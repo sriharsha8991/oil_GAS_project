@@ -39,8 +39,7 @@ class Preprocessor:
         baselines = await preprocessor.extract(Path("report.pdf"))
     """
 
-    def __init__(self, ocr_lang: str = "en", use_ocr: bool = False) -> None:
-        self._ocr_lang = ocr_lang
+    def __init__(self, use_ocr: bool = False) -> None:
         self._use_ocr = use_ocr
 
     async def extract(self, pdf_path: Path) -> list[PageBaseline]:

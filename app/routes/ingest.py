@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -34,17 +34,21 @@ async def ingest(file: UploadFile):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
+    # Sanitize filename to prevent path traversal
+    safe_name = Path(PurePosixPath(file.filename).name).name
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
     # Save upload to disk
-    upload_dir = Path("./data/uploads")
-    upload_path = upload_dir / file.filename
+    settings = get_settings()
+    upload_path = settings.upload_dir / safe_name
     with open(upload_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     # Run pipeline
-    settings = get_settings()
     gemini = GeminiClient(settings) if settings.gemini_api_key else None
     orchestrator = PipelineOrchestrator(settings, gemini_client=gemini)
-    job = await orchestrator.run(upload_path, file.filename)
+    job = await orchestrator.run(upload_path, safe_name)
 
     # Build response with per-page preview
     summary = job.to_summary()

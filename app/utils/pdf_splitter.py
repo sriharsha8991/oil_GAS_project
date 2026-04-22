@@ -43,7 +43,7 @@ class PDFChunk:
     @property
     def is_original(self) -> bool:
         """True if this chunk IS the original file (no split needed)."""
-        return self.chunk_index == 0 and self.file_path.stem != self.file_path.stem + "_chunk_000"
+        return self.chunk_index == 0 and "_chunk_" not in self.file_path.stem
 
 
 @dataclass

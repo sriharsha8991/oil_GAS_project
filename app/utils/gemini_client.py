@@ -35,7 +35,7 @@ class GeminiClient:
         self._client = genai.Client(api_key=self._settings.gemini_api_key)
         # Rate-limit concurrent Gemini calls (RPM headroom)
         self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_batches)
-        self._max_retries = 3
+        self._max_retries = self._settings.max_retries
         self._base_delay = 1.0  # seconds
 
     # ------------------------------------------------------------------

@@ -40,6 +40,7 @@ class Settings(BaseSettings):
 
     # --- Storage ---
     output_dir: Path = Path("./data/output")
+    upload_dir: Path = Path("./data/uploads")
 
     # --- Logging ---
     log_level: str = "INFO"

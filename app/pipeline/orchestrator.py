@@ -4,7 +4,8 @@ Wires together all phases:
   Pre-Phase: PDF splitting (if >1000 pages)
   Phase 0:   Baseline text extraction (pymupdf4llm)
   Phase 1:   Document structure scan via Gemini (TOC, sections, entities)
-  Phase 2+:  (Future — batch queue, extraction, validation)
+  Phase 2:   Batch queue construction (section-aligned page batches)
+  Phase 3+:  (Future — LangGraph agent extraction, validation)
 
 Each ingestion job gets a unique ID and tracks progress through phases.
 Results are written to disk and returned via the API.
@@ -18,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
-from app.models.schemas import DocStructure, JobStatus, PageBaseline
+from app.models.schemas import DocStructure, JobStatus, PageBaseline, PageBatch
+from app.pipeline.batch_queue import BatchQueue, build_batches
 from app.pipeline.preprocessing import Preprocessor
 from app.pipeline.structure_scan import ScanResult, StructureScanner
 from app.storage.file_storage import FileStorage
@@ -44,6 +46,8 @@ class JobResult:
         self.baselines: list[PageBaseline] = []
         self.doc_structure: DocStructure | None = None
         self.scan_result: ScanResult | None = None
+        self.batches: list[PageBatch] = []
+        self.batch_queue: BatchQueue | None = None
         self.phase_timings: dict[str, int] = {}  # phase → ms
         self.output_dir: Path | None = None
 
@@ -75,6 +79,12 @@ class JobResult:
             "doc_structure": (
                 self.doc_structure.model_dump() if self.doc_structure else None
             ),
+            "batches": {
+                "total": len(self.batches),
+                "batch_sizes": [
+                    b.page_end - b.page_start + 1 for b in self.batches
+                ],
+            },
             "phase_timings_ms": self.phase_timings,
             "stats": {
                 "total_pages": self.total_pages,
@@ -193,6 +203,33 @@ class PipelineOrchestrator:
                     document_type=scan_result.doc_structure.document_type,
                     sections=len(scan_result.doc_structure.sections),
                     cross_page_tables=len(scan_result.doc_structure.cross_page_tables),
+                )
+
+            # ── Phase 2: Batch Queue Construction ─────────────────
+            if job.doc_structure:
+                job.current_phase = "batching"
+                t0 = time.perf_counter()
+
+                batches = build_batches(
+                    doc_structure=job.doc_structure,
+                    baselines=all_baselines,
+                    batch_size=self._settings.batch_size,
+                )
+                job.batches = batches
+
+                # Create async queue for Phase 3 workers
+                queue = BatchQueue()
+                queue.load(batches)
+                queue.mark_done()
+                job.batch_queue = queue
+
+                job.phase_timings["batching"] = _ms_since(t0)
+
+                logger.info(
+                    "pipeline_batching_done",
+                    job_id=job_id,
+                    total_batches=len(batches),
+                    batch_sizes=[b.page_end - b.page_start + 1 for b in batches],
                 )
 
             # ── Write Output: Per-page markdown ──────────────────────

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -124,7 +123,7 @@ class BatchValidation(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PageBaseline(BaseModel):
-    """Baseline text for a single page from PyMuPDF / PaddleOCR."""
+    """Baseline text for a single page from pymupdf4llm."""
     page_num: int
     text: str = ""
     char_count: int = 0
@@ -132,7 +131,7 @@ class PageBaseline(BaseModel):
     image_count: int = 0
     width: float = 0.0
     height: float = 0.0
-    extraction_method: str = "pymupdf"  # "pymupdf" | "paddleocr"
+    extraction_method: str = "pymupdf4llm"
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +153,6 @@ class PageBatch(BaseModel):
 # API request / response
 # ---------------------------------------------------------------------------
 
-class IngestRequest(BaseModel):
-    """Request body for POST /ingest."""
-    filename: str = ""
-
-
 class IngestResponse(BaseModel):
     """Response body for POST /ingest."""
     job_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -174,18 +168,3 @@ class JobStatusResponse(BaseModel):
     pages_processed: int = 0
     current_phase: str = ""
     error: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-# ---------------------------------------------------------------------------
-# Trace / logging
-# ---------------------------------------------------------------------------
-
-class TraceEntry(BaseModel):
-    """A single trace log entry for pipeline observability."""
-    phase: str
-    model: str = ""
-    page: int | None = None
-    time_ms: int = 0
-    cached: bool = False
-    details: dict[str, Any] = {}
