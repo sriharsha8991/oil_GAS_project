@@ -5,7 +5,7 @@ Wires together all phases:
   Phase 0:   Baseline text extraction (pymupdf4llm)
   Phase 1:   Document structure scan via Gemini (TOC, sections, entities)
   Phase 2:   Batch queue construction (section-aligned page batches)
-  Phase 3+:  (Future — LangGraph agent extraction, validation)
+  Phase 3:   LangGraph agent extraction + validation + escalation
 
 Each ingestion job gets a unique ID and tracks progress through phases.
 Results are written to disk and returned via the API.
@@ -20,6 +20,7 @@ from typing import Any
 
 from app.config import Settings
 from app.models.schemas import DocStructure, JobStatus, PageBaseline, PageBatch
+from app.agents.graph import build_graph, run_graph_on_batches
 from app.pipeline.batch_queue import BatchQueue, build_batches
 from app.pipeline.preprocessing import Preprocessor
 from app.pipeline.structure_scan import ScanResult, StructureScanner
@@ -48,6 +49,7 @@ class JobResult:
         self.scan_result: ScanResult | None = None
         self.batches: list[PageBatch] = []
         self.batch_queue: BatchQueue | None = None
+        self.extraction_results: list[dict] = []  # Phase 3 BatchState results
         self.phase_timings: dict[str, int] = {}  # phase → ms
         self.output_dir: Path | None = None
 
@@ -84,6 +86,12 @@ class JobResult:
                 "batch_sizes": [
                     b.page_end - b.page_start + 1 for b in self.batches
                 ],
+            },
+            "extraction": {
+                "batches_processed": len(self.extraction_results),
+                "escalated": sum(
+                    1 for r in self.extraction_results if r.get("escalated")
+                ),
             },
             "phase_timings_ms": self.phase_timings,
             "stats": {
@@ -232,13 +240,52 @@ class PipelineOrchestrator:
                     batch_sizes=[b.page_end - b.page_start + 1 for b in batches],
                 )
 
+            # ── Phase 3: LangGraph Agent Extraction ──────────────
+            if self._gemini and job.doc_structure and job.batches and job.scan_result:
+                job.current_phase = "extraction"
+                t0 = time.perf_counter()
+
+                graph = build_graph(
+                    client=self._gemini,
+                    settings=self._settings,
+                    cached_content=job.scan_result.cache_name,
+                    uploaded_file=job.scan_result.upload_result.file,
+                )
+
+                doc_structure_dict = job.doc_structure.model_dump()
+                extraction_results = await run_graph_on_batches(
+                    graph=graph,
+                    batches=job.batches,
+                    doc_structure_dict=doc_structure_dict,
+                    max_concurrent=self._settings.max_concurrent_batches,
+                )
+
+                job.extraction_results = extraction_results
+                job.phase_timings["extraction"] = _ms_since(t0)
+
+                escalated = sum(1 for r in extraction_results if r.get("escalated"))
+                logger.info(
+                    "pipeline_extraction_done",
+                    job_id=job_id,
+                    batches_processed=len(extraction_results),
+                    escalated=escalated,
+                )
+
             # ── Write Output: Per-page markdown ──────────────────────
             job.current_phase = "writing_output"
             t0 = time.perf_counter()
 
+            # Build page-level extraction map from Phase 3 results
+            extracted_page_map = _build_extracted_page_map(job.extraction_results)
+
             doc_name = Path(filename).stem
             for baseline in all_baselines:
-                page_md = self._format_page_markdown(baseline)
+                # Use Phase 3 extraction if available, else fall back to baseline
+                extracted = extracted_page_map.get(baseline.page_num)
+                if extracted:
+                    page_md = extracted.get("markdown", baseline.text)
+                else:
+                    page_md = self._format_page_markdown(baseline)
                 await self._storage.write_page_markdown(doc_name, baseline.page_num, page_md)
 
             # Write combined document
@@ -323,6 +370,17 @@ class PipelineOrchestrator:
             pages.append("")
 
         return "\n".join(header + pages)
+
+
+def _build_extracted_page_map(extraction_results: list[dict]) -> dict[int, dict]:
+    """Build a {page_num: page_extraction_dict} map from Phase 3 batch results."""
+    page_map: dict[int, dict] = {}
+    for batch_result in extraction_results:
+        for page in batch_result.get("final_pages", []):
+            pn = page.get("page_num")
+            if pn is not None:
+                page_map[pn] = page
+    return page_map
 
 
 def _ms_since(start: float) -> int:
