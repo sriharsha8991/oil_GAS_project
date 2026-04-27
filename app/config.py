@@ -12,31 +12,33 @@ class Settings(BaseSettings):
     twelve-factor app principle: config lives in the environment.
     """
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # --- Gemini API ---
     gemini_api_key: str = ""
+
+    # --- Pipeline (v3: streaming per-page) ---
+    max_concurrent_pages: int = 200   # Worker pool size; one Gemini call per worker
+    render_dpi: int = 200             # PNG rasterization DPI (200 default, 300 for small print)
+    max_iterations: int = 3           # Hard cap: iter1 Flash, iter2 Flash, iter3 Pro (FINAL)
+    pass_confidence_threshold: float = 0.85
+
+    # --- Models ---
+    extraction_model: str = "models/gemini-3-flash-preview"   # iter 1 & 2
+    escalation_model: str = "models/gemini-3.1-pro-preview"           # iter 3 (FINAL)
 
     # --- Qdrant ---
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "wellsynthai_documents"
 
-    # --- Pipeline ---
-    max_concurrent_batches: int = 25
-    batch_size: int = 5
-    media_resolution_default: str = "MEDIUM"
-    max_retries: int = 2
+    # --- Embedding ---
+    embedding_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = 768
+    embedding_batch_size: int = 100  # max texts per embed_content call
 
-    # --- PDF Limits (Gemini Files API) ---
-    pdf_max_pages: int = 1000       # Hard limit per upload
-    pdf_max_size_mb: int = 50       # Hard limit per upload
-    pdf_split_target_pages: int = 800  # Target chunk size (headroom below max)
-    pdf_split_min_pages: int = 50      # Minimum chunk to avoid tiny fragments
-
-    # --- Models ---
-    extraction_model: str = "models/gemini-2.5-flash"
-    escalation_model: str = "models/gemini-2.5-pro"
-    embedding_model: str = "models/gemini-embedding-exp-03-07"
+    # --- Chunking ---
+    chunk_size: int = 1000       # chars per chunk
+    chunk_overlap: int = 200     # overlap between consecutive chunks
 
     # --- Storage ---
     output_dir: Path = Path("./data/output")

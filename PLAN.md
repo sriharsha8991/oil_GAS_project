@@ -1,616 +1,1255 @@
-# Wellsynthai Ingestion Pipeline — Full Implementation Plan (v2)
+# WellSynth AI — Master Implementation Plan (v4)
 
-> **v2 changes**: Major architectural overhaul based on research into Gemini's native PDF processing,
-> context caching, long-context capabilities, and multimodal RAG best practices. See "What Changed
-> from v1" section at the bottom.
+> **v4 supersedes v3.** v3 (`PLAN_v3_ingestion.md`, archived) covered only the document
+> ingestion pipeline. v4 reframes the project against the **WellSynth SRS/PRD Functional
+> Spec v3** (`WellSynth_Final_SRS_PRD_Functional_Specification_v3.pdf`) and turns the
+> ingestion pipeline into one module of a larger Well Operations Intelligence product.
+>
+> **North-star goals (in priority order)**
+> 1. **≥ 99% extraction accuracy** on dense well-report content (depths, NPT events,
+>    formation tops, mud weights, table values, BHA components).
+> 2. **Source-grounded citations on every meaningful output** — every answer/summary
+>    references the artifact + page + bbox region it came from.
+> 3. **Image grounding** — when an answer relates to a figure, plot, mud log strip, or
+>    well schematic, return the cropped page region image alongside the text.
+> 4. **Human-supervised** — the system drafts; humans approve. Never autonomous decisions.
+> 5. **Cross-well comparability** — structured entities (NPT, formations, depths, fluids)
+>    are normalized to a controlled vocabulary so wells, sections, and campaigns can be
+>    compared and aggregated.
 
-## Architecture Overview
+---
+
+## 0. PRD → Product Mapping
+
+The PRD describes **WellSynth** as a role-aware Well Operations Intelligence workspace
+covering planning, live operations, handover, campaign memory, and decision support. This
+plan implements it as **eight backend capability layers** that map to PRD sections:
+
+| # | Capability layer | PRD sections | What it delivers | State |
+|---|---|---|---|---|
+| L1 | Document Intelligence (ingestion) | §10, §18 | Per-page MD + tables + image descriptions + entities, with provenance | **Built (v3)** |
+| L2 | Domain Knowledge Layer (entities + taxonomy) | §4, §11 | Normalized well/section/NPT/formation/fluid entities; controlled vocab | Not started |
+| L3 | Tenant & Hierarchy Model | §3, §4.2, §9 | operator → asset → field → campaign → rig → well → section objects | Not started |
+| L4 | Artifact Linkage & Versioning | §10, §11 | Artifact class taxonomy, mandatory metadata, revisions, scope linkage | Not started |
+| L5 | Retrieval Backbone (RAG + KG) | §13.2 (Search/Offset/Lessons), §6 | Hybrid Qdrant + graph; source-cited answers; image grounding | Not started |
+| L6 | Operational Synthesis Agents | §13.2 (Summary/Handover/Program QA/Risks) | Daily summary, handover, program QA, action board, lessons retrieval | Not started |
+| L7 | RBAC & Governance | §7, §19 | Scope-based access, approval routes, audit, AI guardrails | Not started |
+| L8 | API + Workspace UI | §12, §13.1, FastAPI | Endpoints + minimal workspace UI for pilot | API stub only |
+
+The current codebase implements **L1 only**. The rest of this plan defines the path to
+the PRD-MVP scope (PRD §21) with accuracy and grounding as the gating criteria.
+
+---
+
+## 1. Architecture (v4)
 
 ```
-PDF Input
-    │
-    ▼
-┌──────────────────────────────────────┐
-│  FastAPI Service                     │
-│  POST /ingest                        │
-│  GET  /ingest/{job_id}               │
-│  GET  /health                        │
-└──────────┬───────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────┐
-│  Pre-Phase: PDF Splitting            │
-│  If >1000 pages or >50MB:            │
-│  Split into ~800-page chunks         │
-│  aligned to TOC section boundaries   │
-│  Each chunk processed independently  │
-└──────────┬───────────────────────────┘
-           │
-           ▼  (per chunk)
-┌──────────────────────────────────────┐
-│  Phase 0: Pre-Processing             │
-│  PyMuPDF text extraction per page    │
-│  PaddleOCR fallback (scanned pages)  │
-│  → baseline_text[] for validation    │
-└──────────┬───────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────┐
-│  Phase 1: Document Structure Scan    │
-│  Upload full PDF to Gemini Files API │
-│  Flash 2.5 → extract TOC, sections, │
-│  page ranges, document type          │
-│  → DocStructure (cached)             │
-└──────────┬───────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────┐
-│  Phase 2: Batch Deque                │
-│  Group pages into batches of ~5      │
-│  aligned to section boundaries       │
-│  asyncio.deque[PageBatch]            │
-└──────────┬───────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Phase 3: LangGraph Agent Pipeline (25 concurrent batches)   │
-│  Native PDF pages sent directly (no rasterization)           │
-│  MEDIA_RESOLUTION_HIGH for complex pages                     │
-│  Context caching per batch for extractor+validator reuse     │
-│                                                              │
-│  ┌─────────────┐    ┌──────────────┐                        │
-│  │ Extractor    │───▶│ Validator    │                        │
-│  │ Agent        │    │ Agent        │                        │
-│  │ (Flash 2.5)  │    │ (Flash 2.5)  │                        │
-│  └──────▲──────┘    └──────┬───────┘                        │
-│         │                   │                                │
-│         │  retry (max 2x)   │                                │
-│         └───────────────────┘                                │
-│                             │                                │
-│                  ┌──────────▼───────┐                        │
-│                  │ Escalation        │                        │
-│                  │ (Pro 2.5)         │                        │
-│                  └──────────────────┘                        │
-└──────────────────────┬───────────────────────────────────────┘
-                       │
+                     ┌─────────────────────────────────────────┐
+                     │  Workspace UI / API (L8)                 │
+                     │  Role-aware tabs: Overview, Program,     │
+                     │  Offsets, Timeline, Handover, Risks,     │
+                     │  Documents, Lessons                      │
+                     └──────────────┬───────────────────────────┘
+                                    │ scoped by L7 RBAC
+        ┌───────────────────────────┼───────────────────────────┐
+        ▼                           ▼                           ▼
+┌────────────────┐        ┌──────────────────┐        ┌──────────────────┐
+│ Synthesis      │        │ Retrieval        │        │ Workspace State  │
+│ Agents (L6)    │◀──────▶│ Backbone (L5)    │◀──────▶│ (L3 + L4)        │
+│ Summary,       │        │ Hybrid RAG +     │        │ Hierarchy,       │
+│ Handover,      │        │ KG, image        │        │ artifacts,       │
+│ Program QA,    │        │ grounding,       │        │ actions, risks,  │
+│ Lessons        │        │ source citation  │        │ lessons          │
+└────────┬───────┘        └────────┬─────────┘        └────────┬─────────┘
+         │                         │                           │
+         └─────────────┬───────────┴───────────────────────────┘
                        ▼
-┌──────────────────────────────────────┐
-│  Phase 4: Post-Processing            │
-│  Markdown file output per page       │
-│  Cross-page table/section merging    │
-│  Recursive MD chunking               │
-│  Table JSON attachment               │
-└──────────┬───────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────┐
-│  Phase 5: Qdrant Ingestion           │
-│  gemini-embedding-2-preview          │
-│  Multimodal (text + images)          │
-│  Self-hosted Docker                  │
-└──────────────────────────────────────┘
+              ┌─────────────────────────┐
+              │ Domain Knowledge (L2)   │
+              │ Controlled vocab, NPT   │
+              │ codes, depth/unit norm  │
+              │ Entity resolution       │
+              └────────────┬────────────┘
+                           │
+                           ▼
+              ┌─────────────────────────────────────────────┐
+              │ Document Intelligence — Ingestion (L1)      │
+              │ Per-page rasterize → Flash/Pro → MD +       │
+              │ tables + image descriptions + entities +    │
+              │ bboxes + page PNGs persisted for grounding  │
+              └─────────────────────────────────────────────┘
 ```
+
+The accuracy backbone is **L1 → L2**: extraction quality and entity normalization
+determine everything downstream. L5–L6 cannot exceed the accuracy of what L1 captured.
 
 ---
 
-## Tech Stack
+## 2. The Accuracy Strategy (the path to ≥ 99%)
 
-| Component            | Technology                                              |
-|----------------------|---------------------------------------------------------|
-| Language             | Python 3.11+                                            |
-| Orchestration        | LangGraph                                               |
-| LLM (Agents)        | Gemini 2.5 Flash                                        |
-| LLM (Escalation)    | Gemini 2.5 Pro                                          |
-| Embeddings           | gemini-embedding-2-preview                              |
-| PDF Parsing          | PyMuPDF (fitz) — baseline text only                     |
-| OCR Fallback         | PaddleOCR — scanned/image-only pages                    |
-| PDF → Gemini         | Gemini Files API (native PDF, no rasterization needed)  |
-| Context Caching      | Gemini explicit cache (per-batch, ~4x cost reduction)   |
-| Vector DB            | Qdrant (self-hosted Docker)                             |
-| API Framework        | FastAPI + Uvicorn                                       |
-| Async Runtime        | asyncio + semaphore (25 concurrent)                     |
-| Logging/Tracing      | structlog + per-page trace context                      |
-| Chunking             | langchain MarkdownTextSplitter                          |
-| PDF Splitting        | PyMuPDF (fitz) — TOC-aware splitting for >1000pg PDFs    |
+99% on every numeric/entity field is the gating goal. Single-pass extraction will not
+hit it. The strategy is layered defenses, each closing a class of errors the layer above
+cannot catch.
 
----
+| Layer | Defense | Target error class |
+|---|---|---|
+| A1 | Per-page Flash extract + Flash validate (current v3) | Generic vision/OCR errors |
+| A2 | Pro escalation on iter-3 (current v3) | Hard pages Flash cannot handle twice |
+| A3 | **Adaptive DPI** + **ROI second-look** on validator failure | Small print, dense logs, missed table rows |
+| A4 | **Schema-constrained extraction** — `responseSchema` with enums for NPT codes, depth types, units | Free-text drift, unit ambiguity |
+| A5 | **Numeric guardrails** — every depth/pressure/weight value checked against PyMuPDF baseline + unit-range sanity check | Hallucinated numbers, decimal-point errors |
+| A6 | **Cross-page reconciliation** — formation tops, depth sequences, and table column shapes validated for monotonicity/consistency | Page-isolation blind spots |
+| A7 | **Entity resolution** vs canonical store — wells, formations, rigs deduped across docs | Naming drift; false-new entities |
+| A8 | **SME review queue** for low-confidence or high-severity entities (NPT > 12h, casing depth changes) | Residual model error |
+| A9 | **Golden-set CI** — 50–100 hand-labeled pages from real well reports, regression-tested every prompt or model change | Silent drift over time |
 
-## Project Structure
-
-```
-wellsynthai/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                    # FastAPI app entry point
-│   ├── config.py                  # Settings (Gemini keys, Qdrant URL, etc.)
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── schemas.py             # Pydantic models (requests, responses, page context)
-│   │   └── state.py               # LangGraph state definitions
-│   ├── pipeline/
-│   │   ├── __init__.py
-│   │   ├── orchestrator.py        # Main pipeline orchestrator (job management)
-│   │   ├── preprocessing.py       # Phase 0: PyMuPDF + PaddleOCR baseline extraction
-│   │   ├── structure_scan.py      # Phase 1: Doc structure / TOC extraction via Gemini
-│   │   ├── batch_queue.py         # Phase 2: Async deque of page batches
-│   │   └── postprocessor.py       # Phase 4: Markdown output, cross-page merge, chunking
-│   ├── agents/
-│   │   ├── __init__.py
-│   │   ├── graph.py               # LangGraph workflow definition
-│   │   ├── extractor.py           # Extractor agent node
-│   │   ├── validator.py           # Validator agent node
-│   │   ├── escalation.py          # Pro model escalation node
-│   │   └── prompts.py             # All agent system prompts
-│   ├── vectorstore/
-│   │   ├── __init__.py
-│   │   ├── embeddings.py          # Gemini embedding wrapper
-│   │   ├── chunker.py             # Recursive MD chunking + table JSON attachment
-│   │   └── qdrant_client.py       # Qdrant operations (upsert, collection management)
-│   ├── utils/
-│   │   ├── __init__.py
-│   │   ├── logging.py             # structlog setup with per-page trace
-│   │   ├── gemini_client.py       # Shared Gemini API client with rate limiting
-│   │   └── pdf_uploader.py        # Gemini Files API upload + caching helpers
-│   └── storage/
-│       ├── __init__.py
-│       └── file_storage.py        # Markdown + image files to disk
-├── tests/
-│   ├── __init__.py
-│   ├── test_preprocessing.py
-│   ├── test_agents.py
-│   ├── test_chunking.py
-│   └── test_pipeline_e2e.py
-├── docker-compose.yml             # Qdrant + app services
-├── Dockerfile
-├── pyproject.toml
-├── .env.example
-└── README.md
-```
+Layers A1–A2 are built. **A3–A9 are the heart of the next phase of work** and are sized
+into Phase 1A below.
 
 ---
 
-## Detailed Phase Breakdown
+## 3. The Grounding & Citation Strategy
 
-### Phase 0: Baseline Text Extraction (Local, No LLM)
+Every meaningful output must answer: "where did this come from?" Two levels:
 
-**File**: `app/pipeline/preprocessing.py`
+### 3.1 Text grounding
+Each extracted entity, table cell, and answer fragment carries a **provenance record**:
 
-**Purpose**: Produce a cheap, fast baseline text per page that the Validator can use to cross-check Gemini's extraction. This is NOT the primary extraction — Gemini is. This is the **validation reference**.
-
-1. Open PDF with PyMuPDF (`fitz`)
-2. For each page:
-   - Extract text blocks with `page.get_text("blocks")` — preserves layout coordinates
-   - Detect if page is scanned/image-only: if `len(text.strip()) < 50` chars
-   - If scanned → run PaddleOCR on `page.get_pixmap(dpi=300)` PNG
-3. Store per-page `baseline_text[]` — used later by the Validator as ground truth reference
-4. Also extract basic page metadata: page dimensions, rotation, image count
-
-**Key difference from v1**: No LLM-as-Judge here. PyMuPDF/PaddleOCR runs purely locally. The LLM comparison happens inside the Validator agent in Phase 3, which already has the Gemini extraction to compare against. This removes one LLM call per page.
-
----
-
-### Phase 1: Document Structure Scan (NEW)
-
-**File**: `app/pipeline/structure_scan.py`
-
-**Why this matters**: Well reports have hierarchical structure — title page, TOC, well summary, formation logs, test results, appendices. Page-by-page extraction without understanding this structure loses critical context (e.g., "Table continued from previous page", section headers that apply to multiple pages, cross-references).
-
-1. Upload the full PDF to **Gemini Files API** (supports up to 50MB / 1000 pages)
-2. Single Flash 2.5 call with `MEDIA_RESOLUTION_LOW` (cheap, 280 tokens/page):
-
-```
-Analyze this document's structure. Return:
+```json
 {
-  "document_type": str,           // e.g. "well_completion_report", "drilling_log"
-  "title": str,
-  "sections": [
-    {
-      "name": str,                // e.g. "Well Summary", "Formation Evaluation"
-      "page_start": int,
-      "page_end": int,
-      "content_types": ["text", "table", "diagram", "log_chart"],
-      "complexity": "low" | "medium" | "high"
-    }
-  ],
-  "cross_page_tables": [          // Tables that span multiple pages
-    {"page_start": int, "page_end": int, "description": str}
-  ],
-  "key_entities": {               // Document-level metadata
-    "well_name": str,
-    "operator": str,
-    "field": str,
-    "dates": [str]
-  }
+  "doc_id": "well_ALP-12_DDR_2026-04-23.pdf",
+  "page_num": 13,
+  "bbox": [120, 340, 480, 410],         // pixel coords on rendered page (gemini returns these)
+  "extraction_iter": 1,
+  "model": "gemini-3-flash-preview",
+  "confidence": 0.92,
+  "rendered_page_uri": "data/pages/.../page_013.png"
 }
 ```
 
-3. Create an **explicit Gemini cache** of the uploaded PDF file — this cache will be reused by all subsequent extractor/validator calls, giving ~4x input cost reduction
-4. The `DocStructure` output drives:
-   - **Batch boundaries** in Phase 2 (don't split across table continuations)
-   - **Extraction prompts** in Phase 3 (extractor knows what section it's in)
-   - **Media resolution** in Phase 3 (HIGH for complex pages, MEDIUM for text-only)
-   - **Document-level metadata** for Qdrant payloads in Phase 5
+The Retrieval Backbone (L5) attaches the provenance set to every answer. The UI shows
+**evidence cards** (PRD §13.2 FR-010) clickable down to the exact page region.
+
+### 3.2 Image grounding (the user-requested capability)
+When a query is about a figure/plot/log strip/schematic, the system returns the **cropped
+page region** alongside the text answer. Implementation:
+
+1. **At ingestion (L1):** Gemini already returns image descriptions per page. v4 extends
+   the extractor schema to also return **normalized bounding boxes** for each described
+   image (`[ymin, xmin, ymax, xmax]` × 1000, the format `gemini-2.5` natively supports).
+2. **Persist:** the rendered page PNG is kept in `data/pages/{doc_id}/page_{n}.png`
+   (currently discarded after extraction — v4 adds persistence).
+3. **Index:** image descriptions are embedded and indexed in a separate Qdrant collection
+   with payload `{doc_id, page_num, bbox, description, type}`.
+4. **At query time:** if retrieval hits an image-type chunk OR the user explicitly asks
+   for "the diagram/log/schematic of X", L5 crops the bbox from the stored page PNG and
+   returns it inline with the answer.
+
+This satisfies the user's image-priority requirement without storing duplicate pixels —
+we keep the page PNG once and crop on demand.
+
+### 3.3 Document priority for grounding
+The PRD §18.2 evidence hierarchy maps to a **scoring weight** at retrieval time:
+
+| Tier | Artifact class | Weight |
+|---|---|---|
+| 1 (highest) | Approved drilling program, signed final reports, approved lessons | 1.0 |
+| 2 | DDRs, handover notes (released), risk/assurance memos | 0.85 |
+| 3 | Specialist artifacts (mud, DD, MWD), service memos | 0.75 |
+| 4 | Draft programs, draft notes, unapproved lessons | 0.5 |
+| 5 | Ad-hoc media/screenshots, untagged uploads | 0.3 |
+
+The retrieval rerank step multiplies semantic similarity by tier weight. Conflicting
+evidence is **surfaced**, not silently resolved (PRD §18.3).
 
 ---
 
-### Phase 2: Batch Deque
+## 4. Module-by-Module Implementation
 
-**File**: `app/pipeline/batch_queue.py`
+### L1 — Document Intelligence (BUILT)
 
-**Why batches instead of single pages**: 
-- Cross-page context: tables span pages, sections span pages, context is lost page-by-page
-- Token efficiency: Gemini charges per-request overhead; batching amortizes it
-- Cache hits: same PDF file is cached; batching reduces total API calls
+Implemented per `PLAN_v3_ingestion.md`. Per-page PNG rasterize → Flash extract → Flash
+validate → optional Pro escalation. 72/72 tests passing. Outputs per-page MD, table JSON,
+full document MD.
 
-```python
-from collections import deque
-import asyncio
+**Gaps to close before L2 work** (these are A3/A4 from the accuracy strategy, plus the
+groundwork for grounding):
 
-class BatchQueue:
-    def __init__(self):
-        self._deque: deque[PageBatch] = deque()
-        self._event = asyncio.Event()
-        self._done = False
+- **G-L1.1** — Persist rendered page PNGs to `data/pages/{doc_id}/page_{n}.png` instead
+  of discarding. Required for image grounding (§3.2).
+- **G-L1.2** — Extend extractor `responseSchema` to demand bounding boxes for every
+  table and every described image. Validator already sees the image, so it can verify.
+- **G-L1.3** — Add `entities` field to extractor output (well IDs, depths with unit+type,
+  formation tops, NPT events with IADC code, fluids, equipment, dates). Use Gemini's
+  `responseSchema` enum constraints sourced from L2 controlled vocab.
+- **G-L1.4** — Adaptive DPI: pages flagged `is_scanned` or with high text density
+  (chars/area) render at 300 DPI; sparse pages at 150. Cuts cost ~40% with no quality
+  loss on easy pages.
+- **G-L1.5** — ROI second-look. When validator returns specific gaps (e.g., "rows 5–8
+  missing from table at top of page"), iter-2 crops the bbox region (PyMuPDF
+  `page.get_pixmap(clip=...)` at 300 DPI) and sends only the crop. Smaller input,
+  higher resolution on failure region, better iter-2 success without escalating to Pro.
+- **G-L1.6** — Numeric guardrail pass: every `depth`, `pressure`, `weight`, `volume`
+  value in entities is checked against (a) presence in PyMuPDF baseline text and
+  (b) sane physical range for the unit. Discrepancies → escalate that page to Pro
+  even if validator passed.
+- **G-L1.7** — **Durable, resumable ingestion pipeline** (no data loss, scales to
+  100s of PDFs × 100-700 pages). See §4.L1.1 for the full dossier.
 
-    async def push(self, batch: PageBatch): ...
-    async def pop(self) -> PageBatch | None: ...
-    def mark_done(self): ...
-
-@dataclass
-class PageBatch:
-    batch_id: int
-    page_range: tuple[int, int]     # e.g. (5, 9) = pages 5-9
-    section_context: str            # From DocStructure: "Formation Evaluation"
-    complexity: str                 # "low" | "medium" | "high"
-    baseline_texts: list[str]       # From Phase 0
-    media_resolution: str           # HIGH for complex, MEDIUM for text-only
-```
-
-**Batch construction algorithm**:
-1. Walk `DocStructure.sections` 
-2. For each section, create batches of ~5 pages
-3. Never split a `cross_page_table` across batches
-4. Tag complexity from DocStructure (drives media_resolution)
+These are the **Phase 1A** scope and are the prerequisites for any RAG/UI work.
 
 ---
 
-### Phase 3: LangGraph Agent Pipeline
+#### §4.L1.1 — Durable, Resumable Ingestion (Celery + Redis) — Design Dossier
 
-**File**: `app/agents/graph.py`
+> **Status:** Not built. This subsection is the full architectural plan to be consulted
+> when the durability work is picked up. The current in-process pipeline is adequate for
+> development but **cannot survive process restarts, reloads, or crashes mid-document**
+> — the 23-page Harvey run demonstrated that pages_png/ survived but every other
+> artifact (per-page MD, tables, entities, full document) was lost when the process was
+> killed before Phase 3 completed.
+>
+> **Scale target:** hundreds of PDFs concurrently, each 100–700 pages. At 700 pages × 2
+> Gemini calls × ~3s = ~70 minutes of LLM time per worst-case doc. Any architecture that
+> holds that much state in memory or in a single process is guaranteed to lose work.
 
-#### Critical change: Native PDF, no rasterization
+##### L1.1.a Failure-mode recap (what we're hardening against)
 
-**Research finding**: Gemini 2.5+ processes PDFs natively — it extracts embedded text AND uses vision on each page simultaneously. Rasterizing to images and sending PNG bytes:
-- Loses native text layer (forces Gemini to OCR text that's already machine-readable)
-- Costs more tokens (images are 256+ tokens/page; native PDF text is free on Gemini 3)
-- Degrades quality for text-heavy pages
+From the 23-page Harvey 1 retrospective:
 
-**New approach**: Upload PDF once via Files API → cache it → reference cached PDF + page ranges in each agent call. Gemini sees the native PDF pages directly.
+| # | Observed failure mode | Cause | Lost |
+|---|---|---|---|
+| F1 | `pages_png/` present, everything else missing | Uvicorn `--reload` killed the background task mid-Phase-2 | Per-page MD, tables, entities, full_doc |
+| F2 | Any exception in Phase 3 flips job to `FAILED` and writes nothing | Big-bang batch persistence — all writes deferred to end | Whole doc, even pages that extracted fine |
+| F3 | Job disappears on process restart | `_jobs` is a module-level in-memory dict | Job history, status, error traces |
+| F4 | FastAPI `BackgroundTasks` has no supervision | Designed for 1–2s post-response work, not 70-minute jobs | Retry semantics, visibility, guaranteed delivery |
+| F5 | Worker dict `job.page_results` grows unbounded | Every page's full state (minus png_bytes) kept in memory | Memory pressure at scale |
+| F6 | No way to resume from a partial run | No manifest records which pages have been extracted | Forces full re-rasterize + full re-extract |
 
-#### Context Caching Strategy
+The durability architecture must close all six.
 
-```python
-# Upload PDF once (done in Phase 1)
-pdf_file = client.files.upload(file=pdf_path, config={"mime_type": "application/pdf"})
+##### L1.1.b Principles (non-negotiable)
 
-# Create explicit cache (done in Phase 1, reused by all Phase 3 calls)
-cache = client.caches.create(
-    model="models/gemini-2.5-flash",
-    config=types.CreateCachedContentConfig(
-        display_name=f"wellsynthai_{doc_id}",
-        system_instruction=EXTRACTION_SYSTEM_PROMPT,
-        contents=[pdf_file],
-        ttl="3600s",  # 1 hour, enough for full pipeline
-    )
-)
-# All subsequent calls reference this cache → ~4x cheaper input tokens
-```
+1. **Per-page durability.** Each page's markdown, tables, entities, and trace are
+   persisted **immediately inside the worker** as soon as the LangGraph completes for
+   that page. Nothing is held in RAM waiting for a "finalize" step.
+2. **Aggregator, not batch.** Phase 3 becomes a pure aggregator that reads per-page
+   files from disk and produces `full_document.md` + consolidated `entities.json`.
+   Failure in Phase 3 is recoverable by re-running the aggregator — the source data is
+   already on disk.
+3. **Exactly-once per page, idempotent re-runs.** Re-running a page produces the same
+   file contents byte-for-byte (same prompt, temperature=0 or seeded). Re-ingestion
+   short-circuits on `page_NNN.extraction_done` marker.
+4. **Job state lives outside the web process.** A durable store (Redis for live state,
+   SQLite/Postgres for history) is the source of truth. Any web worker, any Celery
+   worker, any admin CLI sees the same view.
+5. **Explicit failure, never silent.** Every exception is logged with full stack,
+   persisted to the job's manifest, and surfaced via the `/ingest/{job_id}` endpoint.
+   A `FAILED` job carries `{stage, page_num, error_class, traceback, partial_artifacts}`.
+6. **Resumable from any phase boundary.** On worker restart, every in-flight job is
+   inspectable, and the user (or an auto-recovery job) can resume from the last
+   completed phase.
+7. **Horizontally scalable by design.** Adding a Celery worker node = more throughput.
+   No shared mutable state between workers.
 
-#### LangGraph State
-
-```python
-class BatchState(TypedDict):
-    batch_id: int
-    page_range: tuple[int, int]
-    section_context: str           # Section name from DocStructure
-    doc_structure: dict            # Full DocStructure for cross-reference
-    baseline_texts: list[str]      # PyMuPDF/PaddleOCR per page (for validation)
-    media_resolution: str          # HIGH or MEDIUM
-    extracted_pages: list[dict]    # Per-page extraction results
-    validation_result: dict        # From validator
-    iteration_count: int           # Retry count (max 2)
-    escalated: bool
-    final_pages: list[dict]        # Final output per page
-    trace_log: list[dict]
-```
-
-#### Graph Flow
-
-```
-START → extractor → validator → CONDITIONAL
-                                    │
-                       ┌────────────┼────────────┐
-                       │            │            │
-                    PASS        RETRY         ESCALATE
-                     │         (≤2x)         (Pro 2.5)
-                     │            │            │
-                     ▼            ▼            ▼
-                    END      extractor        END
-```
-
-#### Agent Details
-
-**Extractor Agent** (`extractor.py` — Flash 2.5):
-- Input: cached PDF reference + page range + section context + DocStructure + baseline_texts + gap feedback (if retry)
-- Uses `MEDIA_RESOLUTION_HIGH` for complex pages (diagrams, tables), `MEDIA_RESOLUTION_MEDIUM` for text-only
-- The section context tells the extractor: "You are extracting pages 15-19 which belong to the 'Formation Evaluation' section"
-- Output per page in batch:
-  ```json
-  {
-    "page_num": 15,
-    "markdown": "## Formation Evaluation\n\n...",
-    "tables": [{"id": "t1", "markdown": "|...|", "json": {...}, "continues_on_next_page": false}],
-    "images": [{"id": "img1", "description": "Well log showing gamma ray...", "location": "center"}],
-    "cross_page_notes": "Table T1 continues from page 14"
-  }
-  ```
-- On retry: receives validator's gap list per page to focus extraction
-
-**Validator Agent** (`validator.py` — Flash 2.5, escalates to Pro 2.5):
-- Input: cached PDF reference + page range + extracted_pages + baseline_texts
-- For each page in batch, cross-references THREE sources:
-  1. **PDF page visual** (ground truth — Gemini sees the actual page)
-  2. **baseline_text** (PyMuPDF/PaddleOCR — independent extraction)
-  3. **extracted_pages** (what the extractor produced)
-- Evaluation criteria:
-  - **Text completeness**: Does extraction contain all text visible on the page? Cross-check against baseline_text
-  - **Table integrity**: Are all rows/columns present? Do numbers match?
-  - **Image/diagram coverage**: Are all visual elements described?
-  - **Cross-page coherence**: Do continued tables/sections connect properly?
-  - **Factual accuracy**: Do extracted numbers, names, depths match what's in the PDF?
-- Output:
-  ```json
-  {
-    "pass": false,
-    "overall_confidence": 0.85,
-    "page_results": [
-      {
-        "page_num": 15,
-        "pass": true,
-        "confidence": 0.95,
-        "gaps": []
-      },
-      {
-        "page_num": 16,
-        "pass": false,
-        "confidence": 0.6,
-        "gaps": ["Table rows 5-8 missing from drilling parameters table",
-                 "Depth value '3,450ft' in baseline not found in extraction"]
-      }
-    ]
-  }
-  ```
-- If any page fails: `pass=False`, route back to extractor with gap details
-- If `iteration_count >= 2` → escalate to Pro 2.5
-
-**Escalation** (`escalation.py` — Pro 2.5):
-- Gets full context: cached PDF + page range + all previous attempts + all gap feedback
-- Pro 2.5 has stronger vision and reasoning — handles edge cases like:
-  - Handwritten annotations (Gemini docs note: "models might hallucinate on handwritten text")
-  - Extremely dense tables
-  - Overlapping text/image layouts
-- Output becomes final (no further validation to avoid cost spiral)
-
-#### Concurrency Control
-
-```python
-semaphore = asyncio.Semaphore(25)
-
-async def process_batch(batch: PageBatch, cache: CachedContent):
-    async with semaphore:
-        result = await graph.ainvoke(BatchState(...))
-        return result
-```
-
-25 concurrent batches × ~5 pages each = ~125 pages in flight.
-Each batch makes ~2 cached API calls (extractor + validator) = 50 RPM in happy path.
-Flash 2.5 Tier 3: 4000 RPM → massive headroom.
-Cached calls are ~4x cheaper on input tokens.
-
----
-
-### Phase 4: Post-Processing
-
-**File**: `app/pipeline/postprocessor.py`
-
-1. **Cross-page merging**: 
-   - Stitch continued tables across batch/page boundaries using `cross_page_notes`
-   - Merge section headers that span pages
-   - Deduplicate headers/footers
-
-2. **Markdown files**: Write `output/{doc_name}/page_{N}.md` per page
-
-3. **Combined document**: Merge all pages into `output/{doc_name}/full_document.md` with:
-   - Document title and metadata from DocStructure
-   - Section headings from DocStructure
-   - Page separators with page numbers
-
-4. **Table JSON**: Write `output/{doc_name}/tables/page_{N}_table_{M}.json`
-
-**File**: `app/vectorstore/chunker.py`
-
-- Use `MarkdownTextSplitter` (recursive) from langchain
-- **Section-aware chunking**: Use DocStructure section boundaries as primary split points
-- Chunk size: ~1000 tokens, overlap: ~200 tokens
-- For chunks containing tables: attach the corresponding table JSON as metadata
-- For chunks near images: attach the image description context
-- Every chunk gets `section_name` from DocStructure for better filtered retrieval
-
----
-
-### Phase 5: Qdrant Ingestion
-
-**File**: `app/vectorstore/qdrant_client.py`
-
-#### Collection Schema
+##### L1.1.c Target architecture
 
 ```
-Collection: "wellsynthai_documents"
-
-Vector: gemini-embedding-2-preview (768 dims or model-specific)
-
-Payload:
-{
-  "document_id": str,          # UUID
-  "document_name": str,        # Original filename
-  "document_type": str,        # From DocStructure: "well_completion_report", etc.
-  "page_number": int,
-  "chunk_index": int,
-  "content_type": str,         # "text" | "table" | "mixed"
-  "section_name": str,         # From DocStructure: "Formation Evaluation"
-  "section_heading": str,      # Nearest heading in markdown
-  "text_content": str,         # The chunk text
-  "table_json": dict | null,   # Structured table data if present
-  "image_description": str,    # Image description if present
-  "has_table": bool,
-  "has_image": bool,
-  "total_pages": int,
-  "well_name": str,            # From DocStructure key_entities
-  "operator": str,             # From DocStructure key_entities
-  "field": str,                # From DocStructure key_entities
-  "extraction_method": str,    # "flash" | "pro_escalated"
-  "confidence_score": float,
-  "created_at": str            # ISO timestamp
-}
+                         ┌──────────────────────────────────────┐
+                         │  FastAPI (web tier, stateless)        │
+                         │  POST /ingest → enqueue Celery task   │
+                         │  GET  /ingest/{job_id} → read status  │
+                         │    from Redis/SQLite (no in-memory)   │
+                         └──────────────┬────────────────────────┘
+                                        │ enqueue
+                                        ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  Redis                                                │
+        │  ├─ Celery broker (task queue, ack-after-success)     │
+        │  ├─ Celery result backend (task status, returns)       │
+        │  └─ Job live state: HSET jobs:{id} {phase, pages_done, │
+        │     pages_total, last_error, started_at, ...}         │
+        └───────────┬───────────────────────────────────────────┘
+                    │ workers pull
+                    ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  Celery worker pool (separate processes)              │
+        │                                                       │
+        │  Canvas per document (Celery primitive):              │
+        │    chord(                                              │
+        │      group(                                            │
+        │        render_page.s(doc_id, 0), ..., render_page.s(doc_id, N)  │
+        │      ),                                                │
+        │      chord(                                            │
+        │        group(extract_page.s(doc_id, 0), ..., extract_page.s(doc_id, N)),│
+        │        aggregate_document.s(doc_id)                    │
+        │      )                                                 │
+        │    )                                                   │
+        │                                                       │
+        │  Each task:                                            │
+        │  • Idempotent (checks disk marker before doing work)  │
+        │  • Writes durable artifacts BEFORE ack'ing             │
+        │  • Updates Redis job state atomically                  │
+        │  • Retries on transient errors (Celery built-in)       │
+        │  • Dead-letter queue on terminal failure               │
+        └───────────────────────────────────────────────────────┘
+                    │ writes immediately
+                    ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  Filesystem (NFS / S3 / local disk)                   │
+        │  data/output/{doc_id}/                                │
+        │    run_manifest.json        ← atomic write-then-rename│
+        │    pages_png/page_NNN.png                             │
+        │    pages/page_NNN.md        ← NEW, written per-page   │
+        │    pages/page_NNN.json      ← NEW, full PageState dict│
+        │    tables/page_NNN_table_MM.{json,md}  ← NEW per-page │
+        │    entities/page_NNN.jsonl  ← NEW per-page            │
+        │    trace/page_NNN.json      ← NEW per-page            │
+        │    full_document.md         ← written by aggregator   │
+        │    entities.json            ← written by aggregator   │
+        │    tables/merged_NN.json    ← written by aggregator   │
+        └───────────────────────────────────────────────────────┘
+                    │ (Phase 4+5: chunk + embed + Qdrant)
+                    ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  chunk_page.s  →  embed_chunks.s  →  upsert_qdrant.s  │
+        │  Each step checkpointed. Re-runnable.                 │
+        └───────────────────────────────────────────────────────┘
 ```
 
-#### Multimodal Storage
+##### L1.1.d Task decomposition (Celery)
 
-- For pages with diagrams/plots: store a rasterized image of that region
-- Use Gemini multimodal embeddings for chunks that reference images
-- Enables multimodal RAG: text queries can retrieve image-associated chunks
+Each task type is small, idempotent, and writes its output before acknowledging the
+message. Task granularity = **one page** for all per-page work, **one document** for
+aggregation.
 
-#### Filterable Indexes
+| Task | Input | Output (durable) | Idempotency check | Retry policy |
+|---|---|---|---|---|
+| `ingest_document.s` | `{doc_id, pdf_path}` | Manifest with pages_total; fires the chord | Manifest exists with `phase=started` | 3× exponential |
+| `preprocess_doc.s` | `doc_id` | `baselines.json` + updates manifest | `baselines.json` exists | 3× |
+| `render_page.s` | `(doc_id, page_num)` | `pages_png/page_NNN.png` | File exists with non-zero size | 5× (local work, transient fs hiccups) |
+| `extract_page.s` | `(doc_id, page_num)` | `pages/page_NNN.{md,json}`, `tables/…`, `entities/…`, `trace/…` | `pages/page_NNN.json` has `final.locked=true` | 5× with jitter; DLQ on terminal |
+| `aggregate_document.s` | `doc_id` | `full_document.md`, `entities.json`, `tables/merged_*.json`, manifest `phase=done` | Manifest `phase=aggregated` | 3× |
+| `chunk_document.s` | `doc_id` | `chunks/chunks.jsonl` | File exists | 3× |
+| `embed_chunks.s` | `(doc_id, chunk_batch)` | `embeddings/batch_NNN.jsonl` | Per-batch marker | 5× |
+| `upsert_qdrant.s` | `(doc_id, batch)` | Qdrant point IDs recorded in manifest | Point IDs present in manifest | 5× with backoff |
 
-Create Qdrant payload indexes on: `document_id`, `document_type`, `section_name`, `well_name`, `content_type`, `has_table`. This enables filtered retrieval (e.g., "find all formation evaluation tables for well X").
+**Why per-page Celery tasks instead of one big per-doc task:**
+- A 700-page doc that fails at page 650 loses only page 650, not pages 0–649.
+- Horizontal scale is automatic — 20 Celery workers × 4 child processes × 100 in-flight
+  Gemini calls per process = ~8,000 pages in flight across the fleet.
+- Retry granularity matches failure granularity (a single Gemini 500 retries just that
+  page, not the whole doc).
 
----
+##### L1.1.e Durability discipline — the "write before ack" rule
 
-### Logging & Tracing
+Every worker follows this sequence without exception:
 
-**File**: `app/utils/logging.py`
+```
+1. Read idempotency marker. If present, ack and return.
+2. Do the work (Gemini call, rasterize, etc.).
+3. Atomic write of output file(s): write to `.tmp` then `os.replace()` to final name.
+4. Update manifest via Redis HSET (atomic).
+5. Log structured event.
+6. Ack the message (Celery task returns cleanly).
+```
 
-Each page gets a trace context with:
+If the worker crashes between step 3 and step 6, Celery redelivers the task. Step 1's
+idempotency check sees the marker and short-circuits. **No duplicate work, no lost work.**
+
+For the full-document aggregator the same pattern applies: write `full_document.md.tmp`
+first, fsync, rename. A crashed aggregator leaves either the old file or the new file
+— never a corrupted half-file.
+
+##### L1.1.f Run manifest (source of truth on disk)
+
+`data/output/{doc_id}/run_manifest.json`:
 
 ```json
 {
   "job_id": "uuid",
-  "document": "well_report_A.pdf",
-  "batch_id": 3,
-  "page_range": [11, 15],
-  "section": "Formation Evaluation",
-  "trace": [
-    {"phase": "preprocessing", "method": "pymupdf", "page": 11, "chars": 1420, "time_ms": 12},
-    {"phase": "preprocessing", "method": "paddleocr_fallback", "page": 13, "chars": 890, "time_ms": 340},
-    {"phase": "structure_scan", "model": "flash-2.5", "resolution": "LOW", "time_ms": 2100, "cached": false},
-    {"phase": "extractor", "model": "flash-2.5", "iteration": 1, "pages": 5, "resolution": "HIGH", "cached": true, "output_chars": 8400, "time_ms": 3200},
-    {"phase": "validator", "model": "flash-2.5", "iteration": 1, "cached": true, "pass": false, "failed_pages": [13], "gaps": ["table rows 5-8 missing"], "time_ms": 1800},
-    {"phase": "extractor", "model": "flash-2.5", "iteration": 2, "pages": 1, "cached": true, "output_chars": 2350, "time_ms": 1100},
-    {"phase": "validator", "model": "flash-2.5", "iteration": 2, "cached": true, "pass": true, "confidence": 0.92, "time_ms": 850}
-  ],
-  "total_time_ms": 9402,
-  "total_api_calls": 5,
-  "cached_calls": 4,
-  "escalated": false,
-  "final_confidence": 0.92,
-  "token_usage": {
-    "input_tokens": 12400,
-    "cached_input_tokens": 9800,
-    "output_tokens": 3200
-  }
+  "doc_id": "gswa_harvey_1_wcr",
+  "pdf_path": "data/uploads/GSWA Harvey 1 WCR.pdf",
+  "pdf_sha256": "ab12...",
+  "pages_total": 23,
+  "created_at": "2026-04-24T10:00:00Z",
+  "updated_at": "2026-04-24T10:08:32Z",
+  "phases": {
+    "preprocessing": {"status": "done", "ms": 4321, "ended_at": "..."},
+    "rasterize":     {"status": "done", "ms": 12056, "pages_ok": 23},
+    "extract":       {"status": "in_progress", "pages_ok": 17, "pages_failed": 0},
+    "aggregate":     {"status": "pending"},
+    "chunk_embed":   {"status": "pending"}
+  },
+  "errors": [],
+  "schema_version": 1
 }
 ```
 
+The manifest is the authority. Redis mirrors the hot parts for fast API reads; the
+filesystem manifest is the recovery ground truth. If Redis is wiped, a one-time scan
+of `data/output/*/run_manifest.json` reconstructs the job registry.
+
+##### L1.1.g Resume semantics
+
+**On Celery worker restart:**
+- Celery's broker (Redis) redelivers unacked messages. Per-page idempotency markers
+  short-circuit the ones that already completed.
+- No human intervention needed.
+
+**On full cluster restart:**
+- `POST /admin/resume` scans `data/output/*/run_manifest.json` for any manifest with a
+  non-terminal phase (`in_progress` or `pending`).
+- For each, re-enqueue the chord at the first non-done phase. Completed pages are
+  short-circuited by their markers; only pending pages actually call Gemini.
+
+**On user "retry failed pages":**
+- `POST /ingest/{job_id}/retry-failed` reads manifest, finds pages with `pages_failed`
+  entries, re-enqueues only those.
+
+##### L1.1.h Redis as broker + state store — specifics
+
+- **Broker queue**: durable (`delivery_mode=persistent`), per-task-type routing keys
+  so Gemini tasks can be isolated on a dedicated worker pool.
+- **Acks late** (`task_acks_late=True`) + **reject on worker lost** — guarantees that a
+  task killed by OOM or SIGKILL is redelivered, not silently dropped.
+- **Visibility timeout** long enough for the slowest page (e.g., 5 min for an escalated
+  Pro call with thinking). Too short → duplicate execution; too long → slow failover.
+- **Task results**: short TTL (1 hour). The manifest is the permanent record; Celery's
+  result backend is only for live polling.
+- **Job live state**: `HSET jobs:{id} phase pages_done pages_total last_error_page`.
+  Written by workers, read by the FastAPI `/ingest/{id}` endpoint. Fast, always fresh.
+
+**Redis sizing (scale math):**
+- 100 concurrent PDFs × 700 pages = 70,000 in-flight tasks worst case.
+- At ~200 bytes/task metadata = 14 MB of queue state. Redis handles this comfortably
+  with default memory.
+- Backup: Redis AOF (append-only file) with `fsync=everysec`. Losing ≤1s of job state
+  on crash is acceptable because the filesystem manifest is the ground truth.
+
+##### L1.1.i Rate limiting & back-pressure
+
+Gemini Tier 3 is not infinite. At 100 PDFs × 700 pages × 2 calls/page = 140,000 API
+calls — if issued flat-out, that's 2.3k RPS, well above the 10k RPM limit (≈167 RPS).
+
+Mitigation:
+- **Per-model Celery rate limit** (`@task(rate_limit="150/s")`) enforced by the broker.
+- **Concurrency cap at the client** (already: `Semaphore(100)` in `GeminiClient`).
+- **Adaptive throttle**: on HTTP 429, Celery task retries with Celery's `retry_backoff`
+  + `Retry-After` header respect. One misbehaving document cannot block the whole fleet.
+- **Job priority queues** — interactive uploads get higher priority than bulk backfills.
+
+##### L1.1.j Failure taxonomy & where each is handled
+
+| Failure | Detection | Recovery |
+|---|---|---|
+| Transient Gemini 500/429/timeout | Exception class / HTTP code | Celery retry w/ backoff, jitter |
+| Page extraction permanently fails (bad PDF page) | Retries exhausted | DLQ entry, page marked `failed` in manifest; user can retry via `/retry-failed` |
+| Worker OOM killed mid-page | Broker redelivers unacked msg | Idempotency marker short-circuits completed work; partial write discarded via `.tmp` rename pattern |
+| Whole machine reboot | Broker persists, disk persists | Workers restart, idempotency shields completed pages, missing pages re-enqueued |
+| Redis crash | AOF replay on restart | Manifest on disk is ground truth; optional `/admin/reconcile` endpoint rebuilds Redis state from disk |
+| Disk full | Write fails | Task raises; Celery retries; monitoring alerts on `aggregate failed pages` metric |
+| Gemini quota blown | 429 storm | Rate limiter throttles; queue backs up; ops alert; no data loss (messages stay in queue) |
+| Pipeline bug wipes all output | Irrecoverable | Backups: daily rsync of `data/output/` to cold storage; Redis AOF snapshots |
+
+##### L1.1.k Pros & Cons (Celery + Redis vs alternatives)
+
+**Pros of Celery + Redis:**
+1. **Durable by design.** Broker persistence + ack-late + idempotency = zero-data-loss
+   guarantee without writing our own queue.
+2. **Battle-tested.** Celery powers production pipelines at Instagram, Mozilla,
+   Airbnb — we're on the well-worn path.
+3. **Horizontal scale.** Add workers = add throughput. No code changes.
+4. **Retry / DLQ / rate-limit / priority** all built in. We don't reinvent them.
+5. **Observability ecosystem** — Flower, Prometheus exporter, Celery events.
+6. **Task composition** (chords, chains, groups) is exactly the ingestion pipeline's
+   shape: per-page fanout → aggregate fan-in.
+7. **Decoupled** from the web tier — FastAPI scales and restarts independently of
+   workers.
+
+**Cons / costs:**
+1. **Operational overhead.** Redis + worker processes + Celery beat (for scheduled
+   tasks) = three more things to run, monitor, and back up.
+2. **Task signature ossification.** Changing a task's signature after deploy requires
+   either blue/green queues or a forced drain + upgrade window.
+3. **Debugging harder.** A stack trace is on a worker, not in the web request. Need
+   centralized logging (stdout + structlog JSON + a log aggregator) from day one.
+4. **Memory tuning.** Celery default worker model is prefork — each worker process
+   loads the whole app (LangGraph, fitz, genai client). On a dev laptop, 4 workers =
+   ~2 GB RAM floor. Mitigation: use `--concurrency=N` + `--pool=solo|threads|gevent`
+   per workload. Gemini async calls + threads pool is likely the best fit.
+5. **Not free.** On managed infra (AWS ElastiCache + ECS tasks), this is a real
+   monthly line item. For self-hosted / pilot it's free but adds a service to the
+   compose file.
+6. **Redis is AP, not CP.** On a network partition you can lose ≤1s of queue state
+   (AOF everysec). Acceptable because disk is authoritative.
+7. **Ordering is per-queue, not per-task.** We don't need ordering (pages are
+   extracted in parallel anyway), but if a future feature requires it, we'd need
+   Redis Streams or a different broker.
+
+##### L1.1.l Alternatives considered
+
+| Option | Pro | Con | Verdict |
+|---|---|---|---|
+| **Celery + Redis** | Mature, durable, well-known | Two new services | **Default.** |
+| **Celery + RabbitMQ** | Stronger delivery guarantees, better routing | Heavier ops; AMQP learning curve | If we ever need strict message ordering or complex topology, revisit. |
+| **Dramatiq + Redis** | Simpler than Celery, same guarantees | Smaller ecosystem | Viable; pick if team dislikes Celery's complexity. |
+| **RQ + Redis** | Simplest possible | No chords, no chains, no complex canvases | Insufficient — we need the chord primitive for fan-out/fan-in. |
+| **Arq + Redis** | Async-native, Pythonic | Younger, smaller community | Strong candidate if we want pure asyncio workers. |
+| **Temporal / Cadence** | Durable workflow engine, replay semantics | Steeper learning curve; separate server to run | Overkill for now; revisit at Phase 5 if workflow complexity grows. |
+| **Prefect / Dagster** | Good DAG UX, observability | More DevOps surface, opinionated about data pipelines | Good for ETL; our workload is per-doc streaming, not table-pipeline shaped. |
+| **Roll our own with asyncio + SQLite** | Zero new services | We'd reinvent every Celery feature badly | **Do not.** Worth doing only if we consciously cap scale at 1 machine. |
+| **Just write per-page to disk, keep BackgroundTasks** | Minimal change | Still loses jobs on process restart; no horizontal scale | **Tier 1 interim fix** (see §L1.1.m). Real fix is Celery. |
+
+##### L1.1.m Rollout — three tiers, each independently shippable
+
+The architecture above is the target. It can be adopted in three increments, each
+closing a class of data-loss risk without blocking the next.
+
+**Tier 1 — Per-page durability (no new services).**
+- Worker writes `pages/page_NNN.md`, `pages/page_NNN.json`, `tables/…`,
+  `entities/page_NNN.jsonl`, `trace/page_NNN.json` immediately after `graph.ainvoke`
+  returns.
+- Phase 3 postprocessor rewritten as an **aggregator** that reads from disk.
+- Run manifest written and updated.
+- `FastAPI BackgroundTasks` retained for now.
+- **Closes F1, F2, F6** (mid-run kill no longer wipes output; aggregator failure
+  doesn't wipe extracted pages; partial resume is possible via manifest inspection).
+- **Leaves F3, F4** (process restart still loses live job registry; no supervision).
+- No new dependencies. One PR.
+
+**Tier 2 — Durable job registry (SQLite, still no broker).**
+- Replace `_jobs: dict` with a SQLite table `ingestion_jobs` (id, status, timings,
+  error, output_dir, created_at, updated_at).
+- On app startup, reconcile: any job with `status=in_progress` and no recent manifest
+  update → mark `interrupted`, expose via API.
+- `POST /ingest/{id}/resume` → re-reads manifest, re-invokes pipeline from first
+  non-done phase.
+- **Closes F3** (job history survives restarts).
+- Still uses `BackgroundTasks` → F4 open.
+- One new dep (SQLAlchemy is already planned for L3/L4).
+
+**Tier 3 — Celery + Redis.**
+- Full target architecture per §L1.1.c.
+- Replace `BackgroundTasks` with Celery enqueue.
+- Add Redis service to `docker-compose.yml`.
+- Add `celery_worker/` and `celery_app.py`.
+- Per-page tasks with idempotency markers, ack-late, DLQ.
+- **Closes F4, F5** (supervision, retries, memory bounded to one page per task).
+- Unlocks the 100 PDFs × 700 pages scale target.
+
+**Ordering rationale:** Tier 1 is high-leverage and low-risk — ship it immediately.
+Tier 2 is only needed when real users are polling job status across restarts. Tier 3
+is only needed when you're actually ingesting >5 PDFs in parallel or documents are
+>100 pages. For today's pilot (one doc at a time, dev laptop), Tier 1 is sufficient.
+The architecture above guarantees we never rewrite — each tier builds on the last.
+
+##### L1.1.n Pitfalls to avoid during the Celery migration
+
+1. **Don't put the Gemini semaphore inside the worker process.** `Semaphore(100)` per
+   worker × 4 workers = 400 concurrent Gemini calls, blowing past rate limits. The
+   concurrency cap belongs at the **cluster** level (Celery rate limit + per-queue
+   concurrency) or at a shared token-bucket in Redis.
+2. **Don't serialize `PageImage` with `png_bytes` in the Celery task payload.** PNG
+   bytes are 200-600 KB; pushing them through the broker is wasteful and adds
+   serialization cost. The PNG is already on disk — tasks pass `(doc_id, page_num)`
+   and read the file.
+3. **Don't store Gemini responses in the Celery result backend.** Results go to disk
+   (the per-page JSON). The result backend is only for task status/completion.
+4. **Don't rely on `task.delay()` return values for business logic.** Chain via chords
+   and look at the manifest/Redis job state, not task results.
+5. **Don't enable `--reload` on the Celery worker.** It silently breaks prefork
+   semantics. Use `watchmedo auto-restart` or `celery multi` for dev restarts.
+6. **Don't share database sessions across Celery forks.** SQLAlchemy session must be
+   created per-task (or per-worker-child), never at module import time.
+7. **Beware of Celery's default `prefetch_multiplier=4`.** For long-running tasks (our
+   case: per-page can be 30s+), prefetch holds messages on a busy worker while others
+   are idle. Set `worker_prefetch_multiplier=1` for Gemini tasks.
+8. **Monitor the DLQ.** A silent DLQ accumulating failed pages is worse than a visible
+   alert. Wire a `/admin/dlq` endpoint + a daily report.
+9. **Don't skip the atomic `.tmp` rename pattern.** Direct writes can leave
+   half-written files on a SIGKILL. `write → fsync → rename` is the only safe pattern
+   for durable output.
+10. **Plan for clock skew across workers.** If timings feed SLA calculations, use a
+    single source (the web tier's monotonic clock) and propagate it in task args.
+
+##### L1.1.o Green-light checklist for each tier
+
+**Tier 1** — ship now:
+- [ ] Worker writes per-page MD/JSON/tables/entities/trace on completion.
+- [ ] Run manifest written and incrementally updated.
+- [ ] Postprocessor rewritten as aggregator that reads from disk.
+- [ ] Idempotent re-aggregation (re-running produces byte-identical outputs).
+- [ ] Tests: kill-the-worker-mid-doc test; aggregator-only test; resume-from-disk test.
+
+**Tier 2** — when users complain about jobs disappearing on restart:
+- [ ] SQLite `ingestion_jobs` schema + migration.
+- [ ] Startup reconciliation against disk manifests.
+- [ ] `/admin/resume` and `/ingest/{id}/retry` endpoints.
+
+**Tier 3** — when concurrent-docs > 5 or pages-per-doc > 100 regularly:
+- [ ] Redis + Celery in docker-compose.
+- [ ] Per-page task + idempotency markers.
+- [ ] Chord-based pipeline canvas.
+- [ ] Rate limiting (cluster-level, not per-worker).
+- [ ] DLQ monitoring + retry admin endpoints.
+- [ ] Flower or Prometheus exporter wired.
+- [ ] Load test: 10 × 100-page PDFs concurrent, zero data loss on force-killed worker.
+
 ---
 
-### FastAPI Endpoints
 
-**File**: `app/main.py`
+### L2 — Domain Knowledge Layer
 
-| Method | Endpoint               | Description                          |
-|--------|------------------------|--------------------------------------|
-| POST   | `/ingest`              | Upload PDF, start ingestion job      |
-| GET    | `/ingest/{job_id}`     | Get job status + progress            |
-| GET    | `/ingest/{job_id}/pages/{n}` | Get extracted markdown for page |
-| GET    | `/health`              | Health check (Qdrant, Gemini)        |
+`app/domain/well_taxonomy.py` (new). Controlled vocabulary as Python enums + JSON
+schemas, exported into Gemini `responseSchema`:
 
----
+- **NPT categories** — IADC standard 26-code list (mechanical, wait-on-weather,
+  wait-on-cement, stuck pipe, lost circulation, etc.)
+- **Operation types** — drilling, tripping, casing, cementing, logging, completion,
+  workover.
+- **Depth types** — MD, TVD, KB, RT, MSL, AHBDF.
+- **Unit normalization** — ft↔m, ppg↔kg/m³, bbl↔m³, psi↔kPa, in↔mm, °F↔°C.
+- **Section types** — surface, intermediate, production, completion.
+- **Formation aliases** — regional naming variants per asset config.
+- **Artifact classes** — the 10 PRD §10 classes (master, program, offset, DDR, handover,
+  service, risk, action, learning, media).
 
-## Implementation Order
+**Entity resolution module** — `app/domain/entity_resolver.py`:
 
-| Step | Task                                            | Estimated Complexity |
-|------|-------------------------------------------------|---------------------|
-| 1    | Project scaffolding + config + dependencies      | Low                 |
-| 2    | Gemini client + Files API upload + rate limiting | Medium              |
-| 3    | PyMuPDF baseline extraction + PaddleOCR fallback | Medium              |
-| 4    | Document structure scan (Phase 1)                | Medium              |
-| 5    | Explicit context caching setup                   | Medium              |
-| 6    | Batch queue with section-aware grouping          | Medium              |
-| 7    | Extractor agent + prompts (cached PDF)           | High                |
-| 8    | Validator agent + retry logic                    | High                |
-| 9    | Pro escalation node                              | Medium              |
-| 10   | LangGraph wiring (full graph)                    | Medium              |
-| 11   | Cross-page merging + markdown output             | High                |
-| 12   | Section-aware recursive MD chunking + table JSON | Medium              |
-| 13   | Qdrant client + collection + indexes             | Medium              |
-| 14   | Gemini embeddings + multimodal ingestion         | Medium              |
-| 15   | Pipeline orchestrator (end-to-end)               | High                |
-| 16   | FastAPI endpoints                                | Medium              |
-| 17   | Docker Compose (app + Qdrant)                    | Low                 |
-| 18   | Tests                                            | Medium              |
+- Each new entity → embedded → top-K against canonical store
+- If sim > 0.92 AND fuzzy string > 0.85 AND domain rules agree → merge to canonical ID
+- Otherwise create new canonical with provenance trail
+- Stub now (just log candidates), activate when corpus reaches 2+ docs
+
+L2 is the **single biggest accuracy lever after L1** because it constrains the model's
+output space at generation time rather than trying to clean up free text afterward.
 
 ---
 
-## Key Design Decisions
+### L3 — Tenant & Hierarchy Model
 
-1. **Native PDF over rasterization**: Gemini 2.5+ processes PDFs natively — extracts embedded text AND applies vision. Rasterizing to PNG loses the native text layer, forces re-OCR of machine-readable text, and costs more tokens. Google's own docs say: "Use PDFs created with text rendered as text instead of scanned images. This provides optimal results for text-heavy documents." We send the PDF directly via Files API.
+Entity model per PRD §4.2. Stored in **PostgreSQL** (or SQLite for pilot — same SQLAlchemy
+schema):
 
-2. **Document structure scan first**: A single cheap call (MEDIA_RESOLUTION_LOW = 280 tokens/page) gives us TOC, sections, cross-page tables, and document metadata. This context makes every downstream extraction call smarter — the extractor knows it's in "Formation Evaluation", knows the table continues from page 14, knows the document is a "well completion report". Without this, each page is extracted in isolation.
+```
+Operator ─┬─ Asset ─┬─ Field ─┬─ Campaign ─┬─ Rig
+          │         │          │             └─ Well ─┬─ Section
+          │         │          │                       └─ OperationWindow ─ Event ─ Action/Risk/Lesson
+          │         │          └─ User (with scope membership)
+          │         └─ Taxonomy override
+          └─ Tenant config (timezone, units, naming, AI guardrails)
+```
 
-3. **Batch processing over page-by-page**: Batches of ~5 pages aligned to section boundaries solve the cross-page problem (tables spanning pages, sections spanning pages). Also reduces total API calls by ~5x vs page-by-page.
+PRD-required behaviors:
+- One artifact → one primary scope, optional explicit cross-link (FR-007)
+- Risk inheritance with local override (FR-024)
+- Action ownership single-writer with watchers (PRD §4.3)
+- Audit log on every mutation (FR-039)
 
-4. **Context caching**: Upload PDF once, cache it, reference cache in all subsequent calls. Gemini 2.5 explicit caching gives ~4x input cost reduction. For a 200-page PDF with ~40 batches × 2-4 calls each, this is massive savings. Implicit caching (auto-enabled on 2.5+) gives additional hits for similar-prefix requests.
-
-5. **PyMuPDF/PaddleOCR as validation reference, not primary extraction**: v1 used PyMuPDF as input to the extractor. v2 uses it purely as an independent baseline for the Validator to cross-check against. Gemini sees the native PDF directly — PyMuPDF text is a "second opinion" to catch extraction gaps, not the primary source.
-
-6. **No LLM-as-Judge in Phase 0**: v1 spent an LLM call per page comparing PyMuPDF vs PaddleOCR output. Unnecessary — the Validator in Phase 3 already compares Gemini's extraction against baseline_text. Removing this saves 1 API call per page.
-
-7. **MEDIA_RESOLUTION per complexity**: Google's docs show MEDIUM (560 tokens/page) is optimal for standard documents, but HIGH (1120 tokens/page) is needed for complex visual analysis, chart reading, dense tables. DocStructure tags page complexity → we use HIGH only where needed, saving tokens on simple text pages.
-
-8. **Section-aware chunking**: Standard recursive chunking doesn't know about document structure. Our chunker uses DocStructure section boundaries as primary split points — a chunk never spans two unrelated sections. Each chunk carries `section_name` metadata enabling filtered retrieval in Qdrant.
-
-9. **2 agents, not 3**: The identifier agent is redundant — Gemini sees the native PDF page directly and can identify + extract in one pass. The baseline_text provides additional context about what's on the page.
-
-10. **Tables as dual format**: Markdown for human readability in files; JSON for structured retrieval in Qdrant (attached to chunk metadata). This means a query like "what was the casing depth?" can retrieve the exact table cell.
-
-11. **Escalation is terminal**: Pro 2.5 output is final — no further validation loop to avoid cost explosion on edge cases.
-
-12. **PDF splitting for large documents**: Gemini Files API has a hard limit of 1000 pages / 50 MB per upload. Well reports can reach 6000+ pages. We split at ~800-page boundaries, preferring TOC section breaks. Each chunk is processed independently through the full pipeline, then merged in post-processing. Structure scan only needs the first ~20 pages (title + TOC) regardless of document size.
+**Pilot simplification:** ship with one operator, one asset, one campaign hard-coded.
+Schema supports multi-tenant from day one but UI/RBAC can be deferred to Phase 3.
 
 ---
 
-## What Changed from v1
+### L4 — Artifact Linkage & Versioning
 
-| Aspect | v1 Plan | v2 Plan | Why |
-|--------|---------|---------|-----|
-| PDF input method | Rasterize to 300 DPI PNG images, send as image bytes | Native PDF via Files API (no rasterization) | Gemini processes PDFs natively — extracts text layer + applies vision. PNG loses native text, costs more tokens, degrades quality on text-heavy pages |
-| Phase 0 | PyMuPDF + PaddleOCR + LLM-as-Judge comparison | PyMuPDF + PaddleOCR only (no LLM call) | LLM comparison is redundant — Validator in Phase 3 already does this. Saves 1 API call per page |
-| Phase 1 | Rasterization (300 DPI) | Document Structure Scan (TOC, sections, cross-page tables) | Structure awareness is critical for extraction quality. Tables span pages, sections span pages — without this context, extraction is blind |
-| Processing unit | Single page | Batch of ~5 pages (section-aligned) | Cross-page context, fewer API calls, better cache utilization |
-| Context caching | Not used | Explicit cache of full PDF, reused by all agent calls | ~4x cheaper input tokens. 200-page PDF with 80+ API calls → huge savings |
-| Media resolution | Fixed 300 DPI for all pages | Adaptive: HIGH for complex pages, MEDIUM for text-only | Google recommends MEDIUM for standard docs; HIGH only for dense tables/charts. Saves tokens on simple pages |
-| PyMuPDF role | Primary input to extractor | Validation reference for cross-checking | Gemini's native PDF vision is superior to PyMuPDF text + image; PyMuPDF serves as independent "second opinion" |
-| Chunking | Generic recursive | Section-aware recursive (split on section boundaries) | Chunks don't span unrelated sections; each chunk tagged with section_name for filtered retrieval |
-| Qdrant metadata | Basic (page, doc, type) | Rich (section_name, well_name, operator, document_type, filterable indexes) | DocStructure provides document intelligence for free — use it in retrieval |
-| Cross-page handling | Not addressed | Explicit: cross_page_tables in DocStructure, cross_page_notes in extraction, merging in post-processing | This was the biggest gap in v1 — well reports frequently have tables spanning 3-5 pages |
-| Cost per 200-page PDF | ~400+ uncached API calls | ~1 structure scan + ~80 cached calls (~4x cheaper each) | Roughly 60-70% cost reduction |
+The ingestion service (L1) becomes one of several artifact producers. New SQLAlchemy
+table `artifacts` with PRD-mandated metadata (FR-005): `artifact_class`, `source_owner`,
+`scope_path`, `effective_date`, `confidentiality_class`, `revision_no`,
+`supersedes_id`, `release_state`, `sha256`, `link_to_extraction_run_id`.
+
+**Revision logic (FR-006):** uploading a new version of an existing artifact (matched by
+`scope + class + filename` or explicit override) marks prior revision `superseded` but
+keeps it queryable. Retrieval by default filters to current effective revision.
+
+**Duplicate detection (FR-008):** on upload, compute sha256 + content embedding; flag
+high-similarity matches for steward review.
+
+---
+
+### L5 — Retrieval Backbone (RAG + KG)
+
+Two parallel indexes from day one (do **not** bolt KG on later — it's a 10× cost):
+
+#### 5.1 Qdrant `chunks_text`
+- Heading-aware MD chunking: `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter`
+- ~1000 token chunks, 200 overlap
+- Payload: `doc_id`, `artifact_class`, `scope_path` (well/section), `page_num`,
+  `section_path` (heading hierarchy), `chunk_index`, `text`, `has_table`, `has_image`,
+  `tier_weight`, `provenance` (full L1 record)
+- Vector: `gemini-embedding` (768-dim or model-default)
+- Indexed payload fields: `scope_path`, `artifact_class`, `section_path`,
+  `effective_date`, `release_state`
+
+#### 5.2 Qdrant `entities_facts`
+- One point per L2 entity (NPT event, formation top, depth, fluid, BHA component, etc.)
+- Embedding of canonical text form: `f"{entity_type} {value} {unit} {context_phrase}"`
+- Payload: structured fields + provenance + `canonical_id` (from L2 resolver)
+- Indexed fields: `well_api`, `formation`, `npt_category`, `depth_range`, `event_date`
+- Enables filtered retrieval like "all NPT > 100h in Eagle Ford in 2024" without LLM
+
+#### 5.3 Qdrant `image_descriptions`
+- One point per described image/figure/log strip from L1
+- Embedding of description text
+- Payload: `doc_id`, `page_num`, `bbox`, `description`, `image_type` (log_strip,
+  schematic, plot, photo, table_image), `tier_weight`
+- Used for the image-grounding pipeline (§3.2)
+
+#### 5.4 Knowledge Graph (graph DB)
+Choice: **Neo4j Community** for pilot (Docker), or **NetworkX-on-Postgres** for ultra-light.
+Either way the on-disk format is `graph.jsonl` per the entity-extraction output, so the
+graph store is interchangeable.
+
+Node types: `Operator`, `Asset`, `Field`, `Campaign`, `Well`, `Section`, `Formation`,
+`Rig`, `BHA`, `NPTEvent`, `Lesson`, `Action`, `Risk`.
+
+Edge types: `BELONGS_TO`, `PENETRATES` (well→formation with depths), `EXPERIENCED`
+(well→NPT), `RAN_ON` (BHA→well), `LEARNED_FROM` (lesson→event), `ANALOG_OF`
+(well→well, with similarity score + reasons), `MITIGATES` (action→risk).
+
+KG enables:
+- **Offset intelligence** (PRD FR-012): "wells in same field within ±500m TVD with same
+  formation sequence" → graph traversal instead of vector search
+- **Repeated-issue detection** (PRD FR-013): NPT events grouped by category + formation
+  + section type
+- **Cross-well comparison** (the user's stated future goal)
+
+#### 5.4.1 Neo4j Integration — Deep Dive (design-only, no code yet)
+
+> **Status:** Not built. This subsection is the full integration dossier to be consulted
+> when the KG work is actually picked up. The explicit ordering is:
+>
+> **(1) Clean extraction (L1)** must be locked first →
+> **(2) Entity validation & resolution (L2)** must be locked second →
+> **(3) Relationship tagging & Neo4j load (this section)** is layered on top **last**.
+>
+> Any Neo4j work started before (1) and (2) reach their exit gates will poison the graph
+> with hallucinated nodes and ambiguous edges that are effectively impossible to clean up
+> without wiping the store. **Do not deviate from this order.**
+
+##### 5.4.1.a Why Neo4j (and why later, not now)
+
+The product value of the KG is **cross-document, cross-well reasoning** — offset intel,
+repeated-cause detection, lesson analogs, "all wells that hit Eagle Ford in <500m TVD
+with a stuck-pipe event". None of that is available from a vector index alone because:
+
+- Vector search retrieves **text similarity**, not **structural relationships**. It cannot
+  answer "find wells that share a formation *sequence*" — that's a path query.
+- Aggregations like "total NPT hours by IADC category across the Field" are graph/SQL
+  problems, not embedding problems.
+- Analog-well ranking needs **multi-hop** traversal (well → field → neighboring wells →
+  same-section NPT history → lessons referencing that NPT) — each hop filtered by scope
+  and tier weight.
+
+But the value is **strictly downstream** of extraction accuracy. A graph built from
+noisy entities is worse than no graph — it produces confidently-wrong analogs and
+miscounts NPT campaigns. Hence the ordering above.
+
+##### 5.4.1.b Prerequisites (hard gates before any Cypher is written)
+
+These are the **go/no-go conditions**. Failing any of them means Neo4j work is on hold.
+
+| Gate | Source | Threshold | Why it blocks the KG |
+|---|---|---|---|
+| G-KG.1 | Phase 1A exit gate | Entity recall ≥ 0.99 (depths/NPT/tables) | Missed entities = missing nodes. A well with 40% of its NPTs missing is worse than no KG record at all. |
+| G-KG.2 | Phase 1B exit gate | Unit & NPT-code conformance = 100% | Free-text category strings produce duplicate/ambiguous nodes (e.g., "stuck pipe" vs "Stuck Pipe" vs "SP"). |
+| G-KG.3 | Phase 1B — entity resolver | Canonical-ID collision rate ≤ 1% on dev corpus | Without resolution, "Well ABC-1", "ABC 1", "ABC1" become three separate nodes. |
+| G-KG.4 | Phase 1A — provenance | 100% of entities carry `{doc_id, page_num, bbox}` | Every edge must be auditable back to a page region; without provenance, KG becomes an unaccountable black box. |
+| G-KG.5 | L2 taxonomy | Closed enum for every relationship type that maps to a PRD FR | Ad-hoc relationship strings defeat traversal queries (`ANALOG_OF` vs `analog_of` vs `ANALOGOUS_TO`). |
+| G-KG.6 | Integration test | Re-running the loader on the same corpus is **idempotent** (MERGE-only, no duplicate edges) | Non-idempotent loaders corrupt the store after the first re-ingestion. |
+
+Only when G-KG.1 through G-KG.5 are green does Neo4j infra stand up. G-KG.6 is a design
+requirement for the loader itself.
+
+##### 5.4.1.c Ingestion flow (where Neo4j plugs in)
+
+```
+  L1 ingestion pipeline (existing)
+        │
+        ▼
+  Per-page extraction output
+  {markdown, tables, images, entities[], bboxes}
+        │
+        ▼
+  L2 entity resolution  ──► canonical_id assigned to every entity
+        │                    provenance attached
+        ▼
+  Post-processor writes
+    • full_document.md
+    • tables/*.json
+    • entities.json (existing)
+    • relationships.jsonl (NEW, see §5.4.1.d)
+        │
+        ▼
+  KG Loader (new module, activated only after gates pass)
+    • Reads entities.json + relationships.jsonl per doc
+    • MERGE nodes by canonical_id
+    • MERGE edges with properties (source provenance, confidence, tier)
+    • Idempotent: re-running the loader on the same doc is a no-op
+        │
+        ▼
+  Neo4j store
+```
+
+The loader is an **out-of-band batch** keyed by `doc_id` — it runs after the L1 pipeline
+completes, not inside it. This keeps Neo4j a non-blocking downstream consumer: if Neo4j
+is down, ingestion still completes, and the loader can back-fill.
+
+##### 5.4.1.d Relationship tagging — where it is produced
+
+**Decision: relationships are produced by a dedicated post-extraction pass, NOT asked of
+the page-level extractor.**
+
+Rationale: the extractor sees ONE page at a time. Most meaningful relationships span
+pages or documents (a well penetrates a formation described on page 3 at a depth logged
+on page 14, referenced in a lesson captured in a different report entirely). Asking the
+page extractor for relationships would force it to guess cross-page structure it cannot
+see, producing noisy edges.
+
+Instead: a **Relationship Builder** module runs after L2 entity resolution. It has three
+inputs:
+
+1. The full-document entity list (with canonical IDs and provenance).
+2. The L2 controlled-vocabulary schema defining valid `(subject_type, edge_type, object_type)`
+   triples.
+3. A small rule library (deterministic, rule-based first; LLM-assisted only for edge
+   cases):
+   - `PENETRATES` — emitted when a `Well` entity and a `Formation` entity co-occur with
+     a `depth` value in the same section or table row.
+   - `EXPERIENCED` — emitted when an `NPTEvent` co-occurs with a `Well` in the same DDR.
+   - `RAN_ON` — emitted when a `BHA` and `Well` co-occur in a BHA run summary.
+   - `ANALOG_OF` — NOT emitted by the extractor or builder. Computed at query time by the
+     retrieval layer using well attributes + traversal — storing it would freeze an
+     analog judgement that should adapt as new wells are ingested.
+   - `LEARNED_FROM` — emitted when a `Lesson` entity explicitly references an event or
+     NPT by canonical ID.
+   - `MITIGATES` — emitted when an `Action` entity's `addresses` field points to a `Risk`.
+
+Every emitted relationship carries:
+- `{source_doc_id, source_page_num, source_bbox}` — provenance
+- `confidence` — from the extraction pass that produced the constituents
+- `tier_weight` — inherited from the source artifact's tier (§3.3)
+- `extraction_run_id` — for traceability to a specific ingestion
+
+LLM-based relationship extraction is held in reserve as a **second pass only**, gated
+behind explicit review, for rare relationships the rule library cannot express. It is
+**not** the default — deterministic rules over validated entities produce fewer false
+edges than LLM relationship extraction over the same entities.
+
+##### 5.4.1.e Neo4j schema (indicative — to be finalized in the KG phase)
+
+```
+// Core hierarchy (mirrors L3 tenant model)
+(:Operator)-[:OWNS]->(:Asset)-[:CONTAINS]->(:Field)-[:RUNS]->(:Campaign)
+(:Campaign)-[:DRILLS]->(:Well)-[:HAS_SECTION]->(:Section)
+(:Campaign)-[:USES_RIG]->(:Rig)
+
+// Geology
+(:Well)-[:PENETRATES {top_md, top_tvd, bottom_md, bottom_tvd, confidence, provenance}]->(:Formation)
+
+// Operations
+(:Well)-[:EXPERIENCED {duration_hr, depth_md, iadc_code, confidence, provenance}]->(:NPTEvent)
+(:BHA)-[:RAN_ON {section, run_no, provenance}]->(:Well)
+
+// Learning
+(:Lesson)-[:LEARNED_FROM {provenance}]->(:NPTEvent)
+(:Lesson)-[:APPLIES_TO]->(:Section)    // section type, not instance
+(:Action)-[:MITIGATES {status, owner}]->(:Risk)
+(:Risk)-[:OBSERVED_ON]->(:Well)
+
+// Artifact lineage (ties graph back to source docs)
+(:Document)-[:MENTIONS {page_num, bbox, confidence}]->(:NPTEvent)
+(:Document)-[:MENTIONS {page_num, bbox, confidence}]->(:Formation)
+// etc. — every node type has a MENTIONS edge from at least one Document.
+```
+
+**Indexing strategy:**
+- Uniqueness constraints on `canonical_id` for every node type.
+- Composite index on `(Well.field_name, Well.tvd_range)` for offset queries.
+- Composite index on `(NPTEvent.iadc_code, NPTEvent.formation_name)` for repeated-cause.
+- Full-text index on `Well.name_aliases[]` for entity-resolution fallback searches.
+
+##### 5.4.1.f Pros & Cons
+
+**Pros:**
+1. **Relationship queries become first-class.** Offset intelligence, repeated-cause
+   detection, and analog ranking shift from brittle LLM prompting to deterministic
+   Cypher — orders of magnitude faster and auditable.
+2. **Audit trail by design.** Every edge carries `{doc_id, page_num, bbox}`. An SME can
+   click any relationship in the UI and see the exact page region that produced it.
+3. **Schema enforces correctness.** Typed nodes + typed edges + uniqueness constraints
+   prevent the "same well, three different IDs" drift that pure-vector stores cannot
+   catch.
+4. **Decoupled from ingestion.** Neo4j down ≠ ingestion down. Loader is a batch job that
+   back-fills when the store returns.
+5. **Portable format.** The on-disk `relationships.jsonl` is graph-store-agnostic. If we
+   outgrow Neo4j Community or move to AWS Neptune/TigerGraph/AGE, the migration is a
+   re-load, not a re-extraction.
+6. **Enables SME "why did the system say this?" at the relationship level** — not just
+   at the document level.
+
+**Cons / costs:**
+1. **Operational overhead.** Neo4j is another service to run, back up, monitor, and
+   upgrade. Not free even in Community edition.
+2. **Schema ossification.** Once the graph has tens of thousands of edges, schema
+   migrations (renaming an edge type, splitting a node type) are painful and error-prone.
+3. **Double-writing risk.** Artifacts live in Postgres (L4), entities live in Qdrant (L5),
+   graph lives in Neo4j — keeping three stores consistent after a re-ingestion or a
+   retraction is a known hard problem. Requires a tombstone/lineage discipline.
+4. **Learning curve.** Cypher is a specialized DSL. Team onboarding cost is non-zero.
+5. **Licence footprint.** Community edition is GPLv3 — fine for a self-hosted internal
+   product, but if we ever sell a hosted multi-tenant service, enterprise licensing
+   becomes a real cost.
+6. **Not useful at single-doc scale.** KG value compounds with corpus size. Building it
+   before we have ≥ 50 ingested wells is pure overhead.
+
+##### 5.4.1.g Future pitfalls we must plan against
+
+These are the traps other teams have stumbled into. Calling them out now so the KG phase
+does not re-learn them the hard way.
+
+1. **"Entity explosion."** If the extractor or L2 resolver has a bug that produces a
+   near-duplicate `Well` node per DDR, the graph doubles in size with every ingestion.
+   *Mitigation:* G-KG.3 (≤ 1% collision rate on dev corpus before loader goes live),
+   plus a nightly deduplication audit that flags `Well` pairs with ≥ 0.92 name similarity
+   as candidates for merge review.
+2. **"Poisoned edges from bad pages."** A single mis-extracted page can emit dozens of
+   wrong `PENETRATES` edges (a formation top misread). Since edges carry provenance,
+   **retraction** must be supported: a UI or admin tool that accepts `doc_id` and
+   deletes all graph changes whose `extraction_run_id` matches.
+3. **"Silent analog drift."** If the `ANALOG_OF` edge is stored (not computed at query
+   time), it freezes an analog judgement that becomes stale as new wells arrive.
+   *Mitigation:* keep `ANALOG_OF` a **derived** relationship — computed on demand by the
+   retrieval layer, cached for a short TTL only. Never written to the graph as a
+   permanent edge.
+4. **"Schema rewrite nightmare."** Adding a new node type is cheap; renaming or splitting
+   an existing type when there are 10M edges is not. *Mitigation:* every node type gets
+   a `schema_version` property from day 1. Loader writes the version. Readers tolerate
+   older versions. Migrations are additive.
+5. **"Graph-RAG hallucination laundering."** The tempting pattern is "serialize a
+   sub-graph and shove it into a Gemini prompt for synthesis." This turns structured
+   fact into free text the model can re-interpret. *Mitigation:* the composer in the
+   hybrid retrieval pipeline (§5.5) must quote graph facts **verbatim with provenance**,
+   and the critic must flag any numeric claim in the draft that does not appear verbatim
+   in the retrieved sub-graph.
+6. **"Permissions bypass via graph traversal."** A scoped query on `chunks_text` correctly
+   excludes restricted docs, but a graph traversal that starts from a public node can
+   walk into restricted territory via confidential-sourced edges. *Mitigation:* every
+   edge and node carries a `confidentiality_class`. L7 RBAC filter is applied at
+   traversal time, not just at query entry.
+7. **"Too-clever loader."** If the loader tries to auto-heal entity mismatches at load
+   time (e.g., "this well looks like that other well, let me merge them"), it will
+   eventually merge the wrong pair. *Mitigation:* the loader is **dumb** — it only
+   creates what the upstream pipeline told it to create. Merges are explicit, auditable
+   operations performed by a separate admin tool.
+8. **"No retraction path."** If a source document is superseded (L4 revision) or
+   retracted, there must be a clean way to remove its contributions from the graph.
+   Since every edge carries `extraction_run_id`, this is a single Cypher DELETE keyed
+   on that ID. Must be tested end-to-end before the loader is released.
+9. **"Graph as ingestion critical path."** Tempting to add "write to Neo4j" synchronously
+   into the ingestion pipeline. Don't. Neo4j availability would become a single point
+   of failure for the entire document intake. Always a separate batch loader.
+10. **"Over-ambitious first schema."** Shipping a 25-node-type, 40-edge-type schema on
+    day one guarantees half of them are wrong. *Mitigation:* first load is the 8 node
+    types and 5 edge types listed in §5.4. Everything else earns its place by being
+    required for a specific PRD FR.
+
+##### 5.4.1.h When to actually start building it
+
+Green-light checklist — all must be true:
+
+- [ ] Phase 1A exit gate met (extraction accuracy on golden set)
+- [ ] Phase 1B exit gate met (entity validation, unit/NPT enums, resolver stub active)
+- [ ] Dev corpus is ≥ 10 wells / 50 documents (enough to meaningfully exercise the graph)
+- [ ] At least one concrete PRD FR requires graph traversal **right now** (FR-012 offset
+      or FR-013 repeated-cause are the canonical triggers)
+- [ ] Team has committed capacity for (a) Neo4j operations, (b) schema migrations, and
+      (c) the retraction/audit tooling — not just the happy-path loader
+
+Until all five are true, KG work is **documented, not built.** The entity output from
+L1 + L2 already produces a `graph.jsonl` style artifact — that artifact is forward-
+compatible with any graph backend, so no work is lost by waiting.
+
+##### 5.4.1.i Alternatives (and why Neo4j is still the likely pick)
+
+| Option | Pro | Con | Verdict |
+|---|---|---|---|
+| **Neo4j Community** (Docker) | Mature, Cypher, native graph algos, best SME ecosystem | Another service, GPLv3, ops burden | **Default choice.** Best fit for pilot & enterprise dev experience. |
+| **Apache AGE** (Postgres extension) | Graph + relational in one store, no new ops | AGE's OpenCypher support is partial, less mature tooling, SME query skills don't transfer as cleanly | Strong candidate if team wants to minimise services. Revisit at Phase 2 kickoff. |
+| **NetworkX in-process** | Zero ops, pure Python, fast for small graphs | Not a database — no persistence, no concurrent writers, collapses past ~10M edges | Good for the canonical-store *in-memory resolver cache*. Not a replacement for a real graph DB. |
+| **AWS Neptune / TigerGraph / Memgraph** | Managed, scales | Cloud lock-in, cost, not needed for pilot | Defer until clear scale signal. |
+| **No graph at all, use Postgres recursive CTEs on a relational edge table** | Simplest possible stack | Expressing 4+ hop traversals in SQL is painful and slow; no graph algos | Viable fallback if ops burden is the deciding factor. Document as escape hatch, do not ship by default. |
+
+The decision is **revisited at the Phase 2 kickoff**, not now. Documenting the decision
+here means the kickoff can be a one-meeting confirmation, not a research project.
+
+#### 5.5 Hybrid Retrieval Pipeline
+For a user query:
+
+1. Detect query intent (classifier or simple keyword routing): factual, analog,
+   trend, image-lookup, action/risk
+2. Route:
+   - factual → `chunks_text` semantic search + scope filter + tier reweight
+   - analog → KG traversal seeded by current-well attributes + entity vector search
+   - trend → SQL/graph aggregation over `entities_facts`
+   - image → `image_descriptions` search → crop bbox from stored page PNG
+   - action/risk → SQL on L4 action table + scope filter
+3. Rerank: semantic_score × tier_weight × recency_boost × scope_proximity
+4. Compose answer with **source-cited Markdown**: every claim ends with
+   `[doc_X p.N]` and the response payload carries the structured provenance for the UI
+   to render evidence cards
+5. **Always include the top-1 supporting image crop** if any retrieved chunk has
+   `has_image=true` or the query intent is image-related
+
+This is implemented as a small LangGraph: `intent_router → retriever(s) → reranker →
+composer → critic`. The **critic** node verifies that every numeric claim and every
+named entity in the draft answer appears in the retrieved evidence; if not, it either
+rewrites with hedging or returns "insufficient evidence" (PRD §18.3).
+
+---
+
+### L6 — Operational Synthesis Agents
+
+Each PRD operational deliverable (§16) is a small LangGraph that consumes from L5 and L4:
+
+| Agent | PRD ref | Inputs | Output |
+|---|---|---|---|
+| Daily Summary | FR-018 | Latest DDR + specialist reports + open actions for scope | Drafted summary + provenance + open-issue diff |
+| Shift Handover | FR-020 | Current-shift events + open actions + carry-forward | Handover note + ack queue |
+| Program QA | FR-015–017 | Program artifact + offset entities + lessons | Gap list with section grouping + evidence cards |
+| Offset Intelligence | FR-012–014 | Current-well attributes | Ranked analog wells + lesson summary + section watchouts |
+| Lessons Retrieval | FR-029–030 | Query or current section context | Applicable lessons with provenance |
+| Action Board | FR-023–025 | L4 actions table | Filtered prioritized list |
+| Campaign Review | FR-027–028 | All scoped entities + L4 events | Trends + repeated-cause analysis + exception list |
+
+Each agent emits to a **Drafts table** (release state = `draft|in_review|released`)
+satisfying PRD §13.3 (high-consequence outputs route to review, never auto-release).
+
+---
+
+### L7 — RBAC & Governance
+
+PRD §7. Implemented as FastAPI dependency that resolves user → scope memberships →
+filter applied to every L3/L4/L5 query. Three permission axes:
+
+- **Action**: read, create/update, approve, admin
+- **Scope**: asset, field, campaign, well, section
+- **Confidentiality**: public, internal, restricted, third-party
+
+Audit log table records every mutation + every released AI draft with evidence count
+and approver (FR-039).
+
+---
+
+### L8 — API + Workspace UI
+
+#### API surface (extension of current FastAPI)
+
+```
+# Existing
+POST   /ingest                              upload + start extraction job
+GET    /ingest/{job_id}                     job status
+
+# L4
+POST   /artifacts                           upload + classify + link to scope
+GET    /artifacts                           filtered list
+GET    /artifacts/{id}/page/{n}             rendered page image (with optional bbox crop)
+
+# L3
+GET    /scopes/{type}/{id}                  hierarchy lookup
+GET    /wells/{id}/timeline                 events + reports + actions sorted
+
+# L5 retrieval
+POST   /search                              {query, scope, intent_hint?} → answer + evidence + image crops
+POST   /offsets/{well_id}                   ranked analog wells + reasons
+POST   /program-qa/{program_id}             gaps + evidence cards
+
+# L6 deliverables
+POST   /summary/daily/{scope}               draft daily summary
+POST   /handover/{shift_id}                 draft handover
+GET    /actions                             open issue board
+
+# L7
+GET    /me                                  scopes + permissions
+GET    /audit                               audit trail (admin)
+```
+
+Every retrieval/synthesis response shape includes:
+```json
+{
+  "answer_markdown": "...",
+  "evidence": [{"doc_id":"...","page_num":13,"bbox":[...],"excerpt":"...","tier":1}],
+  "image_crops": [{"doc_id":"...","page_num":13,"bbox":[...],"png_uri":"..."}],
+  "confidence": 0.91,
+  "warnings": []
+}
+```
+
+#### UI (deferred — pilot can use Swagger + a thin Streamlit/Next.js view)
+The PRD UI (workspace tabs, dashboards) is large. For pilot we ship:
+- Streamlit app with: scope picker → search box → answer panel with evidence cards
+  (clickable → opens page PNG with bbox highlighted) → image crop strip below answer
+- Static page-image viewer endpoint for evidence drilldown
+- Full PRD workspace UI is Phase 4
+
+---
+
+## 5. Phase-Wise Roadmap (feasibility-ranked)
+
+Each phase ends with a measurable accuracy/grounding gate. **No phase advances until
+the gate is met.** Time estimates omitted intentionally — quality gates the schedule.
+
+### Phase 1A — Accuracy & Grounding Hardening (current code base)
+**Why first:** RAG/UI accuracy is bounded by extraction accuracy. Build the
+golden-set + close the L1 gaps before adding more layers.
+
+Scope:
+1. G-L1.1 Persist page PNGs to `data/pages/`
+2. G-L1.2 Extend extractor schema with bbox per table & per image
+3. G-L1.3 Add `entities` field to extractor output (initially loose schema, tightened
+   in Phase 1B once L2 vocab is defined)
+4. G-L1.4 Adaptive DPI based on Phase 0 text density
+5. G-L1.5 ROI second-look on validator failure
+6. G-L1.6 Numeric guardrail pass
+7. **G-L1.7 Durable, resumable ingestion** — per §4.L1.1 dossier. Tier 1 (per-page
+   durability + run manifest + aggregator-only Phase 3) is **in-scope for Phase 1A**;
+   Tier 2 (SQLite job registry) and Tier 3 (Celery + Redis) are deferred to the phase
+   where real concurrent ingestion demand appears. Rationale: zero-data-loss for the
+   golden-set build is a hard prerequisite — losing a 700-page extraction run is
+   unacceptable regardless of accuracy.
+8. **Build the golden set**: 50 pages drawn from 5 representative well reports,
+   hand-labeled for: every depth, every NPT event, every table cell, every image
+   description, every formation top
+9. **CI regression test**: pytest fixture runs extraction on golden set; precision/recall
+   per entity type reported; fail if any class drops below 0.95 (target 0.99)
+
+**Exit gate:** golden-set entity recall ≥ 0.99 for depths/NPT/tables; ≥ 0.95 for image
+descriptions; bbox IoU ≥ 0.7 on tables; **and** a kill-the-worker-mid-doc test proves
+zero data loss on all already-extracted pages.
+
+### Phase 1B — Domain Knowledge Layer (L2)
+1. Build `well_taxonomy.py` enums (NPT IADC codes, depth types, units, op types)
+2. Build `unit_normalizer.py` with bidirectional conversions
+3. Tighten extractor `responseSchema` to use enums (NPT category, depth type, unit)
+4. Build `entity_resolver.py` stub + canonical-store schema (Postgres)
+5. Re-run golden set through schema-constrained extractor; expect entity precision lift
+
+**Exit gate:** unit and NPT-code conformance = 100% (no free-text categories);
+entity precision ≥ 0.99.
+
+### Phase 2 — Retrieval Backbone (L5)
+
+> **Ordering constraint (strict):** Phase 2 begins **only after Phase 1A and Phase 1B
+> exit gates are green** and the KG prerequisite gates in §5.4.1.b (G-KG.1–G-KG.5) are
+> met. Inside Phase 2 the sub-steps are also ordered: vector retrieval first (#1–#4),
+> KG second (#5–#6). Do not start Neo4j work until the vector pipeline is citing
+> sources correctly.
+
+1. Stand up Qdrant (Docker compose) + Postgres
+2. Build chunker + ingestion-to-Qdrant pipeline (3 collections)
+3. Build hybrid retrieval LangGraph with citation + image grounding
+4. Critic node: numeric/entity claim verification against retrieved evidence
+5. Stand up Neo4j + graph-loader from L1 entity output (see §5.4.1 dossier)
+6. Implement offset intelligence (KG traversal) + program QA (gap detection)
+7. Source-citation API contract finalized
+8. **Build retrieval golden set**: 30 questions across factual / analog / trend / image
+   intents, each with hand-labeled correct answer + required evidence docs
+
+**Exit gate:** retrieval precision@5 ≥ 0.9 on golden questions; **100% of answers
+cite at least one source**; image-intent queries return correct cropped image
+≥ 0.85 of the time; critic blocks ≥ 95% of injected hallucination test cases.
+
+### Phase 3 — Tenancy, Artifacts, RBAC (L3 + L4 + L7)
+1. Postgres schema: tenant hierarchy, artifacts, revisions, actions, risks, lessons,
+   audit log
+2. Migrate ingestion to write artifact + scope linkage
+3. Implement RBAC dependency in FastAPI; scope filter injected into every L5 query
+4. Approval workflow + release states for all L6 deliverables
+5. Audit log surfaced via `/audit` endpoint
+
+**Exit gate:** unauthorized scope queries return zero results; every released AI draft
+has owner + evidence count + audit row; revision lineage retrievable.
+
+### Phase 4 — Operational Synthesis Agents (L6)
+1. Daily summary, shift handover, action board (highest PRD value per §20)
+2. Lessons retrieval, offset intelligence pack, program QA pack
+3. Each agent emits to Drafts table with confidence + evidence + warnings
+4. **Synthesis golden set**: 10 historical handovers + 10 daily summaries hand-rated
+   by SME; system drafts compared
+
+**Exit gate:** SME usability rating ≥ 80% on drafted handovers + summaries
+(PRD §22.1 SME trust score target); zero critical-issue carry-forward loss across
+shift transitions in pilot.
+
+### Phase 5 — Pilot UI + Rollout
+1. Streamlit/Next.js workspace: scope picker, search, evidence cards, image viewer,
+   drafts review queue, action board
+2. Pilot data pack ingested per PRD §18.1 (1 well register, 10–20 offsets, 10–20 DDRs,
+   10+ handovers, lessons archive)
+3. 10–15 pilot users across roles per PRD §21.1
+4. Baseline-vs-pilot KPI measurement: handover cycle time, summary cycle time, lesson
+   retrieval speed, carry-forward integrity (PRD §22.1)
+
+**Exit gate:** PRD §22.1 success-metric targets met (handover time -30%, lesson
+retrieval -50%, summary effort -30%, ≥ 70% weekly active use, SME trust ≥ 80%).
+
+### Phase 6+ — PRD Phase 2/3 capabilities
+Cross-campaign repeated-pattern analytics, campaign onboarding packs, Learning Assist
+microbriefs, multi-asset rollout. Out of scope for this plan version.
+
+---
+
+## 6. What this plan deliberately does NOT do
+
+- **No autonomous operational recommendations.** PRD §19. The system drafts, humans
+  approve.
+- **No replacement for real-time rig data systems.** Live status feed is optional
+  (PRD §18.1) and added only if a pilot operator provides one.
+- **No physics simulators, no anti-collision/T&D packages, no ERP.** PRD §5.3.
+- **No full LMS.** Learning Assist (PRD §23) is a Phase 6+ thin extension.
+- **No Files API or context caching** (architecture decision retained from v3 — see
+  `PLAN_v3_ingestion.md` rationale; see also v3-retrospective notes captured in this
+  conversation history).
+
+---
+
+## 7. Open decisions for stakeholder review
+
+1. **Graph DB choice**: Neo4j Community vs Apache AGE (Postgres graph extension) vs
+   NetworkX-in-process vs managed (Neptune/Memgraph). Default is Neo4j Community per
+   §5.4.1.i; final choice confirmed at Phase 2 kickoff, **not earlier**. Pilot scale
+   does not need Neo4j until Phase 2 prerequisite gates (§5.4.1.b G-KG.1–G-KG.5) are
+   green. Ordering is non-negotiable: clean extraction (L1) → entity validation &
+   resolution (L2) → relationship tagging → KG load. See §5.4.1 for the full dossier.
+2. **Postgres vs SQLite for pilot**: SQLite simpler for single-asset pilot; Postgres
+   needed at multi-tenant. Plan: SQLite with SQLAlchemy now, Postgres-compatible schema
+   so flip is one config change.
+3. **Embedding model**: `gemini-embedding-exp-03-07` is current; revisit when
+   `gemini-embedding-001` (GA) ships.
+4. **JV / multi-operator partitioning** (PRD §24.3 open question). Assume single-operator
+   pilot; defer multi-operator confidentiality model to Phase 3.
+5. **Live data feeds** (PRD §24.3). Plan assumes document-first MVP per PRD §24.1.
+6. **Confidence threshold for AI release** (PRD §24.3). Default `pass_confidence_threshold
+   = 0.85` from v3 ingestion config; SME to validate during Phase 1 golden-set build.
+
+---
+
+## 8. Success Definition
+
+This plan succeeds when, against a real pilot well report corpus:
+
+- Any role can ask a question, get a **source-cited Markdown answer with at least one
+  page-region image when relevant**, and click through to the exact page region
+- A drafted shift handover preserves all critical carry-forward items with zero loss
+  across a shift transition
+- A drafted daily summary is approved by the operational owner with at most light edits
+  in ≥ 80% of cases
+- A planner can retrieve top-3 analog wells for a new section in under 1 minute and see
+  the lessons that apply
+- The system can correctly count NPT hours by IADC category across an entire campaign
+  and tie each event back to its source artifact
+- An incoming SME can audit every claim back to the rendered page region it came from
+
+The user's two explicit asks — **99% accuracy** and **image grounding tied to source
+docs** — are the gating criteria for every phase exit, not a "later" feature.

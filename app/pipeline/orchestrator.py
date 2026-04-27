@@ -1,39 +1,44 @@
-"""Pipeline orchestrator — manages the full ingestion lifecycle for a document.
+"""Pipeline orchestrator — manages the v3 streaming ingestion lifecycle.
 
-Wires together all phases:
-  Pre-Phase: PDF splitting (if >1000 pages)
-  Phase 0:   Baseline text extraction (pymupdf4llm)
-  Phase 1:   Document structure scan via Gemini (TOC, sections, entities)
-  Phase 2:   Batch queue construction (section-aligned page batches)
-  Phase 3:   LangGraph agent extraction + validation + escalation
+Wires together all phases for a single PDF:
+  Phase 0:  Baseline text extraction (pymupdf4llm) — local, no LLM
+  Phase 1:  Streaming page rasterizer (PNG bytes → PageDeque)
+  Phase 2:  100 concurrent per-page workers (LangGraph: extractor → validator → escalator)
+  Phase 3:  Post-processing (cross-page table merge, full document assembly)
+  Phase 4:  Vectorize (chunk → embed → upsert to Qdrant)
 
-Each ingestion job gets a unique ID and tracks progress through phases.
-Results are written to disk and returned via the API.
+Each ingestion job gets a unique ID; per-page results land in
+`JobResult.page_results` as soon as each worker completes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+from app.agents.graph import build_graph, page_image_to_state
 from app.config import Settings
-from app.models.schemas import DocStructure, JobStatus, PageBaseline, PageBatch
-from app.agents.graph import build_graph, run_graph_on_batches
-from app.pipeline.batch_queue import BatchQueue, build_batches
+from app.models.schemas import JobStatus, PageBaseline
+from app.models.state import PageState
+from app.pipeline.page_streamer import PageDeque, rasterize_pages
+from app.pipeline.postprocessor import PostProcessor
 from app.pipeline.preprocessing import Preprocessor
-from app.pipeline.structure_scan import ScanResult, StructureScanner
 from app.storage.file_storage import FileStorage
+from app.storage.redis_store import save_job, update_job_field
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
-from app.utils.pdf_splitter import PDFSplitter, SplitResult
+from app.vectorstore.chunker import DocumentChunker
+from app.vectorstore.embedder import GeminiEmbedder
+from app.vectorstore.qdrant_store import QdrantVectorStore
 
 logger = get_logger(__name__)
 
 
 class JobResult:
-    """Container for a completed ingestion job."""
+    """Container for a v3 ingestion job."""
 
     def __init__(self, job_id: str, filename: str) -> None:
         self.job_id = job_id
@@ -43,24 +48,25 @@ class JobResult:
         self.pages_processed: int = 0
         self.current_phase: str = ""
         self.error: str | None = None
-        self.split_result: SplitResult | None = None
         self.baselines: list[PageBaseline] = []
-        self.doc_structure: DocStructure | None = None
-        self.scan_result: ScanResult | None = None
-        self.batches: list[PageBatch] = []
-        self.batch_queue: BatchQueue | None = None
-        self.extraction_results: list[dict] = []  # Phase 3 BatchState results
-        self.phase_timings: dict[str, int] = {}  # phase → ms
+        # {page_num: PageState dict}
+        self.page_results: dict[int, dict] = {}
+        self.phase_timings: dict[str, int] = {}
         self.output_dir: Path | None = None
 
     def to_summary(self) -> dict[str, Any]:
-        """Serialize to a JSON-friendly summary dict."""
         scanned_count = sum(1 for b in self.baselines if b.is_scanned)
         avg_chars = (
             sum(b.char_count for b in self.baselines) / len(self.baselines)
-            if self.baselines
-            else 0
+            if self.baselines else 0
         )
+        escalated = sum(1 for r in self.page_results.values() if r.get("escalated"))
+        iter_counts = {1: 0, 2: 0, 3: 0}
+        for r in self.page_results.values():
+            it = r.get("iteration", 0)
+            if it in iter_counts:
+                iter_counts[it] += 1
+
         return {
             "job_id": self.job_id,
             "filename": self.filename,
@@ -69,29 +75,10 @@ class JobResult:
             "pages_processed": self.pages_processed,
             "current_phase": self.current_phase,
             "error": self.error,
-            "split": {
-                "was_split": self.split_result.was_split if self.split_result else False,
-                "num_chunks": len(self.split_result.chunks) if self.split_result else 1,
-                "chunk_pages": (
-                    [c.page_count for c in self.split_result.chunks]
-                    if self.split_result
-                    else []
-                ),
-            },
-            "doc_structure": (
-                self.doc_structure.model_dump() if self.doc_structure else None
-            ),
-            "batches": {
-                "total": len(self.batches),
-                "batch_sizes": [
-                    b.page_end - b.page_start + 1 for b in self.batches
-                ],
-            },
             "extraction": {
-                "batches_processed": len(self.extraction_results),
-                "escalated": sum(
-                    1 for r in self.extraction_results if r.get("escalated")
-                ),
+                "pages_extracted": len(self.page_results),
+                "escalated_to_pro": escalated,
+                "iter_distribution": iter_counts,
             },
             "phase_timings_ms": self.phase_timings,
             "stats": {
@@ -103,200 +90,221 @@ class JobResult:
             "output_dir": str(self.output_dir) if self.output_dir else None,
         }
 
+    def persist(self) -> None:
+        """Persist current job state to Redis (called at phase boundaries)."""
+        try:
+            save_job(self.job_id, self.to_summary())
+        except Exception:
+            logger.warning("redis_persist_failed", job_id=self.job_id, exc_info=True)
 
-# In-memory job store (replace with DB/Redis in production)
+
+# In-memory job store — bounded LRU to prevent OOM on high-volume ingestion.
+# Completed/failed jobs are persisted to Redis; only the most recent N are
+# kept in memory for fast access by the sync endpoint and page-level queries.
+_MAX_IN_MEMORY_JOBS = 20
 _jobs: dict[str, JobResult] = {}
+
+
+def _evict_old_jobs() -> None:
+    """Evict oldest completed/failed jobs when the cache exceeds the cap."""
+    if len(_jobs) <= _MAX_IN_MEMORY_JOBS:
+        return
+    evictable = [
+        jid for jid, j in _jobs.items()
+        if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+    ]
+    # Remove oldest first (dict preserves insertion order in Python 3.7+)
+    for jid in evictable[: len(_jobs) - _MAX_IN_MEMORY_JOBS]:
+        del _jobs[jid]
 
 
 def get_job(job_id: str) -> JobResult | None:
     return _jobs.get(job_id)
 
 
+def list_jobs() -> list[JobResult]:
+    """Return all jobs (most recent first by insertion order)."""
+    return list(reversed(_jobs.values()))
+
+
 class PipelineOrchestrator:
-    """Runs the full ingestion pipeline for a single PDF."""
+    """Runs the full v3 streaming ingestion pipeline for a single PDF."""
 
     def __init__(
         self,
         settings: Settings,
         gemini_client: GeminiClient | None = None,
+        vector_store: QdrantVectorStore | None = None,
     ) -> None:
         self._settings = settings
         self._gemini = gemini_client
-        self._splitter = PDFSplitter(
-            max_pages=settings.pdf_max_pages,
-            max_size_mb=settings.pdf_max_size_mb,
-            target_pages=settings.pdf_split_target_pages,
-            min_pages=settings.pdf_split_min_pages,
-        )
         self._preprocessor = Preprocessor(use_ocr=False)
-        self._scanner = StructureScanner(gemini_client, settings) if gemini_client else None
         self._storage = FileStorage(settings.output_dir)
+        self._vector_store = vector_store
+        self._embedder = (
+            GeminiEmbedder(settings) if settings.gemini_api_key else None
+        )
+        self._chunker = DocumentChunker(settings)
+        # Compile the LangGraph once per orchestrator — the graph is a pure
+        # function of (client, settings) and is safe to reuse across jobs.
+        self._graph = (
+            build_graph(client=self._gemini, settings=self._settings)
+            if self._gemini is not None
+            else None
+        )
 
-    async def run(self, pdf_path: Path, filename: str) -> JobResult:
-        """Execute the pipeline end-to-end.
-
-        Args:
-            pdf_path: Path to the uploaded PDF on disk.
-            filename: Original filename from the upload.
-
-        Returns:
-            JobResult with all extraction results and metadata.
-        """
-        job_id = str(uuid.uuid4())
+    async def run(
+        self,
+        pdf_path: Path,
+        filename: str,
+        *,
+        job_id: str | None = None,
+    ) -> JobResult:
+        """Execute the pipeline end-to-end."""
+        job_id = job_id or str(uuid.uuid4())
         job = JobResult(job_id=job_id, filename=filename)
         _jobs[job_id] = job
 
         try:
             job.status = JobStatus.PROCESSING
+            job.persist()
 
-            # ── Pre-Phase: PDF Splitting ─────────────────────────────
-            job.current_phase = "splitting"
-            t0 = time.perf_counter()
-
-            split_result = self._splitter.split(pdf_path, self._settings.output_dir / "_chunks")
-            job.split_result = split_result
-            job.total_pages = split_result.total_pages
-            job.phase_timings["splitting"] = _ms_since(t0)
-
-            logger.info(
-                "pipeline_split_done",
-                job_id=job_id,
-                total_pages=split_result.total_pages,
-                was_split=split_result.was_split,
-                num_chunks=len(split_result.chunks),
-            )
-
-            # ── Phase 0: Baseline Text Extraction ────────────────────
+            # ── Phase 0: Baseline Text ─────────────────────────────────
             job.current_phase = "preprocessing"
             t0 = time.perf_counter()
-
-            all_baselines: list[PageBaseline] = []
-            for chunk in split_result.chunks:
-                chunk_baselines = await self._preprocessor.extract(chunk.file_path)
-
-                # Remap page numbers to global (original PDF) page numbers
-                for b in chunk_baselines:
-                    b.page_num = b.page_num + chunk.page_start
-
-                all_baselines.extend(chunk_baselines)
-                job.pages_processed = len(all_baselines)
-
-            job.baselines = all_baselines
+            baselines = await self._preprocessor.extract(pdf_path)
+            job.baselines = baselines
+            job.total_pages = len(baselines)
             job.phase_timings["preprocessing"] = _ms_since(t0)
 
             logger.info(
                 "pipeline_preprocessing_done",
                 job_id=job_id,
-                pages=len(all_baselines),
-                scanned=sum(1 for b in all_baselines if b.is_scanned),
+                pages=len(baselines),
+                scanned=sum(1 for b in baselines if b.is_scanned),
             )
+            job.persist()
 
-            # ── Phase 1: Document Structure Scan ─────────────────────
-            if self._scanner:
-                job.current_phase = "structure_scan"
+            # ── Phases 1 + 2: Streaming Rasterizer + Worker Pool ───────
+            if self._gemini:
+                job.current_phase = "streaming_extraction"
                 t0 = time.perf_counter()
 
-                scan_result = await self._scanner.scan(
+                graph = self._graph
+                deque = PageDeque()
+                num_workers = self._settings.max_concurrent_pages
+
+                # Start all workers BEFORE the rasterizer so they can pop
+                # the very first page the moment it lands.
+                worker_tasks = [
+                    asyncio.create_task(
+                        _worker(deque, graph, job, worker_id=i,
+                                output_dir=self._storage.doc_dir(Path(filename).stem))
+                    )
+                    for i in range(num_workers)
+                ]
+
+                # Producer
+                pages_dir = self._storage.pages_dir(Path(filename).stem)
+                pushed = await rasterize_pages(
                     pdf_path=pdf_path,
-                    doc_id=job_id,
-                    total_pages=job.total_pages,
-                )
-                job.doc_structure = scan_result.doc_structure
-                job.scan_result = scan_result
-                job.phase_timings["structure_scan"] = _ms_since(t0)
-
-                logger.info(
-                    "pipeline_structure_scan_done",
-                    job_id=job_id,
-                    document_type=scan_result.doc_structure.document_type,
-                    sections=len(scan_result.doc_structure.sections),
-                    cross_page_tables=len(scan_result.doc_structure.cross_page_tables),
+                    baselines=baselines,
+                    deque=deque,
+                    dpi=self._settings.render_dpi,
+                    pages_dir=pages_dir,
+                    use_adaptive_dpi=True,
                 )
 
-            # ── Phase 2: Batch Queue Construction ─────────────────
-            if job.doc_structure:
-                job.current_phase = "batching"
-                t0 = time.perf_counter()
+                # Signal completion to workers
+                deque.close(num_consumers=num_workers)
 
-                batches = build_batches(
-                    doc_structure=job.doc_structure,
-                    baselines=all_baselines,
-                    batch_size=self._settings.batch_size,
-                )
-                job.batches = batches
+                # Wait for all workers to drain
+                await asyncio.gather(*worker_tasks)
 
-                # Create async queue for Phase 3 workers
-                queue = BatchQueue()
-                queue.load(batches)
-                queue.mark_done()
-                job.batch_queue = queue
+                job.phase_timings["streaming_extraction"] = _ms_since(t0)
 
-                job.phase_timings["batching"] = _ms_since(t0)
-
-                logger.info(
-                    "pipeline_batching_done",
-                    job_id=job_id,
-                    total_batches=len(batches),
-                    batch_sizes=[b.page_end - b.page_start + 1 for b in batches],
-                )
-
-            # ── Phase 3: LangGraph Agent Extraction ──────────────
-            if self._gemini and job.doc_structure and job.batches and job.scan_result:
-                job.current_phase = "extraction"
-                t0 = time.perf_counter()
-
-                graph = build_graph(
-                    client=self._gemini,
-                    settings=self._settings,
-                    cached_content=job.scan_result.cache_name,
-                    uploaded_file=job.scan_result.upload_result.file,
-                )
-
-                doc_structure_dict = job.doc_structure.model_dump()
-                extraction_results = await run_graph_on_batches(
-                    graph=graph,
-                    batches=job.batches,
-                    doc_structure_dict=doc_structure_dict,
-                    max_concurrent=self._settings.max_concurrent_batches,
-                )
-
-                job.extraction_results = extraction_results
-                job.phase_timings["extraction"] = _ms_since(t0)
-
-                escalated = sum(1 for r in extraction_results if r.get("escalated"))
                 logger.info(
                     "pipeline_extraction_done",
                     job_id=job_id,
-                    batches_processed=len(extraction_results),
-                    escalated=escalated,
+                    pages_pushed=pushed,
+                    pages_extracted=len(job.page_results),
+                    escalated=sum(
+                        1 for r in job.page_results.values() if r.get("escalated")
+                    ),
                 )
+                job.persist()
 
-            # ── Write Output: Per-page markdown ──────────────────────
-            job.current_phase = "writing_output"
+            # ── Phase 3: Post-Processing ───────────────────────────────
+            job.current_phase = "postprocessing"
             t0 = time.perf_counter()
 
-            # Build page-level extraction map from Phase 3 results
-            extracted_page_map = _build_extracted_page_map(job.extraction_results)
-
             doc_name = Path(filename).stem
-            for baseline in all_baselines:
-                # Use Phase 3 extraction if available, else fall back to baseline
-                extracted = extracted_page_map.get(baseline.page_num)
-                if extracted:
-                    page_md = extracted.get("markdown", baseline.text)
-                else:
-                    page_md = self._format_page_markdown(baseline)
-                await self._storage.write_page_markdown(doc_name, baseline.page_num, page_md)
-
-            # Write combined document
-            full_md = self._format_full_document(filename, all_baselines, split_result)
-            await self._storage.write_full_document(doc_name, full_md)
+            postprocessor = PostProcessor(self._storage)
+            pp_result = await postprocessor.run(
+                doc_name=doc_name,
+                filename=filename,
+                baselines=baselines,
+                page_results=job.page_results,
+            )
             job.output_dir = self._storage.doc_dir(doc_name)
-            job.phase_timings["writing_output"] = _ms_since(t0)
+            job.phase_timings["postprocessing"] = _ms_since(t0)
 
-            # ── Done ─────────────────────────────────────────────────
+            logger.info(
+                "pipeline_postprocessing_done",
+                job_id=job_id,
+                **pp_result.to_dict(),
+            )
+
+            # ── Phase 4: Vectorize (chunk → embed → Qdrant) ───────────
+            if self._embedder and self._vector_store:
+                job.current_phase = "vectorizing"
+                t0 = time.perf_counter()
+
+                # Build page_map the same way PostProcessor does
+                page_map: dict[int, dict] = {}
+                for pn, state in job.page_results.items():
+                    extracted = state.get("final") or state.get("extracted") or {}
+                    if extracted:
+                        page_map[int(pn)] = extracted
+
+                chunks = self._chunker.chunk_pages(
+                    page_map,
+                    doc_name=doc_name,
+                    job_id=job_id,
+                    filename=filename,
+                )
+
+                if chunks:
+                    # Delete old vectors for this job (idempotent re-ingestion)
+                    await self._vector_store.delete_by_job(job_id)
+
+                    embeddings = await self._embedder.embed_texts(
+                        [c.text for c in chunks]
+                    )
+                    upserted = await self._vector_store.upsert_chunks(
+                        chunks, embeddings
+                    )
+                    job.phase_timings["vectorizing"] = _ms_since(t0)
+
+                    logger.info(
+                        "pipeline_vectorize_done",
+                        job_id=job_id,
+                        chunks=len(chunks),
+                        vectors_upserted=upserted,
+                    )
+                else:
+                    job.phase_timings["vectorizing"] = _ms_since(t0)
+                    logger.info(
+                        "pipeline_vectorize_skipped",
+                        job_id=job_id,
+                        reason="no_chunks",
+                    )
+
+                job.persist()
+
             job.status = JobStatus.COMPLETED
             job.current_phase = "done"
+            job.persist()
 
             logger.info(
                 "pipeline_complete",
@@ -309,78 +317,107 @@ class PipelineOrchestrator:
             job.status = JobStatus.FAILED
             job.error = str(exc)
             logger.error("pipeline_failed", job_id=job_id, error=str(exc))
+            job.persist()
 
+        _evict_old_jobs()
         return job
 
-    def _format_page_markdown(self, baseline: PageBaseline) -> str:
-        """Format a single page's baseline extraction as markdown."""
-        lines = [
-            f"# Page {baseline.page_num + 1}",
-            "",
-            f"**Extraction method**: {baseline.extraction_method}  ",
-            f"**Characters**: {baseline.char_count}  ",
-            f"**Scanned**: {baseline.is_scanned}  ",
-            f"**Images on page**: {baseline.image_count}  ",
-            f"**Dimensions**: {baseline.width:.0f} x {baseline.height:.0f}",
-            "",
-            "---",
-            "",
-        ]
-        if baseline.text:
-            lines.append(baseline.text)
-        else:
-            lines.append("*(No text extracted — page appears to be image-only)*")
-        lines.append("")
-        return "\n".join(lines)
 
-    def _format_full_document(
-        self,
-        filename: str,
-        baselines: list[PageBaseline],
-        split_result: SplitResult,
-    ) -> str:
-        """Format the full document as a single merged markdown."""
-        scanned = sum(1 for b in baselines if b.is_scanned)
-        total_chars = sum(b.char_count for b in baselines)
+async def _worker(
+    deque: PageDeque,
+    graph: Any,
+    job: JobResult,
+    *,
+    worker_id: int,
+    output_dir: Path | None = None,
+) -> None:
+    """Single worker: pop a PageImage, run the per-page graph, store result."""
+    while True:
+        page = await deque.pop()
+        if page is None:
+            return  # sentinel — clean exit
 
-        header = [
-            f"# {filename}",
-            "",
-            f"**Total pages**: {len(baselines)}  ",
-            f"**Text pages**: {len(baselines) - scanned}  ",
-            f"**Scanned pages**: {scanned}  ",
-            f"**Total characters**: {total_chars:,}  ",
-            f"**Split into chunks**: {split_result.was_split} "
-            f"({len(split_result.chunks)} chunk(s))",
-            "",
-            "---",
-            "",
-        ]
+        try:
+            # ── Idempotency check ──────────────────────────────────────
+            # If page markdown already exists on disk (from a previous run
+            # that was interrupted after extraction but before completion),
+            # skip the expensive Gemini calls entirely.
+            if output_dir is not None:
+                marker = output_dir / f"page_{page.page_num:03d}.md"
+                if marker.exists():
+                    job.page_results[page.page_num] = {
+                        "page_num": page.page_num,
+                        "iteration": 0,
+                        "escalated": False,
+                        "png_path": page.png_path,
+                        "final": {
+                            "page_num": page.page_num,
+                            "markdown": marker.read_text(encoding="utf-8"),
+                            "tables": [],
+                            "images": [],
+                            "entities": [],
+                            "cross_page_notes": "",
+                        },
+                        "skipped": True,
+                    }
+                    job.pages_processed = len(job.page_results)
+                    logger.info(
+                        "worker_page_skipped_idempotent",
+                        worker_id=worker_id,
+                        page_num=page.page_num,
+                    )
+                    continue
 
-        pages = []
-        for b in baselines:
-            pages.append(f"## Page {b.page_num + 1}")
-            pages.append("")
-            if b.text:
-                pages.append(b.text)
-            else:
-                pages.append("*(No text extracted)*")
-            pages.append("")
-            pages.append("---")
-            pages.append("")
+            initial_state: PageState = page_image_to_state(page)
+            result = await graph.ainvoke(initial_state)
 
-        return "\n".join(header + pages)
+            # Release PNG bytes immediately — they've been consumed by
+            # Gemini and are no longer needed.  On a 1000-page PDF this
+            # frees ~200 MB that would otherwise stay pinned until the
+            # worker task finishes.
+            page.png_bytes = b""
 
+            # Lock final: if validator never passed and no escalation ran,
+            # use whatever the last extraction produced.
+            if not result.get("final"):
+                result["final"] = result.get("extracted", {})
 
-def _build_extracted_page_map(extraction_results: list[dict]) -> dict[int, dict]:
-    """Build a {page_num: page_extraction_dict} map from Phase 3 batch results."""
-    page_map: dict[int, dict] = {}
-    for batch_result in extraction_results:
-        for page in batch_result.get("final_pages", []):
-            pn = page.get("page_num")
-            if pn is not None:
-                page_map[pn] = page
-    return page_map
+            # Strip raw bytes before persisting (memory + serialization).
+            # Keep the on-disk PNG path so the API can serve the page image.
+            result_to_store = {k: v for k, v in result.items() if k != "png_bytes"}
+            result_to_store["png_path"] = page.png_path
+            job.page_results[page.page_num] = result_to_store
+            job.pages_processed = len(job.page_results)
+
+            logger.info(
+                "worker_page_complete",
+                worker_id=worker_id,
+                page_num=page.page_num,
+                iteration=result.get("iteration"),
+                escalated=result.get("escalated", False),
+            )
+        except Exception as exc:
+            logger.error(
+                "worker_page_failed",
+                worker_id=worker_id,
+                page_num=page.page_num,
+                error=str(exc),
+            )
+            job.page_results[page.page_num] = {
+                "page_num": page.page_num,
+                "iteration": 0,
+                "escalated": False,
+                "png_path": page.png_path,
+                "final": {
+                    "page_num": page.page_num,
+                    "markdown": page.baseline_text,
+                    "tables": [],
+                    "images": [],
+                    "entities": [],
+                    "cross_page_notes": "",
+                },
+                "trace": [{"phase": "error", "error": str(exc)}],
+            }
 
 
 def _ms_since(start: float) -> int:

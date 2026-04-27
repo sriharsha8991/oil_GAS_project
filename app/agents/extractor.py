@@ -1,19 +1,12 @@
-"""Extractor agent node — calls Gemini to extract content from PDF pages.
-
-This is the primary extraction step.  It sends the cached PDF + page range
-to Gemini Flash 2.5 with structured JSON output and returns per-page
-extraction results (markdown, tables, images, cross-page notes).
-"""
+"""Extractor agent — Gemini 3 Flash Preview per-page extraction with inline image bytes."""
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Any
 
 from app.agents.prompts import EXTRACTOR_SYSTEM, build_extractor_prompt
-from app.models.schemas import PageExtraction
-from app.models.state import BatchState
+from app.models.state import PageState
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
 
@@ -21,146 +14,103 @@ logger = get_logger(__name__)
 
 
 async def extractor_node(
-    state: BatchState,
+    state: PageState,
+    *,
     client: GeminiClient,
     model: str,
-    cached_content: str | None = None,
-    uploaded_file: Any | None = None,
-) -> BatchState:
-    """LangGraph node: extract content from a batch of PDF pages.
+) -> PageState:
+    """LangGraph node: extract content from one PDF page (PNG bytes).
 
-    Args:
-        state: Current graph state with batch identity and context.
-        client: GeminiClient instance.
-        model: Model name (e.g. "models/gemini-2.5-flash").
-        cached_content: Cache resource name for cost savings.
-        uploaded_file: Uploaded PDF file reference.
-
-    Returns:
-        Updated state with extracted_pages populated.
+    On iter 1, baseline is passed as a hint. On iter 2, previous gaps
+    from the validator are appended as retry instructions.
     """
-    page_start = state["page_start"]
-    page_end = state["page_end"]
-    section_context = state.get("section_context", "")
-    iteration = state.get("iteration_count", 0)
+    page_num = state["page_num"]
+    iteration = state.get("iteration", 0) + 1
 
-    # Build gap feedback from previous validation if this is a retry
     gap_feedback = ""
-    if iteration > 0 and state.get("validation_result"):
-        vr = state["validation_result"]
-        failed_gaps = []
-        for pr in vr.get("page_results", []):
-            if not pr.get("passed", True) and pr.get("gaps"):
-                failed_gaps.append(
-                    f"Page {pr['page_num']}: {'; '.join(pr['gaps'])}"
-                )
-        gap_feedback = "\n".join(failed_gaps)
-
-    # Build doc title from structure
-    doc_title = ""
-    ds = state.get("doc_structure", {})
-    if ds:
-        doc_title = ds.get("title", "")
+    if iteration > 1 and state.get("validation"):
+        gaps = state["validation"].get("gaps", [])
+        if gaps:
+            gap_feedback = "\n".join(f"- {g}" for g in gaps)
 
     prompt = build_extractor_prompt(
-        page_start=page_start,
-        page_end=page_end,
-        section_context=section_context,
-        doc_title=doc_title,
+        page_num=page_num,
+        is_scanned=state.get("is_scanned", False),
+        baseline_text=state.get("baseline_text", ""),
         gap_feedback=gap_feedback,
     )
 
-    # Build contents: PDF file reference + prompt
-    contents: list[Any] = []
-    if uploaded_file:
-        contents.append(uploaded_file)
-    contents.append(prompt)
-
     start = time.perf_counter()
-    raw_response = await client.generate(
+    raw = await client.generate_with_image(
         model=model,
-        contents=contents,
+        prompt=prompt,
+        png_bytes=state["png_bytes"],
         system_instruction=EXTRACTOR_SYSTEM,
         response_mime_type="application/json",
-        cached_content=cached_content,
         temperature=0.1,
     )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-    # Parse response
-    extracted = _parse_extraction_response(raw_response, page_start, page_end)
+    extracted = _parse_extraction(raw, page_num)
 
     logger.info(
         "extractor_done",
-        batch_id=state.get("batch_id"),
-        pages=f"{page_start}-{page_end}",
+        page_num=page_num,
         iteration=iteration,
-        extracted_pages=len(extracted),
         time_ms=elapsed_ms,
+        chars=len(extracted.get("markdown", "")),
     )
 
-    # Build trace entry
-    trace_entry = {
+    trace = list(state.get("trace", []))
+    trace.append({
         "phase": "extractor",
         "model": model,
         "iteration": iteration,
-        "pages": page_end - page_start + 1,
-        "cached": cached_content is not None,
-        "output_chars": len(raw_response),
         "time_ms": elapsed_ms,
-    }
-
-    trace_log = list(state.get("trace_log", []))
-    trace_log.append(trace_entry)
+        "output_chars": len(raw),
+    })
 
     return {
         **state,
-        "extracted_pages": extracted,
-        "iteration_count": iteration + 1,
-        "trace_log": trace_log,
+        "extracted": extracted,
+        "iteration": iteration,
+        "trace": trace,
     }
 
 
-def _parse_extraction_response(
-    raw: str,
-    page_start: int,
-    page_end: int,
-) -> list[dict]:
-    """Parse the JSON array response from the extractor.
-
-    Returns a list of PageExtraction-compatible dicts.
-    Falls back to a minimal result if parsing fails.
-    """
+def _parse_extraction(raw: str, page_num: int) -> dict:
+    """Parse the JSON object response from the extractor."""
     cleaned = raw.strip()
     if cleaned.startswith("```"):
-        first_nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
-        cleaned = cleaned[first_nl + 1:]
+        nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
+        cleaned = cleaned[nl + 1:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
 
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        logger.error("extractor_parse_error", raw_preview=raw[:300])
-        # Return minimal fallback
-        return [
-            {"page_num": p, "markdown": "", "tables": [], "images": [], "cross_page_notes": ""}
-            for p in range(page_start, page_end + 1)
-        ]
-
-    if not isinstance(data, list):
-        data = [data]
-
-    # Validate and normalize each page
-    pages: list[dict] = []
-    for item in data:
-        page = {
-            "page_num": item.get("page_num", page_start),
-            "markdown": item.get("markdown", ""),
-            "tables": item.get("tables", []),
-            "images": item.get("images", []),
-            "cross_page_notes": item.get("cross_page_notes", ""),
+        logger.error("extractor_parse_error", page_num=page_num, raw_preview=raw[:300])
+        return {
+            "page_num": page_num,
+            "markdown": "",
+            "tables": [],
+            "images": [],
+            "entities": [],
+            "cross_page_notes": "",
         }
-        pages.append(page)
 
-    return pages
+    # If the model returned a list (one-element wrapper), unwrap
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    return {
+        "page_num": data.get("page_num", page_num),
+        "markdown": data.get("markdown", ""),
+        "tables": data.get("tables", []),
+        "images": data.get("images", []),
+        "entities": data.get("entities", []),
+        "cross_page_notes": data.get("cross_page_notes", ""),
+    }

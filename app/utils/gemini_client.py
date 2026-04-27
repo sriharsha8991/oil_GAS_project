@@ -1,8 +1,9 @@
-"""Shared Gemini API client with rate limiting and retry logic.
+"""Singleton Gemini client for inline image + text generation.
 
-Encapsulates all Google GenAI SDK interactions behind a single interface
-so the rest of the codebase never imports google.genai directly.
-This makes future model swaps (e.g., to vLLM/Qwen) a config change.
+v3: drops Files API + caching entirely. Every call sends inline image
+bytes (`types.Part.from_bytes`) plus a text prompt. A single shared
+`asyncio.Semaphore(max_concurrent_pages)` guards all calls so the
+worker pool can never exceed the configured concurrency.
 """
 
 from __future__ import annotations
@@ -21,11 +22,11 @@ logger = get_logger(__name__)
 
 
 class GeminiClient:
-    """Async-friendly wrapper around the Google GenAI SDK.
+    """Async-friendly wrapper around the Google GenAI SDK (singleton).
 
     Responsibilities:
-    - API key management (single source)
-    - Rate limiting via asyncio.Semaphore
+    - One `genai.Client` instance shared by all 100 workers
+    - Concurrency cap via `asyncio.Semaphore(max_concurrent_pages)`
     - Retry with exponential back-off on transient errors
     - Structured logging for every API call
     """
@@ -33,109 +34,49 @@ class GeminiClient:
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
         self._client = genai.Client(api_key=self._settings.gemini_api_key)
-        # Rate-limit concurrent Gemini calls (RPM headroom)
-        self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_batches)
-        self._max_retries = self._settings.max_retries
+        self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_pages)
+        self._max_retries = 3
         self._base_delay = 1.0  # seconds
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def generate(
+    async def generate_with_image(
         self,
         model: str,
-        contents: list[Any],
+        prompt: str,
+        png_bytes: bytes,
         *,
         system_instruction: str | None = None,
-        response_mime_type: str | None = None,
-        cached_content: str | None = None,
+        response_mime_type: str | None = "application/json",
         temperature: float = 0.1,
+        mime_type: str = "image/png",
     ) -> str:
-        """Send a generation request with rate limiting and retry.
+        """Send an inline image + text prompt to Gemini.
 
         Args:
-            model: Model resource name, e.g. "models/gemini-2.5-flash".
-            contents: List of content parts (text, file references, etc.).
+            model: Model resource name, e.g. "models/gemini-3-flash-preview".
+            prompt: User text prompt.
+            png_bytes: Raw PNG bytes of the rendered page.
             system_instruction: Optional system prompt.
-            response_mime_type: E.g. "application/json" for structured output.
-            cached_content: Cached content resource name for cost savings.
+            response_mime_type: Default "application/json" for structured output.
             temperature: Sampling temperature.
+            mime_type: Image mime type (default image/png).
 
         Returns:
             The generated text response.
         """
+        image_part = types.Part.from_bytes(data=png_bytes, mime_type=mime_type)
+        contents = [image_part, prompt]
+
         config = types.GenerateContentConfig(
             temperature=temperature,
             system_instruction=system_instruction,
             response_mime_type=response_mime_type,
         )
 
-        if cached_content:
-            config.cached_content = cached_content
-
         return await self._call_with_retry(model, contents, config)
-
-    async def upload_file(self, file_path: str, mime_type: str = "application/pdf") -> Any:
-        """Upload a file to the Gemini Files API.
-
-        Returns:
-            The uploaded file object (contains name/uri for referencing).
-        """
-        logger.info("uploading_file", path=file_path, mime_type=mime_type)
-
-        def _upload() -> Any:
-            return self._client.files.upload(
-                file=file_path,
-                config=types.UploadFileConfig(mime_type=mime_type),
-            )
-
-        return await asyncio.to_thread(_upload)
-
-    async def create_cache(
-        self,
-        model: str,
-        *,
-        system_instruction: str,
-        contents: list[Any],
-        ttl_seconds: int = 3600,
-        display_name: str = "",
-    ) -> Any:
-        """Create an explicit content cache for cost savings.
-
-        Returns:
-            The cached content object (contains name for referencing).
-        """
-        logger.info("creating_cache", model=model, display_name=display_name, ttl=ttl_seconds)
-
-        def _create() -> Any:
-            return self._client.caches.create(
-                model=model,
-                config=types.CreateCachedContentConfig(
-                    display_name=display_name,
-                    system_instruction=system_instruction,
-                    contents=contents,
-                    ttl=f"{ttl_seconds}s",
-                ),
-            )
-
-        return await asyncio.to_thread(_create)
-
-    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for a batch of texts.
-
-        Returns:
-            List of embedding vectors.
-        """
-
-        def _embed() -> list[list[float]]:
-            result = self._client.models.embed_content(
-                model=model,
-                contents=texts,
-            )
-            return [e.values for e in result.embeddings]
-
-        return await asyncio.to_thread(_embed)
 
     # ------------------------------------------------------------------
     # Internal
@@ -147,15 +88,14 @@ class GeminiClient:
         contents: list[Any],
         config: types.GenerateContentConfig,
     ) -> str:
-        """Execute a generate call with semaphore, retry, and logging."""
+        """Execute generate_content with semaphore, retry, and logging."""
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 1):
             async with self._semaphore:
                 start = time.perf_counter()
                 try:
-                    response = await asyncio.to_thread(
-                        self._client.models.generate_content,
+                    response = await self._client.aio.models.generate_content(
                         model=model,
                         contents=contents,
                         config=config,

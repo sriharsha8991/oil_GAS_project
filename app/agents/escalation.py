@@ -1,21 +1,12 @@
-"""Escalation agent node — re-extracts using Gemini Pro 2.5.
-
-Called when the validator fails a batch after max_retries iterations.
-Pro 2.5 has stronger vision and reasoning for edge cases like
-handwritten annotations, extremely dense tables, and degraded scans.
-
-Escalation output is FINAL — no further validation loop to avoid
-cost explosion.
-"""
+"""Escalation agent — Gemini 3.1 Pro Preview final extraction (iter 3, no further validation)."""
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Any
 
 from app.agents.prompts import ESCALATION_SYSTEM, build_escalation_prompt
-from app.models.state import BatchState
+from app.models.state import PageState
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
 
@@ -23,135 +14,107 @@ logger = get_logger(__name__)
 
 
 async def escalation_node(
-    state: BatchState,
+    state: PageState,
+    *,
     client: GeminiClient,
     model: str,
-    uploaded_file: Any | None = None,
-) -> BatchState:
-    """LangGraph node: re-extract with Pro 2.5 after Flash failures.
+) -> PageState:
+    """LangGraph node: re-extract one page with Gemini 3.1 Pro Preview. Output is FINAL.
 
-    Note: No cached_content — Pro may use a different model than the cache.
-    The uploaded file is sent directly.
-
-    Args:
-        state: Current graph state with validation failures.
-        client: GeminiClient instance.
-        model: Escalation model name (e.g. "models/gemini-2.5-pro").
-        uploaded_file: Uploaded PDF file reference.
-
-    Returns:
-        Updated state with final_pages from Pro extraction.
+    Receives all gap descriptions from prior validator runs.
     """
-    page_start = state["page_start"]
-    page_end = state["page_end"]
-    section_context = state.get("section_context", "")
+    page_num = state["page_num"]
 
-    # Collect all gap feedback from validation
+    # Collect gap history from the trace + the latest validation
     previous_gaps = _collect_gaps(state)
 
     prompt = build_escalation_prompt(
-        page_start=page_start,
-        page_end=page_end,
-        section_context=section_context,
+        page_num=page_num,
+        is_scanned=state.get("is_scanned", False),
+        baseline_text=state.get("baseline_text", ""),
         previous_gaps=previous_gaps,
     )
 
-    contents: list[Any] = []
-    if uploaded_file:
-        contents.append(uploaded_file)
-    contents.append(prompt)
-
     start = time.perf_counter()
-    raw_response = await client.generate(
+    raw = await client.generate_with_image(
         model=model,
-        contents=contents,
+        prompt=prompt,
+        png_bytes=state["png_bytes"],
         system_instruction=ESCALATION_SYSTEM,
         response_mime_type="application/json",
         temperature=0.1,
     )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-    # Parse response
-    extracted = _parse_escalation_response(raw_response, page_start, page_end)
+    final = _parse_extraction(raw, page_num)
 
     logger.info(
         "escalation_done",
-        batch_id=state.get("batch_id"),
-        pages=f"{page_start}-{page_end}",
-        extracted_pages=len(extracted),
+        page_num=page_num,
         time_ms=elapsed_ms,
+        chars=len(final.get("markdown", "")),
     )
 
-    trace_entry = {
+    trace = list(state.get("trace", []))
+    trace.append({
         "phase": "escalation",
         "model": model,
-        "cached": False,
-        "output_chars": len(raw_response),
+        "iteration": 3,
         "time_ms": elapsed_ms,
-    }
-
-    trace_log = list(state.get("trace_log", []))
-    trace_log.append(trace_entry)
+        "output_chars": len(raw),
+    })
 
     return {
         **state,
-        "final_pages": extracted,
+        "extracted": final,
+        "final": final,
+        "iteration": 3,
         "escalated": True,
-        "trace_log": trace_log,
+        "trace": trace,
     }
 
 
-def _collect_gaps(state: BatchState) -> str:
-    """Collect all gap descriptions from the validation result."""
-    vr = state.get("validation_result", {})
-    if not vr:
-        return "No specific gaps recorded."
-
-    lines: list[str] = []
-    for pr in vr.get("page_results", []):
-        gaps = pr.get("gaps", [])
-        if gaps:
-            lines.append(f"Page {pr.get('page_num', '?')}:")
-            for g in gaps:
-                lines.append(f"  - {g}")
-
-    return "\n".join(lines) if lines else "No specific gaps recorded."
+def _collect_gaps(state: PageState) -> str:
+    """Build a human-readable gap summary from the validation result."""
+    validation = state.get("validation", {})
+    gaps = validation.get("gaps", [])
+    if not gaps:
+        return "No specific gaps recorded; previous attempts had low overall confidence."
+    return "\n".join(f"- {g}" for g in gaps)
 
 
-def _parse_escalation_response(
-    raw: str,
-    page_start: int,
-    page_end: int,
-) -> list[dict]:
-    """Parse the JSON array response from the escalation model."""
+def _parse_extraction(raw: str, page_num: int) -> dict:
+    """Parse the JSON object response (same shape as extractor)."""
     cleaned = raw.strip()
     if cleaned.startswith("```"):
-        first_nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
-        cleaned = cleaned[first_nl + 1:]
+        nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
+        cleaned = cleaned[nl + 1:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
 
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        logger.error("escalation_parse_error", raw_preview=raw[:300])
-        return [
-            {"page_num": p, "markdown": "", "tables": [], "images": [], "cross_page_notes": ""}
-            for p in range(page_start, page_end + 1)
-        ]
-
-    if not isinstance(data, list):
-        data = [data]
-
-    pages: list[dict] = []
-    for item in data:
-        page = {
-            "page_num": item.get("page_num", page_start),
-            "markdown": item.get("markdown", ""),
-            "tables": item.get("tables", []),
-            "images": item.get("images", []),
-            "cross_page_notes": item.get("cross_page_notes", ""),
+        logger.error("escalation_parse_error", page_num=page_num, raw_preview=raw[:300])
+        return {
+            "page_num": page_num,
+            "markdown": "",
+            "tables": [],
+            "images": [],
+            "entities": [],
+            "cross_page_notes": "",
         }
-        pages.append(page)
 
-    return pages
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    return {
+        "page_num": data.get("page_num", page_num),
+        "markdown": data.get("markdown", ""),
+        "tables": data.get("tables", []),
+        "images": data.get("images", []),
+        "entities": data.get("entities", []),
+        "cross_page_notes": data.get("cross_page_notes", ""),
+    }

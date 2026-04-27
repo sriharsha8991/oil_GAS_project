@@ -1,40 +1,34 @@
-"""LangGraph state definitions for the agent pipeline."""
+"""LangGraph state definitions for the per-page agent pipeline."""
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import TypedDict
 
 
-class BatchState(TypedDict, total=False):
-    """State that flows through the LangGraph extractor → validator graph.
+class PageState(TypedDict, total=False):
+    """State that flows through the per-page LangGraph.
 
-    Every field is optional (total=False) so nodes can populate them
-    incrementally as the graph executes.
+    One PageState instance exists per PDF page; 100 instances run
+    concurrently across the worker pool. Every field is optional
+    (total=False) so nodes populate them incrementally.
     """
 
-    # --- Identity ---
-    batch_id: int
-    page_start: int
-    page_end: int
+    # --- Identity & inputs ---
+    page_num: int
+    png_bytes: bytes              # The rendered page (inline image)
+    is_scanned: bool
+    baseline_text: str            # Phase 0 reference for the validator
 
-    # --- Context from earlier phases ---
-    section_context: str              # Section name from DocStructure
-    doc_structure: dict[str, Any]     # Full DocStructure dict
-    baseline_texts: list[dict]        # List of PageBaseline dicts
-    media_resolution: str             # "HIGH" | "MEDIUM"
-
-    # --- Extractor output ---
-    extracted_pages: list[dict]       # List of PageExtraction dicts
+    # --- Extractor output (replaced each iteration) ---
+    extracted: dict               # PageExtraction-shaped dict
 
     # --- Validator output ---
-    validation_result: dict           # BatchValidation dict
+    validation: dict              # PageValidation-shaped dict
 
     # --- Control flow ---
-    iteration_count: int              # Retry count (max 2)
-    escalated: bool
-
-    # --- Final ---
-    final_pages: list[dict]           # Final PageExtraction dicts after all retries
+    iteration: int                # 1 = Flash, 2 = Flash + gaps, 3 = Pro (FINAL)
+    escalated: bool               # True if iter 3 ran
+    final: dict                   # Locked-in extraction (passed or escalated)
 
     # --- Observability ---
-    trace_log: list[dict]
+    trace: list[dict]

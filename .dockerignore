@@ -1,0 +1,41 @@
+# Version control
+.git/
+.gitignore
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment (secrets)
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / Output — mounted as a volume at runtime
+data/
+
+# PDFs (large binaries)
+*.pdf
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+tests/
+
+# Build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Docs (not needed at runtime)
+*.md

@@ -91,12 +91,15 @@ class TestPreprocessor:
 
     @pytest.mark.asyncio
     async def test_extraction_method_is_pymupdf4llm(self, sample_pdf_path: Path):
-        """All pages should use pymupdf4llm extraction method."""
+        """Text pages use pymupdf4llm; scanned/sparse pages fall back to fitz_raw."""
         preprocessor = Preprocessor(use_ocr=False)
         baselines = await preprocessor.extract(sample_pdf_path)
 
         for b in baselines:
-            assert b.extraction_method == "pymupdf4llm"
+            if b.is_scanned:
+                assert b.extraction_method == "fitz_raw"
+            else:
+                assert b.extraction_method == "pymupdf4llm"
 
 
 class TestPreprocessorSync:

@@ -53,33 +53,64 @@ class Preprocessor:
         return await asyncio.to_thread(self._extract_sync, pdf_path)
 
     def _extract_sync(self, pdf_path: Path) -> list[PageBaseline]:
-        """Synchronous extraction — called inside asyncio.to_thread."""
+        """Synchronous extraction — called inside asyncio.to_thread.
+
+        Fast path:
+          1. Single fitz pass gets page metadata AND raw text length per page.
+          2. Pages with enough raw text go into a single batched
+             ``pymupdf4llm.to_markdown(pages=[...], page_chunks=True)`` call
+             — layout analyzer + ONNX model load happens ONCE instead of
+             once per page.
+          3. Scanned / text-poor pages skip pymupdf4llm entirely (nothing
+             for the layout extractor to do on them anyway).
+        """
         pdf_str = str(pdf_path)
 
-        # Get page metadata via fitz (dimensions, image count)
         doc = fitz.open(pdf_str)
-        page_meta = []
-        for i in range(len(doc)):
+        page_count = len(doc)
+        page_meta: list[dict] = []
+        text_page_indices: list[int] = []
+        raw_text_by_page: dict[int, str] = {}
+
+        for i in range(page_count):
             page = doc[i]
+            raw_text = page.get_text().strip()
             page_meta.append({
                 "image_count": len(page.get_images(full=True)),
                 "width": page.rect.width,
                 "height": page.rect.height,
             })
-        page_count = len(doc)
+            raw_text_by_page[i] = raw_text
+            if len(raw_text) >= SCANNED_THRESHOLD:
+                text_page_indices.append(i)
         doc.close()
 
-        # Extract markdown per page via pymupdf4llm
-        baselines: list[PageBaseline] = []
-        for page_num in range(page_count):
-            md_text = pymupdf4llm.to_markdown(
+        # Batched layout-aware extraction — ONE pymupdf4llm call for every
+        # text-bearing page in the document instead of one call per page.
+        md_by_page: dict[int, str] = {}
+        if text_page_indices:
+            chunks = pymupdf4llm.to_markdown(
                 pdf_str,
-                pages=[page_num],
+                pages=text_page_indices,
+                page_chunks=True,
                 use_ocr=self._use_ocr,
             )
+            # chunks is a list aligned with text_page_indices.
+            # Defensive: in some versions the chunk is a dict with "text";
+            # fall back to raw text from fitz if the shape is unexpected.
+            for idx, chunk in zip(text_page_indices, chunks):
+                if isinstance(chunk, dict):
+                    md_by_page[idx] = (chunk.get("text") or "").strip()
+                else:
+                    md_by_page[idx] = str(chunk).strip()
 
-            # Strip trailing whitespace / page separators
-            md_text = md_text.strip()
+        baselines: list[PageBaseline] = []
+        for page_num in range(page_count):
+            md_text = md_by_page.get(page_num)
+            if not md_text:
+                # Scanned or pymupdf4llm produced nothing — fall back to
+                # fitz raw text (still useful as a cross-check hint).
+                md_text = raw_text_by_page.get(page_num, "")
 
             meta = page_meta[page_num]
             is_scanned = len(md_text) < SCANNED_THRESHOLD
@@ -92,7 +123,9 @@ class Preprocessor:
                 image_count=meta["image_count"],
                 width=meta["width"],
                 height=meta["height"],
-                extraction_method="pymupdf4llm",
+                extraction_method=(
+                    "pymupdf4llm" if page_num in md_by_page else "fitz_raw"
+                ),
             )
             baselines.append(baseline)
 

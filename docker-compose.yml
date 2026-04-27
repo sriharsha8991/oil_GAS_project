@@ -1,24 +1,141 @@
+# Wellsynthai — compose stack (see PLAN.md §4.L1.1)
+#   All services start by default: qdrant + redis + app + celery-worker.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose up -d --scale celery-worker=4   # horizontal scale
+
 services:
+  # ---------------------------------------------------------------------------
+  # Vector store (always on)
+  # ---------------------------------------------------------------------------
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: wellsynthai-qdrant
+    restart: unless-stopped
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "6333:6333"     # HTTP
+      - "6334:6334"     # gRPC
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
+  # ---------------------------------------------------------------------------
+  # Redis — Celery broker + result backend + job live state (see §4.L1.1.h)
+  #   AOF everysec → ≤1s of queue state lost on crash. Disk manifest is the
+  #   ground truth, so this is acceptable.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: wellsynthai-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction     # never evict unacked task state
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # FastAPI web tier (stateless)
+  # ---------------------------------------------------------------------------
   app:
     build: .
+    container_name: wellsynthai-app
+    restart: unless-stopped
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_MODEL=gemini-embedding-001
+      # Celery wiring — no-op when Redis is absent (app still runs in
+      # BackgroundTasks mode per Tier 1).
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - REDIS_URL=redis://redis:6379/2
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
+      - ./app:/app/app  # dev: live-mount source code
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).status==200 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Celery worker pool (§4.L1.1.d) — per-page extraction tasks.
+  #   prefork pool because each task spawns its own asyncio loop internally.
+  #   concurrency=2 keeps Gemini semaphore math per-worker predictable:
+  #     per-worker in-flight cap = GeminiClient Semaphore(100) / concurrency
+  #   Scale horizontally by running multiple replicas, NOT by raising
+  #   concurrency (see §4.L1.1.n pitfall #1 — cluster-level rate limit).
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    build: .
+    container_name: wellsynthai-celery-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_MODEL=gemini-embedding-001
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - REDIS_URL=redis://redis:6379/2
+    volumes:
+      - ./data:/app/data
+      - ./app:/app/app  # dev: live-mount source code
+    # NOTE: the celery_app target + task modules are not implemented yet
+    # (Tier 3 of the §4.L1.1.m rollout). When they land, this command is
+    # what will start the worker. Until then the service is defined but
+    # off by default (profile-gated), so `docker compose up` keeps working.
+    command:
+      - celery
+      - -A
+      - app.workers.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+      - --prefetch-multiplier=1        # §4.L1.1.n pitfall #7
+      - --without-heartbeat            # reduce broker chatter
+      - -Q
+      - extract,rasterize,aggregate,default
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 volumes:
   qdrant_data:
+  redis_data:
