@@ -3,7 +3,7 @@
 Wires together all phases for a single PDF:
   Phase 0:  Baseline text extraction (pymupdf4llm) — local, no LLM
   Phase 1:  Streaming page rasterizer (PNG bytes → PageDeque)
-  Phase 2:  100 concurrent per-page workers (LangGraph: extractor → validator → escalator)
+  Phase 2:  100 concurrent per-page workers (LangGraph: extractor self-validates → escalator on flagged gaps)
   Phase 3:  Post-processing (cross-page table merge, full document assembly)
   Phase 4:  Vectorize (chunk → embed → upsert to Qdrant)
 
@@ -24,14 +24,16 @@ from app.config import Settings
 from app.models.schemas import JobStatus, PageBaseline
 from app.models.state import PageState
 from app.pipeline.page_streamer import PageDeque, rasterize_pages
-from app.pipeline.postprocessor import PostProcessor
+from app.pipeline.postprocessor import PostProcessor, _build_page_map
 from app.pipeline.preprocessing import Preprocessor
 from app.storage.file_storage import FileStorage
-from app.storage.redis_store import save_job, update_job_field
+from app.storage.redis_store import save_job
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
 from app.vectorstore.chunker import DocumentChunker
 from app.vectorstore.embedder import GeminiEmbedder
+from app.vectorstore.entity_indexer import build_entity_points, upsert_entity_points
+from app.vectorstore.image_indexer import build_image_points, upsert_image_points
 from app.vectorstore.qdrant_store import QdrantVectorStore
 
 logger = get_logger(__name__)
@@ -43,6 +45,7 @@ class JobResult:
     def __init__(self, job_id: str, filename: str) -> None:
         self.job_id = job_id
         self.filename = filename
+        self.doc_name: str | None = None
         self.status: JobStatus = JobStatus.PENDING
         self.total_pages: int = 0
         self.pages_processed: int = 0
@@ -53,6 +56,11 @@ class JobResult:
         self.page_results: dict[int, dict] = {}
         self.phase_timings: dict[str, int] = {}
         self.output_dir: Path | None = None
+        # Wall-clock timing
+        self.started_at: float = time.time()
+        self.finished_at: float | None = None
+        # Embedding token usage (aggregated by orchestrator)
+        self.embedding_tokens: int = 0
 
     def to_summary(self) -> dict[str, Any]:
         scanned_count = sum(1 for b in self.baselines if b.is_scanned)
@@ -61,15 +69,23 @@ class JobResult:
             if self.baselines else 0
         )
         escalated = sum(1 for r in self.page_results.values() if r.get("escalated"))
-        iter_counts = {1: 0, 2: 0, 3: 0}
+        iter_counts: dict[int, int] = {1: 0, 2: 0}
         for r in self.page_results.values():
             it = r.get("iteration", 0)
             if it in iter_counts:
                 iter_counts[it] += 1
 
+        usage = self._aggregate_usage()
+        cost = self._estimate_cost(usage)
+
+        # Wall-clock duration: finished_at if job ended, else "now"
+        end = self.finished_at if self.finished_at is not None else time.time()
+        duration_s = round(end - self.started_at, 2)
+
         return {
             "job_id": self.job_id,
             "filename": self.filename,
+            "doc_name": self.doc_name,
             "status": self.status.value,
             "total_pages": self.total_pages,
             "pages_processed": self.pages_processed,
@@ -81,14 +97,69 @@ class JobResult:
                 "iter_distribution": iter_counts,
             },
             "phase_timings_ms": self.phase_timings,
+            "duration_seconds": duration_s,
             "stats": {
                 "total_pages": self.total_pages,
                 "scanned_pages": scanned_count,
                 "text_pages": self.total_pages - scanned_count,
                 "avg_chars_per_page": round(avg_chars),
             },
+            "tokens": usage,
+            "cost_usd": cost,
             "output_dir": str(self.output_dir) if self.output_dir else None,
         }
+
+    def _aggregate_usage(self) -> dict[str, Any]:
+        """Sum per-model token counts from every per-page trace entry."""
+        per_model: dict[str, dict[str, int]] = {}
+        for r in self.page_results.values():
+            for entry in r.get("trace", []) or []:
+                u = entry.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                model = u.get("model") or "unknown"
+                slot = per_model.setdefault(
+                    model,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0},
+                )
+                slot["input_tokens"] += int(u.get("input_tokens") or 0)
+                slot["output_tokens"] += int(u.get("output_tokens") or 0)
+                slot["total_tokens"] += int(u.get("total_tokens") or 0)
+                slot["calls"] += 1
+
+        totals = {
+            "input_tokens": sum(m["input_tokens"] for m in per_model.values()),
+            "output_tokens": sum(m["output_tokens"] for m in per_model.values()),
+            "total_tokens": sum(m["total_tokens"] for m in per_model.values()),
+            "calls": sum(m["calls"] for m in per_model.values()),
+        }
+        return {
+            "by_model": per_model,
+            "embedding_tokens": self.embedding_tokens,
+            "totals": totals,
+        }
+
+    def _estimate_cost(self, usage: dict[str, Any]) -> dict[str, Any]:
+        """Apply per-model pricing from settings to compute USD cost."""
+        from app.config import get_settings  # local import: avoid cycles
+        s = get_settings()
+
+        breakdown: dict[str, float] = {}
+        total = 0.0
+        for model, slot in usage["by_model"].items():
+            in_p, out_p = _pricing_for_model(model, s)
+            cost = (
+                slot["input_tokens"] * in_p / 1_000_000.0
+                + slot["output_tokens"] * out_p / 1_000_000.0
+            )
+            breakdown[model] = round(cost, 6)
+            total += cost
+
+        embed_cost = self.embedding_tokens * s.embedding_usd_per_1m / 1_000_000.0
+        breakdown["embedding"] = round(embed_cost, 6)
+        total += embed_cost
+
+        return {"by_model": breakdown, "total": round(total, 6), "currency": "USD"}
 
     def persist(self) -> None:
         """Persist current job state to Redis (called at phase boundaries)."""
@@ -103,6 +174,15 @@ class JobResult:
 # kept in memory for fast access by the sync endpoint and page-level queries.
 _MAX_IN_MEMORY_JOBS = 20
 _jobs: dict[str, JobResult] = {}
+
+
+def _pricing_for_model(model: str, settings: Any) -> tuple[float, float]:
+    """Return (input_price_per_1m, output_price_per_1m) USD for a model name."""
+    m = (model or "").lower()
+    if "pro" in m:
+        return settings.pro_input_usd_per_1m, settings.pro_output_usd_per_1m
+    # Default: Flash pricing (covers extractor + any unknown Flash variant).
+    return settings.flash_input_usd_per_1m, settings.flash_output_usd_per_1m
 
 
 def _evict_old_jobs() -> None:
@@ -159,10 +239,23 @@ class PipelineOrchestrator:
         filename: str,
         *,
         job_id: str | None = None,
+        doc_name: str | None = None,
     ) -> JobResult:
-        """Execute the pipeline end-to-end."""
+        """Execute the pipeline end-to-end.
+
+        ``doc_name`` controls the on-disk output directory and Qdrant
+        ``doc_name`` payload field. When omitted it falls back to the
+        filename stem (legacy behaviour); routes pass an explicit
+        job-scoped name to avoid collisions when two PDFs share a name.
+        """
         job_id = job_id or str(uuid.uuid4())
+        doc_name = doc_name or Path(filename).stem
+        # Evict eagerly on insertion so concurrent in-flight jobs don't
+        # blow past the cap; the previous "evict only on completion"
+        # behaviour allowed unbounded growth under burst load.
+        _evict_old_jobs()
         job = JobResult(job_id=job_id, filename=filename)
+        job.doc_name = doc_name
         _jobs[job_id] = job
 
         try:
@@ -198,28 +291,50 @@ class PipelineOrchestrator:
                 # the very first page the moment it lands.
                 worker_tasks = [
                     asyncio.create_task(
-                        _worker(deque, graph, job, worker_id=i,
-                                output_dir=self._storage.doc_dir(Path(filename).stem))
+                        _worker(
+                            deque,
+                            graph,
+                            job,
+                            worker_id=i,
+                            output_dir=self._storage.doc_dir(doc_name),
+                            storage=self._storage,
+                            doc_name=doc_name,
+                        )
                     )
                     for i in range(num_workers)
                 ]
 
                 # Producer
-                pages_dir = self._storage.pages_dir(Path(filename).stem)
-                pushed = await rasterize_pages(
-                    pdf_path=pdf_path,
-                    baselines=baselines,
-                    deque=deque,
-                    dpi=self._settings.render_dpi,
-                    pages_dir=pages_dir,
-                    use_adaptive_dpi=True,
+                pages_dir = self._storage.pages_dir(doc_name)
+                pushed = 0
+                try:
+                    pushed = await rasterize_pages(
+                        pdf_path=pdf_path,
+                        baselines=baselines,
+                        deque=deque,
+                        dpi=self._settings.render_dpi,
+                        pages_dir=pages_dir,
+                        use_adaptive_dpi=True,
+                    )
+                finally:
+                    # ALWAYS signal completion to workers, even if the
+                    # rasterizer raised. Without this, workers block forever
+                    # on `deque.pop()` and the gather() below hangs.
+                    deque.close(num_consumers=num_workers)
+
+                # Wait for all workers to drain. return_exceptions=True so a
+                # single page failure doesn't cancel the rest mid-flight —
+                # workers already record per-page errors into job.page_results.
+                worker_results = await asyncio.gather(
+                    *worker_tasks, return_exceptions=True
                 )
-
-                # Signal completion to workers
-                deque.close(num_consumers=num_workers)
-
-                # Wait for all workers to drain
-                await asyncio.gather(*worker_tasks)
+                for wr in worker_results:
+                    if isinstance(wr, BaseException):
+                        logger.error(
+                            "worker_task_unhandled",
+                            job_id=job_id,
+                            error=str(wr),
+                        )
 
                 job.phase_timings["streaming_extraction"] = _ms_since(t0)
 
@@ -238,7 +353,7 @@ class PipelineOrchestrator:
             job.current_phase = "postprocessing"
             t0 = time.perf_counter()
 
-            doc_name = Path(filename).stem
+
             postprocessor = PostProcessor(self._storage)
             pp_result = await postprocessor.run(
                 doc_name=doc_name,
@@ -260,12 +375,9 @@ class PipelineOrchestrator:
                 job.current_phase = "vectorizing"
                 t0 = time.perf_counter()
 
-                # Build page_map the same way PostProcessor does
-                page_map: dict[int, dict] = {}
-                for pn, state in job.page_results.items():
-                    extracted = state.get("final") or state.get("extracted") or {}
-                    if extracted:
-                        page_map[int(pn)] = extracted
+                # Reuse postprocessor's flattening so we don't duplicate the
+                # "final or extracted" rule across modules.
+                page_map = _build_page_map(job.page_results)
 
                 chunks = self._chunker.chunk_pages(
                     page_map,
@@ -284,39 +396,90 @@ class PipelineOrchestrator:
                     upserted = await self._vector_store.upsert_chunks(
                         chunks, embeddings
                     )
-                    job.phase_timings["vectorizing"] = _ms_since(t0)
+
+                    # Approximate embedding tokens (~4 chars/token).
+                    job.embedding_tokens += sum(len(c.text) for c in chunks) // 4
 
                     logger.info(
-                        "pipeline_vectorize_done",
+                        "pipeline_vectorize_chunks_done",
                         job_id=job_id,
                         chunks=len(chunks),
                         vectors_upserted=upserted,
                     )
                 else:
-                    job.phase_timings["vectorizing"] = _ms_since(t0)
                     logger.info(
-                        "pipeline_vectorize_skipped",
+                        "pipeline_vectorize_chunks_skipped",
                         job_id=job_id,
                         reason="no_chunks",
                     )
+
+                # Phase 4b: Entity indexing
+                entity_points = build_entity_points(
+                    pp_result.resolved_by_page,
+                    doc_name=doc_name,
+                    job_id=job_id,
+                    filename=filename,
+                )
+                entities_upserted = 0
+                if entity_points:
+                    entities_upserted = await upsert_entity_points(
+                        entity_points, self._embedder, self._vector_store
+                    )
+                    job.embedding_tokens += sum(len(p.text) for p in entity_points) // 4
+
+                # Phase 4c: Image description indexing
+                image_points = build_image_points(
+                    page_map,
+                    doc_name=doc_name,
+                    job_id=job_id,
+                    filename=filename,
+                )
+                images_upserted = 0
+                if image_points:
+                    images_upserted = await upsert_image_points(
+                        image_points, self._embedder, self._vector_store
+                    )
+                    job.embedding_tokens += sum(len(p.text) for p in image_points) // 4
+
+                job.phase_timings["vectorizing"] = _ms_since(t0)
+                logger.info(
+                    "pipeline_vectorize_done",
+                    job_id=job_id,
+                    chunks_upserted=len(chunks) if chunks else 0,
+                    entities_upserted=entities_upserted,
+                    images_upserted=images_upserted,
+                )
 
                 job.persist()
 
             job.status = JobStatus.COMPLETED
             job.current_phase = "done"
+            job.finished_at = time.time()
             job.persist()
 
+            summary = job.to_summary()
             logger.info(
                 "pipeline_complete",
                 job_id=job_id,
                 total_pages=job.total_pages,
-                total_time_ms=sum(job.phase_timings.values()),
+                duration_seconds=summary["duration_seconds"],
+                total_tokens=summary["tokens"]["totals"]["total_tokens"],
+                cost_usd=summary["cost_usd"]["total"],
             )
 
         except Exception as exc:
+            import traceback as _tb
+            tb_str = _tb.format_exc()
+            err_msg = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             job.status = JobStatus.FAILED
-            job.error = str(exc)
-            logger.error("pipeline_failed", job_id=job_id, error=str(exc))
+            job.error = err_msg
+            job.finished_at = time.time()
+            logger.error(
+                "pipeline_failed",
+                job_id=job_id,
+                error=err_msg,
+                traceback=tb_str,
+            )
             job.persist()
 
         _evict_old_jobs()
@@ -330,6 +493,8 @@ async def _worker(
     *,
     worker_id: int,
     output_dir: Path | None = None,
+    storage: FileStorage | None = None,
+    doc_name: str | None = None,
 ) -> None:
     """Single worker: pop a PageImage, run the per-page graph, store result."""
     while True:
@@ -377,7 +542,7 @@ async def _worker(
             # worker task finishes.
             page.png_bytes = b""
 
-            # Lock final: if validator never passed and no escalation ran,
+            # Lock final: if extractor self-passed and no escalation ran,
             # use whatever the last extraction produced.
             if not result.get("final"):
                 result["final"] = result.get("extracted", {})
@@ -388,6 +553,20 @@ async def _worker(
             result_to_store["png_path"] = page.png_path
             job.page_results[page.page_num] = result_to_store
             job.pages_processed = len(job.page_results)
+
+            # Persist per-page state JSON so a future run can resume
+            # without losing tables/entities/images.
+            if storage is not None and doc_name is not None:
+                try:
+                    await storage.write_page_state(
+                        doc_name, page.page_num, result_to_store
+                    )
+                except Exception:
+                    logger.warning(
+                        "worker_state_persist_failed",
+                        page_num=page.page_num,
+                        exc_info=True,
+                    )
 
             logger.info(
                 "worker_page_complete",

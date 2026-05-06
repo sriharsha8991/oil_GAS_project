@@ -96,17 +96,30 @@ class PageDeque:
 
     def __init__(self, maxsize: int = 32) -> None:
         self._queue: asyncio.Queue[PageImage | None] = asyncio.Queue(maxsize=maxsize)
+        self._closed: bool = False
 
     async def push(self, page: PageImage) -> None:
         await self._queue.put(page)
 
     async def pop(self) -> PageImage | None:
-        return await self._queue.get()
+        # When the producer is done AND the queue has drained, return the
+        # sentinel directly. This avoids needing one queued sentinel per
+        # consumer (which can raise QueueFull when num_consumers > maxsize).
+        while True:
+            if self._closed and self._queue.empty():
+                return None
+            try:
+                return await asyncio.wait_for(self._queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
 
-    def close(self, num_consumers: int) -> None:
-        """Send one sentinel per consumer so each worker exits cleanly."""
-        for _ in range(num_consumers):
-            self._queue.put_nowait(None)
+    def close(self, num_consumers: int = 0) -> None:
+        """Mark the deque closed. Workers will exit once the queue drains.
+
+        ``num_consumers`` is accepted for backwards compatibility but
+        ignored — closure is now flag-based, not sentinel-based.
+        """
+        self._closed = True
 
     def qsize(self) -> int:
         return self._queue.qsize()

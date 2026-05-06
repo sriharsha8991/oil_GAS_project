@@ -25,10 +25,18 @@ _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/2")
 _KEY_PREFIX = "job:"
 _INDEX_KEY = "jobs:index"  # sorted set: job_id → created_ts
 
+# Module-level singleton: redis.from_url internally uses a connection pool,
+# so a single shared client object reuses sockets across all callers and
+# avoids the OSError: Too many open files failure mode under burst load.
+_client_singleton: redis.Redis | None = None
+
 
 def _client() -> redis.Redis:
-    """Return a Redis client (lazy, connection-pooled)."""
-    return redis.from_url(_REDIS_URL, decode_responses=True)
+    """Return the shared Redis client (lazy, connection-pooled)."""
+    global _client_singleton  # noqa: PLW0603
+    if _client_singleton is None:
+        _client_singleton = redis.from_url(_REDIS_URL, decode_responses=True)
+    return _client_singleton
 
 
 # ---------------------------------------------------------------------------

@@ -69,12 +69,6 @@ class FileStorage:
         """Resolve the on-disk path for a persisted page PNG (no I/O)."""
         return self.pages_dir(doc_name) / f"page_{page_num:03d}.png"
 
-    async def write_page_png(self, doc_name: str, page_num: int, png: bytes) -> Path:
-        """Persist a rendered page PNG to disk (used for image grounding)."""
-        path = self.page_png_path(doc_name, page_num)
-        await _atomic_write_bytes(path, png)
-        return path
-
     async def write_entities_json(self, doc_name: str, data: dict[str, Any]) -> Path:
         """Persist the consolidated per-doc entities JSON."""
         d = self.doc_dir(doc_name)
@@ -87,6 +81,26 @@ class FileStorage:
         d = self.doc_dir(doc_name)
         path = d / f"page_{page_num:03d}.md"
         await _atomic_write_text(path, content)
+        return path
+
+    def page_state_path(self, doc_name: str, page_num: int) -> Path:
+        """On-disk path for the per-page extraction state JSON."""
+        return self.doc_dir(doc_name) / f"page_{page_num:03d}.state.json"
+
+    async def write_page_state(
+        self, doc_name: str, page_num: int, state: dict[str, Any]
+    ) -> Path:
+        """Persist the locked-in extraction state for a page.
+
+        Written by the worker after the LangGraph completes so a crash
+        between extraction and post-processing can be resumed without
+        re-paying for Gemini calls AND without losing tables/entities/
+        images (the markdown-only resume previously discarded them).
+        """
+        path = self.page_state_path(doc_name, page_num)
+        await _atomic_write_text(
+            path, json.dumps(state, indent=2, ensure_ascii=False, default=str)
+        )
         return path
 
     async def write_full_document(self, doc_name: str, content: str) -> Path:
@@ -114,14 +128,6 @@ class FileStorage:
         d.mkdir(exist_ok=True)
         path = d / f"page_{page_num:03d}_table_{table_index:02d}.md"
         await _atomic_write_text(path, content)
-        return path
-
-    async def write_image(self, doc_name: str, page_num: int, img_index: int, data: bytes) -> Path:
-        """Write a raw image file."""
-        d = self.doc_dir(doc_name) / "images"
-        d.mkdir(exist_ok=True)
-        path = d / f"page_{page_num:03d}_img_{img_index:02d}.png"
-        await _atomic_write_bytes(path, data)
         return path
 
     @staticmethod

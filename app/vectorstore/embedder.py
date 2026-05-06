@@ -29,6 +29,9 @@ class GeminiEmbedder:
         self._batch_size = settings.embedding_batch_size
         self._dimensions = settings.embedding_dimensions
         self._semaphore = asyncio.Semaphore(10)  # max concurrent embed calls
+        self._call_timeout = settings.embed_call_timeout_seconds
+        self._max_retries = 3
+        self._base_delay = 1.0
 
     async def embed_texts(
         self,
@@ -74,27 +77,43 @@ class GeminiEmbedder:
         *,
         task_type: str,
     ) -> list[list[float]]:
-        """Call the Gemini embed_content API for a single batch."""
-        async with self._semaphore:
-            try:
-                response = await self._client.aio.models.embed_content(
-                    model=self._model,
-                    contents=texts,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=self._dimensions,
-                    ),
-                )
-                logger.debug(
-                    "embed_batch_done",
-                    batch_size=len(texts),
-                    model=self._model,
-                )
-                return [e.values for e in response.embeddings]
-            except Exception:
-                logger.error(
-                    "embed_batch_failed",
-                    batch_size=len(texts),
-                    exc_info=True,
-                )
-                raise
+        """Call the Gemini embed_content API for a single batch with retry."""
+        last_error: BaseException | None = None
+        for attempt in range(1, self._max_retries + 1):
+            async with self._semaphore:
+                try:
+                    response = await asyncio.wait_for(
+                        self._client.aio.models.embed_content(
+                            model=self._model,
+                            contents=texts,
+                            config=types.EmbedContentConfig(
+                                task_type=task_type,
+                                output_dimensionality=self._dimensions,
+                            ),
+                        ),
+                        timeout=self._call_timeout,
+                    )
+                    logger.debug(
+                        "embed_batch_done",
+                        batch_size=len(texts),
+                        model=self._model,
+                    )
+                    return [e.values for e in response.embeddings]
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "embed_batch_attempt_failed",
+                        attempt=attempt,
+                        batch_size=len(texts),
+                        error=str(exc),
+                    )
+                    if attempt < self._max_retries:
+                        delay = self._base_delay * (2 ** (attempt - 1))
+                        await asyncio.sleep(delay)
+        logger.error(
+            "embed_batch_failed",
+            batch_size=len(texts),
+            attempts=self._max_retries,
+        )
+        assert last_error is not None
+        raise last_error

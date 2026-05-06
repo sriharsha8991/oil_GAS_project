@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 
+from app.domain.entity_resolver import CanonicalEntity, EntityResolver, ResolvedEntity
 from app.models.schemas import PageBaseline
 from app.storage.file_storage import FileStorage
 from app.utils.logging import get_logger
@@ -100,9 +101,55 @@ class PostProcessor:
         full_md = _build_full_document(filename, baselines, page_map, header_footer)
         await self._storage.write_full_document(doc_name, full_md)
 
-        # Step 8: Consolidated entities (one file per doc, organized by page)
+        # Step 8: Entity resolution (L2 domain knowledge)
+        resolver = EntityResolver()
+        canonical_store: list[CanonicalEntity] = []
+        resolved_by_page: dict[int, list[dict]] = {}
+
+        for pn in sorted(page_map.keys()):
+            raw_entities = page_map[pn].get("entities", []) or []
+            if not raw_entities:
+                continue
+            resolved, canonical_store = resolver.resolve_entities(
+                raw_entities,
+                canonical_store,
+                doc_name=doc_name,
+                page_num=pn,
+            )
+            resolved_by_page[pn] = [
+                {
+                    "type": r.type,
+                    "value": r.value,
+                    "unit": r.unit,
+                    "context": r.context,
+                    "bbox": r.bbox,
+                    "canonical_id": r.canonical_id,
+                    "canonical_value": r.canonical_value,
+                    "resolution": r.resolution,
+                    "similarity": round(r.similarity, 3),
+                }
+                for r in resolved
+            ]
+
+        # Step 9: Consolidated entities (one file per doc, organized by page)
         entities_doc = _build_entities_doc(doc_name, page_map)
+        # Enrich with resolution data
+        entities_doc["resolved_by_page"] = {
+            str(k): v for k, v in resolved_by_page.items()
+        }
+        entities_doc["canonical_entities"] = [
+            {
+                "canonical_id": c.canonical_id,
+                "entity_type": c.entity_type,
+                "canonical_value": c.canonical_value,
+                "unit": c.unit,
+                "aliases": c.aliases,
+                "occurrences": c.occurrences,
+            }
+            for c in canonical_store
+        ]
         entities_count = sum(len(v) for v in entities_doc["entities_by_page"].values())
+        resolved_count = sum(len(v) for v in resolved_by_page.values())
         await self._storage.write_entities_json(doc_name, entities_doc)
 
         result = PostProcessResult(
@@ -111,6 +158,9 @@ class PostProcessor:
             merged_tables=len(merged_tables),
             header_footer_removed=len(header_footer),
             entities_written=entities_count,
+            entities_resolved=resolved_count,
+            canonical_entities=len(canonical_store),
+            resolved_by_page=resolved_by_page,
         )
 
         logger.info(
@@ -120,6 +170,8 @@ class PostProcessor:
             tables=tables_written,
             merged_tables=len(merged_tables),
             entities=entities_count,
+            entities_resolved=resolved_count,
+            canonical_entities=len(canonical_store),
         )
         return result
 
@@ -134,12 +186,18 @@ class PostProcessResult:
         merged_tables: int = 0,
         header_footer_removed: int = 0,
         entities_written: int = 0,
+        entities_resolved: int = 0,
+        canonical_entities: int = 0,
+        resolved_by_page: dict[int, list[dict]] | None = None,
     ) -> None:
         self.pages_written = pages_written
         self.tables_written = tables_written
         self.merged_tables = merged_tables
         self.header_footer_removed = header_footer_removed
         self.entities_written = entities_written
+        self.entities_resolved = entities_resolved
+        self.canonical_entities = canonical_entities
+        self.resolved_by_page = resolved_by_page or {}
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -148,6 +206,8 @@ class PostProcessResult:
             "merged_tables": self.merged_tables,
             "header_footer_removed": self.header_footer_removed,
             "entities_written": self.entities_written,
+            "entities_resolved": self.entities_resolved,
+            "canonical_entities": self.canonical_entities,
         }
 
 
@@ -320,8 +380,18 @@ def _detect_header_footer(
     page_map: dict[int, dict],
     baselines: list[PageBaseline],
 ) -> set[str]:
-    """Detect lines that appear on >50% of pages (likely headers/footers)."""
-    if len(baselines) < 5:
+    """Detect lines that appear on most pages (likely headers/footers).
+
+    Tiered threshold tuning:
+    - Documents with <10 pages: skip detection entirely (false-positive risk
+      outweighs the cleanup, e.g. a section heading repeated across the only
+      few pages of that section gets mis-stripped).
+    - 10-29 pages: require ~70% co-occurrence.
+    - 30+ pages: require ~50% co-occurrence (original behaviour).
+    Candidate lines must also be reasonably short (<=80 chars) to avoid
+    matching legitimate paragraphs.
+    """
+    if len(baselines) < 10:
         return set()
 
     line_counts: dict[str, int] = {}
@@ -336,12 +406,13 @@ def _detect_header_footer(
         candidates = set()
         for line in non_empty[:2] + non_empty[-2:]:
             cleaned = _normalize_header_line(line)
-            if cleaned and len(cleaned) > 5:
+            if cleaned and 5 < len(cleaned) <= 80:
                 candidates.add(cleaned)
         for c in candidates:
             line_counts[c] = line_counts.get(c, 0) + 1
 
-    threshold = max(total_pages * 0.5, 3)
+    ratio = 0.7 if total_pages < 30 else 0.5
+    threshold = max(total_pages * ratio, 4)
     return {line for line, count in line_counts.items() if count >= threshold}
 
 

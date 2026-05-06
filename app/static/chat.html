@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WellSynth — Chat</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161a22;
+      --panel-2: #1d222c;
+      --border: #262d39;
+      --text: #e6e9ef;
+      --muted: #8a93a6;
+      --accent: #5b8cff;
+      --user: #2a3142;
+      --assistant: #1a2030;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --info: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+      display: flex; flex-direction: column;
+    }
+    header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px;
+      background: var(--panel);
+    }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    header .sub { color: var(--muted); font-size: 12px; }
+    header .controls { margin-left: auto; display: flex; gap: 8px; }
+    header input, header button {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 10px; font-size: 12px;
+    }
+    header button { cursor: pointer; }
+    header button:hover { border-color: var(--accent); }
+
+    main {
+      flex: 1; overflow-y: auto; padding: 20px;
+      display: flex; flex-direction: column; gap: 14px;
+      max-width: 900px; margin: 0 auto; width: 100%;
+    }
+    .msg {
+      padding: 12px 14px; border-radius: 10px;
+      border: 1px solid var(--border);
+      max-width: 85%;
+    }
+    .msg.user { align-self: flex-end; background: var(--user); }
+    .msg.assistant { align-self: flex-start; background: var(--assistant); }
+    .msg .role { font-size: 11px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .msg .body { white-space: pre-wrap; word-wrap: break-word; }
+    .msg .body p:first-child { margin-top: 0; }
+    .msg .body p:last-child { margin-bottom: 0; }
+    .msg pre { background: #0c0e13; padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+    .msg code { background: #0c0e13; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    .msg table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+    .msg th, .msg td { border: 1px solid var(--border); padding: 4px 8px; }
+    .msg th { background: var(--panel-2); }
+
+    .status {
+      display: inline-block; font-size: 10px; padding: 2px 6px;
+      border-radius: 4px; text-transform: uppercase; letter-spacing: 0.5px;
+      margin-bottom: 6px; font-weight: 600;
+    }
+    .status.answered { background: rgba(74,222,128,.15); color: var(--ok); }
+    .status.partial { background: rgba(251,191,36,.15); color: var(--warn); }
+    .status.no_evidence { background: rgba(248,113,113,.15); color: var(--bad); }
+    .status.clarification_requested { background: rgba(96,165,250,.15); color: var(--info); }
+
+    .meta { font-size: 11px; color: var(--muted); margin-top: 10px; }
+    .meta details { margin-top: 6px; }
+    .meta summary { cursor: pointer; user-select: none; }
+
+    .followup {
+      margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+      background: rgba(91,140,255,.08); border: 1px solid rgba(91,140,255,.25);
+      font-size: 12px;
+    }
+    .followup .label { color: var(--accent); font-weight: 600; margin-right: 6px; }
+
+    .unanswered {
+      margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+      background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.25);
+      font-size: 12px;
+    }
+    .unanswered .label { color: var(--warn); font-weight: 600; }
+    .unanswered ul { margin: 4px 0 0 18px; padding: 0; }
+
+    .evidence { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+    .evidence .card {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px; font-size: 11px;
+    }
+    .evidence .card .ek { font-weight: 600; color: var(--accent); font-size: 10px; text-transform: uppercase; }
+    .evidence .card img { max-width: 100%; border-radius: 4px; margin-top: 4px; display: block; }
+    .evidence .card a { color: var(--text); text-decoration: none; }
+    .evidence .card a:hover { color: var(--accent); }
+    .evidence .card .src-id {
+      display: inline-block; background: rgba(91,140,255,.15); color: var(--accent);
+      padding: 1px 5px; border-radius: 3px; font-family: ui-monospace, Menlo, monospace;
+      font-size: 10px; margin-left: 4px;
+    }
+    .evidence .card .img-err {
+      margin-top: 4px; padding: 6px; border-radius: 4px;
+      background: rgba(248,113,113,.08); border: 1px dashed rgba(248,113,113,.4);
+      color: var(--bad); font-size: 10px; word-break: break-all;
+    }
+    .evidence .card .img-err a { color: var(--accent); }
+
+    .attached {
+      margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+      background: rgba(91,140,255,.06); border: 1px solid rgba(91,140,255,.25);
+    }
+    .attached .label {
+      color: var(--accent); font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .attached .grid {
+      margin-top: 6px; display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 6px;
+    }
+    .attached .thumb {
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px; font-size: 10px; color: var(--muted);
+    }
+    .attached .thumb img { max-width: 100%; border-radius: 3px; display: block; }
+    .attached .thumb .lbl { margin-top: 3px; word-break: break-all; }
+
+    .citations {
+      margin-top: 8px; font-size: 11px; color: var(--muted);
+    }
+    .citations .cite {
+      display: inline-block; margin: 2px 4px 2px 0; padding: 1px 6px;
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 10px; font-family: ui-monospace, Menlo, monospace;
+    }
+    .citations .cite.low { border-color: rgba(251,191,36,.4); color: var(--warn); }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 12px 20px; background: var(--panel);
+    }
+    .input-row {
+      max-width: 900px; margin: 0 auto;
+      display: flex; gap: 8px;
+    }
+    .input-row textarea {
+      flex: 1; resize: none; min-height: 44px; max-height: 160px;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; font: inherit;
+    }
+    .input-row textarea:focus { outline: none; border-color: var(--accent); }
+    .input-row button {
+      background: var(--accent); color: white; border: none;
+      padding: 0 18px; border-radius: 8px; font-weight: 600; cursor: pointer;
+      font-size: 13px;
+    }
+    .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .typing { color: var(--muted); font-style: italic; font-size: 12px; }
+    .typing::after { content: '…'; animation: dots 1.2s steps(4,end) infinite; }
+    @keyframes dots {
+      0%, 20% { content: ''; }
+      40% { content: '.'; }
+      60% { content: '..'; }
+      80%, 100% { content: '...'; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WellSynth Chat</h1>
+    <nav style="display:flex; gap:4px;">
+      <a href="/ingest-ui" style="color:var(--muted); text-decoration:none; padding:6px 10px; border-radius:6px; font-size:13px;">Ingest</a>
+      <a href="/ui" style="color:var(--text); background:var(--panel-2); text-decoration:none; padding:6px 10px; border-radius:6px; font-size:13px;">Chat</a>
+    </nav>
+    <span class="sub" id="conn-status">connecting…</span>
+    <div class="controls">
+      <input id="job_id" placeholder="job_id (optional)" size="20" />
+      <input id="doc_name" placeholder="doc_name (optional)" size="20" />
+      <button id="reset">New session</button>
+    </div>
+  </header>
+
+  <main id="chat"></main>
+
+  <footer>
+    <div class="input-row">
+      <textarea id="input" rows="1" placeholder="Ask about your documents…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const chatEl = $("chat");
+    const inputEl = $("input");
+    const sendBtn = $("send");
+    const resetBtn = $("reset");
+    const jobInput = $("job_id");
+    const docInput = $("doc_name");
+    const connStatus = $("conn-status");
+
+    let sessionId = null;
+
+    // --- Tiny markdown renderer (headings, bold, italic, code, lists, tables) ---
+    function escapeHTML(s) {
+      return s.replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    function renderTable(block) {
+      const lines = block.trim().split("\n");
+      if (lines.length < 2) return null;
+      const split = (l) => l.replace(/^\||\|$/g, "").split("|").map(s => s.trim());
+      const header = split(lines[0]);
+      const rows = lines.slice(2).map(split);
+      let html = "<table><thead><tr>";
+      for (const h of header) html += `<th>${escapeHTML(h)}</th>`;
+      html += "</tr></thead><tbody>";
+      for (const r of rows) {
+        html += "<tr>";
+        for (const c of r) html += `<td>${escapeHTML(c)}</td>`;
+        html += "</tr>";
+      }
+      return html + "</tbody></table>";
+    }
+
+    function renderMarkdown(md) {
+      if (!md) return "";
+      // Pull out fenced code blocks first
+      const codeBlocks = [];
+      md = md.replace(/```([\s\S]*?)```/g, (_, code) => {
+        codeBlocks.push(code);
+        return `\u0000CB${codeBlocks.length - 1}\u0000`;
+      });
+
+      // Pull out tables
+      const tableBlocks = [];
+      md = md.replace(/((?:^\|[^\n]*\|\s*\n)(?:\|[\s\-:|]+\|\s*\n)(?:\|[^\n]*\|\s*\n?)+)/gm, (block) => {
+        const html = renderTable(block);
+        if (!html) return block;
+        tableBlocks.push(html);
+        return `\u0000TB${tableBlocks.length - 1}\u0000`;
+      });
+
+      let html = escapeHTML(md);
+
+      // Headings
+      html = html.replace(/^### (.+)$/gm, "<h4>$1</h4>");
+      html = html.replace(/^## (.+)$/gm, "<h3>$1</h3>");
+      html = html.replace(/^# (.+)$/gm, "<h2>$1</h2>");
+
+      // Bold / italic / inline code
+      html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+      html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      html = html.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+
+      // Lists (very simple)
+      html = html.replace(/(?:^|\n)((?:[-*] [^\n]+\n?)+)/g, (_, block) => {
+        const items = block.trim().split("\n").map(l => l.replace(/^[-*] /, ""));
+        return "\n<ul>" + items.map(i => `<li>${i}</li>`).join("") + "</ul>";
+      });
+
+      // Paragraphs
+      html = html.split(/\n{2,}/).map(p => p.trim() ? `<p>${p.replace(/\n/g, "<br>")}</p>` : "").join("");
+
+      // Restore tables and code
+      html = html.replace(/\u0000TB(\d+)\u0000/g, (_, i) => tableBlocks[+i]);
+      html = html.replace(/\u0000CB(\d+)\u0000/g, (_, i) => `<pre><code>${escapeHTML(codeBlocks[+i])}</code></pre>`);
+
+      return html;
+    }
+
+    function appendUser(text) {
+      const div = document.createElement("div");
+      div.className = "msg user";
+      div.innerHTML = `<div class="role">You</div><div class="body">${escapeHTML(text)}</div>`;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function appendTyping() {
+      const div = document.createElement("div");
+      div.className = "msg assistant";
+      div.id = "typing-msg";
+      div.innerHTML = `<div class="role">Assistant</div><div class="typing">thinking</div>`;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function removeTyping() {
+      const t = document.getElementById("typing-msg");
+      if (t) t.remove();
+    }
+
+    function renderEvidence(evidence) {
+      if (!evidence || !evidence.length) return "";
+      const cards = evidence.map((e, i) => {
+        const url = e.url ? (window.location.origin + e.url) : null;
+        const sid = e.source_id ? `<span class="src-id">${escapeHTML(e.source_id)}</span>` : "";
+        const errId = `img-err-${Date.now()}-${i}`;
+        // onerror handler swaps broken <img> for an inline error block exposing the URL
+        // (so the user can click it and see the actual HTTP error from the route).
+        const imgFallback = (u, alt) => `
+          <a href="${u}" target="_blank">
+            <img src="${u}" loading="lazy" alt="${alt}"
+                 onerror="this.style.display='none';
+                          var e=document.getElementById('${errId}');
+                          if(e){e.style.display='block';
+                                fetch('${u}',{method:'HEAD'}).then(r=>{
+                                  e.querySelector('.s').textContent=r.status+' '+r.statusText;
+                                }).catch(()=>{e.querySelector('.s').textContent='network error';});}" />
+          </a>
+          <div id="${errId}" class="img-err" style="display:none">
+            image failed (<span class="s">…</span>)<br>
+            <a href="${u}" target="_blank">${escapeHTML(u)}</a>
+          </div>`;
+        let body = "";
+        if (e.kind === "table") {
+          body = `<div>📊 Table on p${(e.page_num||0)+1}</div>`;
+          if (url) body += `<a href="${url}" target="_blank">view page</a>`;
+        } else if (e.kind === "bbox_crop") {
+          body = url ? imgFallback(url, "crop") : `<div>${escapeHTML(e.description||"")}</div>`;
+          body += `<div>p${(e.page_num||0)+1} · ${escapeHTML(e.image_type||"figure")}</div>`;
+        } else if (e.kind === "page_image") {
+          body = url ? imgFallback(url, "page") : `<div>p${(e.page_num||0)+1}</div>`;
+          body += `<div>p${(e.page_num||0)+1}${e.image_type?` · ${escapeHTML(e.image_type)}`:""}</div>`;
+        }
+        return `<div class="card"><div class="ek">${e.kind}${sid}</div>${body}</div>`;
+      }).join("");
+      return `<div class="evidence">${cards}</div>`;
+    }
+
+    function renderAttached(pages) {
+      if (!pages || !pages.length) return "";
+      const items = pages.map(p => {
+        const url = p.url ? (window.location.origin + p.url) : null;
+        const lbl = `${escapeHTML(p.doc_name||"")} p${(p.page_num||0)+1}` +
+                    (p.image_type ? ` · ${escapeHTML(p.image_type)}` : "");
+        const kb = p.size_bytes ? ` <span style="color:var(--muted)">(${(p.size_bytes/1024).toFixed(0)} KB)</span>` : "";
+        return `
+          <div class="thumb">
+            ${url ? `<a href="${url}" target="_blank"><img src="${url}" loading="lazy" alt="page" /></a>` : ""}
+            <div class="lbl">${lbl}${kb}</div>
+          </div>`;
+      }).join("");
+      return `
+        <div class="attached">
+          <span class="label">🖼 Sent to Gemini for grounding (${pages.length})</span>
+          <div class="grid">${items}</div>
+        </div>`;
+    }
+
+    function renderCitations(claims) {
+      if (!claims || !claims.length) return "";
+      const chips = claims.map(c => {
+        const cls = (c.confidence||"").toLowerCase() === "low" ? "cite low" : "cite";
+        const title = `${c.text || ""}\n(${c.confidence || "medium"} confidence)`;
+        return `<span class="${cls}" title="${escapeHTML(title)}">${escapeHTML(c.source_id)}</span>`;
+      }).join("");
+      return `<div class="citations">Citations: ${chips}</div>`;
+    }
+
+    function humanize(s) {
+      return String(s||"").replace(/_/g, " ");
+    }
+
+    function renderUnanswered(unanswered) {
+      if (!unanswered || !unanswered.length) return "";
+      const items = unanswered.map(u =>
+        `<li><strong>${escapeHTML(humanize(u.facet))}</strong> — ${escapeHTML(u.reason||"")}</li>`
+      ).join("");
+      return `<div class="unanswered"><span class="label">Couldn't determine:</span><ul>${items}</ul></div>`;
+    }
+
+    function renderFollowup(followup) {
+      if (!followup) return "";
+      return `<div class="followup"><span class="label">Suggested next question:</span>${escapeHTML(followup)}</div>`;
+    }
+
+    function renderMeta(data) {
+      const a = data.assessment;
+      const calls = data.tool_calls_made;
+      let meta = `<div class="meta">model_calls: ${calls ?? 0}`;
+      if (a) {
+        meta += ` · top_score: ${a.top_score} · facets: ${a.covered_facets?.length||0}/${(a.covered_facets?.length||0)+(a.missing_facets?.length||0)}`;
+      }
+      if (data.sources && data.sources.length) {
+        meta += ` · sources: ${data.sources.length}`;
+      }
+      if (data.plan) {
+        meta += `<details><summary>plan</summary><pre>${escapeHTML(JSON.stringify(data.plan, null, 2))}</pre></details>`;
+      }
+      return meta + "</div>";
+    }
+
+    function appendAssistant(data) {
+      const div = document.createElement("div");
+      div.className = "msg assistant";
+      const status = data.status || "answered";
+      const body = data.answer
+        ? renderMarkdown(data.answer)
+        : "<em>(no response)</em>";
+
+      div.innerHTML = `
+        <div class="role">Assistant</div>
+        <span class="status ${status}">${status.replace("_"," ")}</span>
+        <div class="body">${body}</div>
+        ${renderCitations(data.claims)}
+        ${renderUnanswered(data.unanswered)}
+        ${renderFollowup(data.followup)}
+        ${renderEvidence(data.evidence)}
+        ${renderAttached(data.attached_pages)}
+        ${renderMeta(data)}
+      `;
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+
+      // Wire follow-up click to refill input
+      const fEl = div.querySelector(".followup");
+      if (fEl && data.followup) {
+        fEl.style.cursor = "pointer";
+        fEl.title = "Click to use this as your next question";
+        fEl.addEventListener("click", () => {
+          inputEl.value = data.followup;
+          inputEl.focus();
+        });
+      }
+    }
+
+    async function send() {
+      const message = inputEl.value.trim();
+      if (!message) return;
+      inputEl.value = "";
+      sendBtn.disabled = true;
+
+      appendUser(message);
+      appendTyping();
+
+      // Hard 75s timeout so the UI never appears stuck.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 75000);
+
+      try {
+        const r = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: ctrl.signal,
+          body: JSON.stringify({
+            message,
+            session_id: sessionId,
+            job_id: jobInput.value.trim() || null,
+            doc_name: docInput.value.trim() || null,
+          }),
+        });
+        removeTyping();
+        if (!r.ok) {
+          const txt = await r.text();
+          appendAssistant({
+            status: "no_evidence",
+            answer: `**Error ${r.status}** — ${escapeHTML(txt).slice(0,500)}`,
+          });
+          return;
+        }
+        const data = await r.json();
+        sessionId = data.session_id;
+        appendAssistant(data);
+      } catch (e) {
+        removeTyping();
+        const msg = e && e.name === "AbortError"
+          ? "**Timed out** — the server took longer than 75s. Try a more specific question or check the backend logs."
+          : `**Network error** — ${escapeHTML(String(e))}`;
+        appendAssistant({ status: "no_evidence", answer: msg });
+      } finally {
+        clearTimeout(timer);
+        sendBtn.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    // Probe service health on load
+    (async () => {
+      try {
+        const r = await fetch("/");
+        connStatus.textContent = r.ok ? "connected" : `error ${r.status}`;
+        connStatus.style.color = r.ok ? "var(--ok)" : "var(--bad)";
+      } catch {
+        connStatus.textContent = "offline";
+        connStatus.style.color = "var(--bad)";
+      }
+    })();
+
+    sendBtn.addEventListener("click", send);
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+    inputEl.addEventListener("input", () => {
+      inputEl.style.height = "auto";
+      inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+    });
+    resetBtn.addEventListener("click", () => {
+      sessionId = null;
+      chatEl.innerHTML = "";
+      inputEl.focus();
+    });
+
+    // Pre-fill job_id (and optional doc_name) from URL hash set by the
+    // ingest UI's "Chat with this" button. Hash format:
+    //   #job=<job_id>            or
+    //   #job=<job_id>&doc=<doc_name>
+    if (window.location.hash) {
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      const jid = params.get("job");
+      const doc = params.get("doc");
+      if (jid) jobInput.value = jid;
+      if (doc) docInput.value = doc;
+    }
+    inputEl.focus();
+  </script>
+</body>
+</html>

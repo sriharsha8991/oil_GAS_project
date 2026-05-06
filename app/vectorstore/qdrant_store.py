@@ -30,35 +30,68 @@ class QdrantVectorStore:
         self._dimensions = settings.embedding_dimensions
 
     async def ensure_collection(self) -> None:
-        """Create the collection if it doesn't exist."""
-        exists = await self._client.collection_exists(self._collection)
+        """Create all required collections if they don't exist."""
+        await self._ensure_single_collection(
+            self._collection,
+            payload_indices={
+                "job_id": models.PayloadSchemaType.KEYWORD,
+                "doc_name": models.PayloadSchemaType.KEYWORD,
+                "filename": models.PayloadSchemaType.KEYWORD,
+                "page_num": models.PayloadSchemaType.INTEGER,
+                "kind": models.PayloadSchemaType.KEYWORD,
+            },
+        )
+        # Entity facts collection
+        await self._ensure_single_collection(
+            "wellsynthai_entities",
+            payload_indices={
+                "job_id": models.PayloadSchemaType.KEYWORD,
+                "doc_name": models.PayloadSchemaType.KEYWORD,
+                "entity_type": models.PayloadSchemaType.KEYWORD,
+                "canonical_id": models.PayloadSchemaType.KEYWORD,
+                "unit": models.PayloadSchemaType.KEYWORD,
+                "page_num": models.PayloadSchemaType.INTEGER,
+            },
+        )
+        # Image descriptions collection
+        await self._ensure_single_collection(
+            "wellsynthai_images",
+            payload_indices={
+                "job_id": models.PayloadSchemaType.KEYWORD,
+                "doc_name": models.PayloadSchemaType.KEYWORD,
+                "image_type": models.PayloadSchemaType.KEYWORD,
+                "page_num": models.PayloadSchemaType.INTEGER,
+            },
+        )
+
+    async def _ensure_single_collection(
+        self,
+        name: str,
+        payload_indices: dict[str, models.PayloadSchemaType],
+    ) -> None:
+        """Create a single collection with payload indices if it doesn't exist."""
+        exists = await self._client.collection_exists(name)
         if exists:
-            logger.info("qdrant_collection_exists", collection=self._collection)
+            logger.info("qdrant_collection_exists", collection=name)
             return
 
         await self._client.create_collection(
-            collection_name=self._collection,
+            collection_name=name,
             vectors_config=models.VectorParams(
                 size=self._dimensions,
                 distance=models.Distance.COSINE,
             ),
         )
-        # Create payload indices for common filter fields
-        for field in ("job_id", "doc_name", "filename"):
+        for field_name, schema_type in payload_indices.items():
             await self._client.create_payload_index(
-                collection_name=self._collection,
-                field_name=field,
-                field_schema=models.PayloadSchemaType.KEYWORD,
+                collection_name=name,
+                field_name=field_name,
+                field_schema=schema_type,
             )
-        await self._client.create_payload_index(
-            collection_name=self._collection,
-            field_name="page_num",
-            field_schema=models.PayloadSchemaType.INTEGER,
-        )
 
         logger.info(
             "qdrant_collection_created",
-            collection=self._collection,
+            collection=name,
             dimensions=self._dimensions,
         )
 
@@ -85,6 +118,10 @@ class QdrantVectorStore:
                     "filename": chunk.filename,
                     "page_num": chunk.page_num,
                     "chunk_index": chunk.chunk_index,
+                    "kind": chunk.kind,
+                    "table_id": chunk.table_id,
+                    "table_markdown": chunk.table_markdown,
+                    "bbox": chunk.bbox,
                 },
             )
             for chunk, embedding in zip(chunks, embeddings)
@@ -177,21 +214,96 @@ class QdrantVectorStore:
             for point in results.points
         ]
 
-    async def delete_by_job(self, job_id: str) -> None:
-        """Delete all vectors belonging to a job (for re-ingestion)."""
-        await self._client.delete(
+    async def fetch_chunks_by_keys(
+        self,
+        keys: list[tuple[str, int, int]],
+        *,
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Look up chunks by exact ``(doc_name, page_num, chunk_index)`` triples.
+
+        Used for adjacent-chunk context expansion: given a top hit, fetch its
+        immediate neighbors so information that bleeds across chunk boundaries
+        is preserved when shown to the synthesizer.
+
+        Returns dicts in the same shape as :meth:`search` (with ``score=0.0``).
+        """
+        if not keys:
+            return []
+
+        should: list[models.Filter] = []
+        for doc_name, page_num, chunk_index in keys:
+            must: list[models.Condition] = [
+                models.FieldCondition(key="doc_name",
+                                      match=models.MatchValue(value=doc_name)),
+                models.FieldCondition(key="page_num",
+                                      match=models.MatchValue(value=page_num)),
+                models.FieldCondition(key="chunk_index",
+                                      match=models.MatchValue(value=chunk_index)),
+            ]
+            if job_id:
+                must.append(models.FieldCondition(
+                    key="job_id", match=models.MatchValue(value=job_id),
+                ))
+            should.append(models.Filter(must=must))
+
+        scrolled, _ = await self._client.scroll(
             collection_name=self._collection,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="job_id",
-                            match=models.MatchValue(value=job_id),
-                        )
-                    ]
-                )
-            ),
+            scroll_filter=models.Filter(should=should),
+            limit=max(1, len(keys)),
+            with_payload=True,
+            with_vectors=False,
         )
+        return [
+            {
+                "text": p.payload.get("text", ""),
+                "score": 0.0,
+                "doc_name": p.payload.get("doc_name"),
+                "filename": p.payload.get("filename"),
+                "job_id": p.payload.get("job_id"),
+                "page_num": p.payload.get("page_num"),
+                "chunk_index": p.payload.get("chunk_index"),
+                "kind": p.payload.get("kind"),
+                "table_id": p.payload.get("table_id"),
+                "table_markdown": p.payload.get("table_markdown"),
+                "bbox": p.payload.get("bbox"),
+            }
+            for p in scrolled
+        ]
+
+    async def delete_by_job(self, job_id: str) -> None:
+        """Delete all vectors belonging to a job (for re-ingestion).
+
+        Purges the main chunk collection AND the entity + image
+        collections so re-ingestion of the same job_id is fully idempotent.
+        """
+        selector = models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="job_id",
+                        match=models.MatchValue(value=job_id),
+                    )
+                ]
+            )
+        )
+        for collection in (
+            self._collection,
+            "wellsynthai_entities",
+            "wellsynthai_images",
+        ):
+            try:
+                await self._client.delete(
+                    collection_name=collection,
+                    points_selector=selector,
+                )
+            except Exception:
+                logger.warning(
+                    "qdrant_delete_skipped",
+                    collection=collection,
+                    job_id=job_id,
+                    exc_info=True,
+                )
         logger.info("qdrant_deleted_job", job_id=job_id)
 
     async def close(self) -> None:

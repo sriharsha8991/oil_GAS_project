@@ -1,30 +1,42 @@
-"""Ingest routes — upload PDFs, query extraction results, serve grounded evidence."""
+"""Ingest routes — public surface for document ingestion.
+
+The public surface is intentionally minimal. Anything not listed here is
+either an internal Python call (used by the RAG agent via ``app.agents``)
+or a development helper that should not be exposed to end users.
+
+Public endpoints
+----------------
+- ``POST   /ingest``                                 JSON: ingest by file path
+- ``GET    /ingest``                                 list jobs
+- ``GET    /ingest/{job_id}``                        job status / summary
+- ``GET    /ingest/{job_id}/full``                   combined document markdown
+- ``GET    /ingest/{job_id}/pages/{n}/image``        rendered page PNG
+- ``GET    /ingest/{job_id}/pages/{n}/image/crop``   bbox crop for evidence
+
+Anything else (per-page state, raw tables, raw entities, validator trace)
+lives behind direct module imports for the chat agent. Those are NOT
+exposed over HTTP.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import shutil
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF — for bbox cropping
-from fastapi import APIRouter, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, Response
+from pydantic import BaseModel, Field
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.models.schemas import JobStatus
-from app.pipeline.orchestrator import (
-    JobResult,
-    PipelineOrchestrator,
-    get_job,
-    list_jobs,
-)
 from app.storage import redis_store
-from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
-from app.vectorstore.qdrant_store import QdrantVectorStore
+
+# Maximum number of files allowed in a single ingest request
+_MAX_BATCH_FILES = 20
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -35,165 +47,268 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 # ---------------------------------------------------------------------------
 
 
-def _safe_filename(name: str | None) -> str:
-    if not name or not name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
-    safe = Path(PurePosixPath(name).name).name
-    if not safe:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    return safe
-
-
-def _require_job(job_id: str) -> JobResult:
-    job = get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return job
-
-
-def _require_page(job: JobResult, page_num: int) -> dict:
-    if not (0 <= page_num < job.total_pages):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Page {page_num} out of range (0-{job.total_pages - 1})",
-        )
-    state = job.page_results.get(page_num)
-    if not state:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No extraction result yet for page {page_num}",
-        )
-    return state
-
-
-def _final_extracted(state: dict) -> dict:
-    return state.get("final") or state.get("extracted") or {}
-
-
-# ---------------------------------------------------------------------------
-# Upload + run pipeline (sync — blocks until complete)
-# ---------------------------------------------------------------------------
-
-
-@router.post("", summary="Upload PDF and run the pipeline synchronously")
-async def ingest(file: UploadFile) -> dict[str, Any]:
-    """Upload a PDF, run the full v3 streaming pipeline, return summary."""
-    safe_name = _safe_filename(file.filename)
-
-    settings = get_settings()
-    settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    upload_path = settings.upload_dir / safe_name
-    with open(upload_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    gemini = GeminiClient(settings) if settings.gemini_api_key else None
-    vector_store = QdrantVectorStore(settings)
-    orchestrator = PipelineOrchestrator(settings, gemini_client=gemini, vector_store=vector_store)
-    job = await orchestrator.run(upload_path, safe_name)
-
-    summary = job.to_summary()
-    summary["pages"] = [
-        {
-            "page_num": b.page_num,
-            "char_count": b.char_count,
-            "is_scanned": b.is_scanned,
-            "image_count": b.image_count,
-            "extraction_method": b.extraction_method,
-            "text_preview": b.text[:500] + ("..." if len(b.text) > 500 else ""),
-        }
-        for b in job.baselines
-    ]
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Upload + run pipeline (async — returns job_id immediately)
-# ---------------------------------------------------------------------------
-
-
-@router.post("/async", summary="Upload PDF and run the pipeline in the background")
-async def ingest_async(file: UploadFile) -> dict[str, str]:
-    """Upload a PDF, dispatch ingestion to Celery, return job_id.
-
-    Poll ``GET /ingest/{job_id}`` for status.
+def _job_scoped_doc_name(safe_stem: str, job_id: str) -> str:
+    """Build a job-scoped doc_name so concurrent ingestions of the same file
+    don't collide on disk.
     """
-    safe_name = _safe_filename(file.filename)
+    slug = job_id.replace("-", "")[:8]
+    return f"{safe_stem}_{slug}"
+
+
+def _resolve_pdf_path(raw_path: str, settings: Settings) -> Path:
+    """Validate a server-side PDF path and return the resolved absolute path.
+
+    Accepts any path the API process can read on the host filesystem. We
+    intentionally do NOT confine to ``settings.upload_dir`` so operators
+    can ingest from arbitrary mount points (network shares, /data, etc.).
+    Validation:
+      - must exist and be a regular file
+      - must end in ``.pdf`` (case-insensitive)
+      - must be within ``settings.max_upload_mb``
+    """
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        # Resolve relative paths against the current working directory of
+        # the API process — operators typically run with a known CWD.
+        candidate = Path.cwd() / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail=f"File not found: {raw_path}")
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail=f"Not a file: {raw_path}")
+    if resolved.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail=f"Not a PDF: {raw_path}")
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        raise HTTPException(status_code=400, detail=f"Cannot stat file: {raw_path}")
+    if size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {settings.max_upload_mb} MB limit: {raw_path}",
+        )
+    return resolved
+
+
+def _resolve_doc_dir(job_id: str, settings: Settings) -> Path:
+    """Look up the on-disk output directory for a job from Redis.
+
+    Disk-backed endpoints must work across uvicorn workers and the Celery
+    worker pool. Reading ``output_dir`` from the Redis manifest avoids
+    depending on the in-memory ``_jobs`` cache, which is per-process.
+    """
+    manifest = redis_store.get_job(job_id)
+    if not manifest:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    output_dir = manifest.get("output_dir")
+    if not output_dir:
+        raise HTTPException(status_code=404, detail="No output generated yet")
+    path = Path(output_dir)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Output directory missing on disk")
+    try:
+        path.resolve().relative_to(settings.output_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid output path")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# POST /ingest — JSON: ingest by server-side file path
+# ---------------------------------------------------------------------------
+
+
+class IngestRequest(BaseModel):
+    """JSON body for ingestion by file path."""
+
+    file_paths: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=_MAX_BATCH_FILES,
+        description=(
+            "Absolute or relative server-side paths to PDF files. "
+            "Relative paths resolve against the API process working directory. "
+            "Any path readable by the server is accepted."
+        ),
+        json_schema_extra={
+            "examples": [
+                [
+                    "/data/well_reports/Sajaa_9_EOWR.pdf",
+                    "./data/uploads/GSWA_Harvey_1_WCR.pdf",
+                ]
+            ]
+        },
+    )
+
+
+@router.post(
+    "",
+    summary="Ingest one or more PDFs by server-side file path (async)",
+)
+async def ingest(req: IngestRequest) -> dict[str, Any]:
+    """Submit up to 20 PDF paths. Each is dispatched to a Celery worker
+    and returns immediately with a ``job_id``. Poll
+    ``GET /ingest/{job_id}`` for status.
+    """
+    settings = get_settings()
+    from app.workers.tasks.ingest import ingest_document
+
+    dispatched: list[dict[str, str]] = []
+    for raw_path in req.file_paths:
+        pdf_path = _resolve_pdf_path(raw_path, settings)
+        filename = pdf_path.name
+        safe_stem = Path(filename).stem
+
+        job_id = str(uuid.uuid4())
+        doc_name = _job_scoped_doc_name(safe_stem, job_id)
+
+        ingest_document.apply_async(
+            args=[str(pdf_path), filename, job_id, doc_name],
+            task_id=job_id,
+        )
+        dispatched.append({
+            "job_id": job_id,
+            "filename": filename,
+            "source_path": str(pdf_path),
+            "status": JobStatus.PENDING.value,
+        })
+        logger.info(
+            "ingest_dispatched",
+            job_id=job_id,
+            source_path=str(pdf_path),
+            doc_name=doc_name,
+        )
+
+    return {"total": len(dispatched), "jobs": dispatched}
+
+
+# ---------------------------------------------------------------------------
+# POST /ingest/upload — multipart: ingest by uploaded file (for the UI)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/upload",
+    summary="Upload one or more PDFs and ingest them (multipart, for the UI)",
+)
+async def ingest_upload(
+    files: list[UploadFile] = File(..., description="PDF files to ingest"),
+) -> dict[str, Any]:
+    """Accept multipart PDF uploads, persist them to ``settings.upload_dir``,
+    then dispatch each to a Celery worker. Returns the same shape as
+    ``POST /ingest``.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > _MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {_MAX_BATCH_FILES} files per request",
+        )
+
     settings = get_settings()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    upload_path = settings.upload_dir / safe_name
-    with open(upload_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    job_id = str(uuid.uuid4())
+    max_bytes = settings.max_upload_mb * 1024 * 1024
 
     from app.workers.tasks.ingest import ingest_document
 
-    ingest_document.apply_async(
-        args=[str(upload_path), safe_name, job_id],
-        task_id=job_id,
-    )
+    dispatched: list[dict[str, str]] = []
+    for f in files:
+        original = f.filename or "upload.pdf"
+        if not original.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only PDF files are accepted: {original}",
+            )
 
-    return {"job_id": job_id, "status": JobStatus.PENDING.value, "filename": safe_name}
+        job_id = str(uuid.uuid4())
+        safe_stem = Path(original).stem
+        # Disambiguate on disk so two uploads with the same name don't clash.
+        target = settings.upload_dir / f"{safe_stem}_{job_id[:8]}.pdf"
+
+        # Stream to disk while enforcing the size cap.
+        size = 0
+        with target.open("wb") as out:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    out.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File exceeds {settings.max_upload_mb} MB limit: "
+                            f"{original}"
+                        ),
+                    )
+                out.write(chunk)
+        await f.close()
+
+        doc_name = _job_scoped_doc_name(safe_stem, job_id)
+        ingest_document.apply_async(
+            args=[str(target), original, job_id, doc_name],
+            task_id=job_id,
+        )
+        dispatched.append({
+            "job_id": job_id,
+            "filename": original,
+            "source_path": str(target),
+            "size_bytes": str(size),
+            "status": JobStatus.PENDING.value,
+        })
+        logger.info(
+            "ingest_uploaded",
+            job_id=job_id,
+            filename=original,
+            size_bytes=size,
+            doc_name=doc_name,
+        )
+
+    return {"total": len(dispatched), "jobs": dispatched}
 
 
 # ---------------------------------------------------------------------------
-# Jobs list
+# GET /ingest — list jobs
 # ---------------------------------------------------------------------------
 
 
 @router.get("", summary="List all ingestion jobs")
 async def list_all_jobs() -> dict[str, Any]:
-    # Merge in-memory jobs (current process) with Redis-backed jobs
-    in_memory = list_jobs()
-    in_memory_ids = {j.job_id for j in in_memory}
-
-    # In-memory jobs (richer data — have baselines, page_results)
-    result_jobs = [
-        {
-            "job_id": j.job_id,
-            "filename": j.filename,
-            "status": j.status.value,
-            "total_pages": j.total_pages,
-            "pages_processed": j.pages_processed,
-            "current_phase": j.current_phase,
-        }
-        for j in in_memory
-    ]
-
-    # Redis jobs not already in memory
-    redis_jobs = redis_store.list_jobs(limit=100)
-    for rj in redis_jobs:
-        if rj.get("job_id") not in in_memory_ids:
-            result_jobs.append({
-                "job_id": rj.get("job_id"),
-                "filename": rj.get("filename"),
-                "status": rj.get("status"),
-                "total_pages": rj.get("total_pages", 0),
-                "pages_processed": rj.get("pages_processed", 0),
-                "current_phase": rj.get("current_phase"),
-            })
-
-    return {"count": len(result_jobs), "jobs": result_jobs}
+    """List the most recent ingestion jobs, sourced from Redis."""
+    jobs = redis_store.list_jobs(limit=100)
+    return {
+        "count": len(jobs),
+        "jobs": [
+            {
+                "job_id": j.get("job_id"),
+                "filename": j.get("filename"),
+                "status": j.get("status"),
+                "total_pages": j.get("total_pages", 0),
+                "pages_processed": j.get("pages_processed", 0),
+                "current_phase": j.get("current_phase"),
+            }
+            for j in jobs
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
-# Job status / summary
+# GET /ingest/{job_id} — status / summary
 # ---------------------------------------------------------------------------
 
 
 @router.get("/{job_id}", summary="Job status + summary")
 async def get_job_status(job_id: str) -> dict[str, Any]:
-    # 1. Check in-memory store (sync pipeline or same-process)
-    job = get_job(job_id)
-    if job:
-        return job.to_summary()
-
-    # 2. Check Redis manifest (durable, cross-container)
+    """Return the current job manifest from Redis, or fall back to Celery."""
     redis_job = redis_store.get_job(job_id)
     if redis_job:
         return redis_job
 
-    # 3. Fall back to Celery result backend (async pipeline via worker)
     from celery.result import AsyncResult
 
     from app.workers.celery_app import celery_app
@@ -202,22 +317,21 @@ async def get_job_status(job_id: str) -> dict[str, Any]:
 
     if result.state == "PENDING":
         return {"job_id": job_id, "status": "pending", "detail": "Task queued or unknown"}
-    elif result.state == "STARTED":
+    if result.state == "STARTED":
         return {"job_id": job_id, "status": "processing"}
-    elif result.state == "SUCCESS":
+    if result.state == "SUCCESS":
         return result.result  # the dict from job.to_summary()
-    elif result.state == "FAILURE":
+    if result.state == "FAILURE":
         return {
             "job_id": job_id,
             "status": "failed",
             "error": str(result.result),
         }
-    else:
-        return {"job_id": job_id, "status": result.state.lower()}
+    return {"job_id": job_id, "status": result.state.lower()}
 
 
 # ---------------------------------------------------------------------------
-# Full document markdown
+# GET /ingest/{job_id}/full — full document markdown
 # ---------------------------------------------------------------------------
 
 
@@ -227,73 +341,16 @@ async def get_job_status(job_id: str) -> dict[str, Any]:
     summary="Combined full-document markdown",
 )
 async def get_full_document(job_id: str) -> str:
-    job = _require_job(job_id)
-    if not job.output_dir:
-        raise HTTPException(status_code=404, detail="No output generated yet")
-    full_md = job.output_dir / "full_document.md"
+    settings = get_settings()
+    doc_dir = _resolve_doc_dir(job_id, settings)
+    full_md = doc_dir / "full_document.md"
     if not full_md.exists():
         raise HTTPException(status_code=404, detail="full_document.md not found")
     return full_md.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
-# Per-page baseline + extraction
-# ---------------------------------------------------------------------------
-
-
-@router.get("/{job_id}/pages/{page_num}", summary="Page baseline + extraction summary")
-async def get_page(job_id: str, page_num: int) -> dict[str, Any]:
-    job = _require_job(job_id)
-    baseline = next((b for b in job.baselines if b.page_num == page_num), None)
-    if not baseline:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Page {page_num} not found (range 0-{job.total_pages - 1})",
-        )
-
-    state = job.page_results.get(page_num) or {}
-    extracted = _final_extracted(state)
-    md = extracted.get("markdown", "")
-
-    return {
-        "page_num": baseline.page_num,
-        "char_count": baseline.char_count,
-        "is_scanned": baseline.is_scanned,
-        "image_count": baseline.image_count,
-        "width": baseline.width,
-        "height": baseline.height,
-        "extraction_method": baseline.extraction_method,
-        "baseline_text": baseline.text,
-        "iteration": state.get("iteration"),
-        "escalated": state.get("escalated"),
-        "validation": state.get("validation"),
-        "extracted": {
-            "markdown_preview": md[:500] + ("..." if len(md) > 500 else ""),
-            "tables": len(extracted.get("tables", [])),
-            "images": len(extracted.get("images", [])),
-            "entities": len(extracted.get("entities", [])),
-        },
-        "png_path": state.get("png_path"),
-    }
-
-
-@router.get(
-    "/{job_id}/pages/{page_num}/markdown",
-    response_class=PlainTextResponse,
-    summary="Per-page extracted markdown file",
-)
-async def get_page_markdown(job_id: str, page_num: int) -> str:
-    job = _require_job(job_id)
-    if not job.output_dir:
-        raise HTTPException(status_code=404, detail="No output generated yet")
-    md_path = job.output_dir / f"page_{page_num:03d}.md"
-    if not md_path.exists():
-        raise HTTPException(status_code=404, detail=f"Markdown for page {page_num} not found")
-    return md_path.read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Image grounding — page PNG and on-demand bbox crop
+# GET /ingest/{job_id}/pages/{n}/image — rendered page PNG
 # ---------------------------------------------------------------------------
 
 
@@ -302,12 +359,17 @@ async def get_page_markdown(job_id: str, page_num: int) -> str:
     summary="Rendered page PNG (for evidence grounding)",
 )
 async def get_page_image(job_id: str, page_num: int) -> FileResponse:
-    job = _require_job(job_id)
-    state = _require_page(job, page_num)
-    png_path = state.get("png_path")
-    if not png_path or not Path(png_path).exists():
+    settings = get_settings()
+    doc_dir = _resolve_doc_dir(job_id, settings)
+    png_path = doc_dir / "pages_png" / f"page_{page_num:03d}.png"
+    if not png_path.exists():
         raise HTTPException(status_code=404, detail="Page PNG not persisted")
     return FileResponse(png_path, media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# GET /ingest/{job_id}/pages/{n}/image/crop — bbox crop for evidence cards
+# ---------------------------------------------------------------------------
 
 
 @router.get(
@@ -331,14 +393,14 @@ async def get_page_crop(
             status_code=400, detail="Invalid bbox: ymax>ymin and xmax>xmin required"
         )
 
-    job = _require_job(job_id)
-    state = _require_page(job, page_num)
-    png_path = state.get("png_path")
-    if not png_path or not Path(png_path).exists():
+    settings = get_settings()
+    doc_dir = _resolve_doc_dir(job_id, settings)
+    png_path = doc_dir / "pages_png" / f"page_{page_num:03d}.png"
+    if not png_path.exists():
         raise HTTPException(status_code=404, detail="Page PNG not persisted")
 
     def _crop() -> bytes:
-        pix = fitz.Pixmap(png_path)
+        pix = fitz.Pixmap(str(png_path))
         w, h = pix.width, pix.height
         x0 = int(xmin / 1000 * w)
         y0 = int(ymin / 1000 * h)
@@ -351,100 +413,3 @@ async def get_page_crop(
     png = await asyncio.to_thread(_crop)
     return Response(content=png, media_type="image/png")
 
-
-# ---------------------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------------------
-
-
-@router.get("/{job_id}/pages/{page_num}/tables", summary="Tables on a single page")
-async def get_page_tables(job_id: str, page_num: int) -> dict[str, Any]:
-    job = _require_job(job_id)
-    state = _require_page(job, page_num)
-    tables = _final_extracted(state).get("tables", []) or []
-    return {"page_num": page_num, "count": len(tables), "tables": tables}
-
-
-@router.get(
-    "/{job_id}/tables/{page_num}/{table_index}",
-    summary="Single persisted table JSON file",
-)
-async def get_table_file(
-    job_id: str, page_num: int, table_index: int
-) -> dict[str, Any]:
-    job = _require_job(job_id)
-    if not job.output_dir:
-        raise HTTPException(status_code=404, detail="No output generated yet")
-    path = (
-        job.output_dir
-        / "tables"
-        / f"page_{page_num:03d}_table_{table_index:02d}.json"
-    )
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Table file not found")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# Entities
-# ---------------------------------------------------------------------------
-
-
-@router.get("/{job_id}/entities", summary="All entities extracted from the document")
-async def get_entities(
-    job_id: str,
-    type: str | None = Query(None, description="Filter by entity type"),
-) -> dict[str, Any]:
-    job = _require_job(job_id)
-    by_page: dict[int, list[dict]] = {}
-    by_type: dict[str, int] = {}
-
-    for pn, state in sorted(job.page_results.items()):
-        items = _final_extracted(state).get("entities", []) or []
-        if type:
-            items = [e for e in items if e.get("type") == type]
-        if items:
-            by_page[pn] = items
-            for e in items:
-                t = e.get("type", "other") or "other"
-                by_type[t] = by_type.get(t, 0) + 1
-
-    return {
-        "job_id": job_id,
-        "filter_type": type,
-        "count": sum(len(v) for v in by_page.values()),
-        "by_type": by_type,
-        "by_page": {str(k): v for k, v in by_page.items()},
-    }
-
-
-@router.get(
-    "/{job_id}/pages/{page_num}/entities",
-    summary="Entities for a single page",
-)
-async def get_page_entities(job_id: str, page_num: int) -> dict[str, Any]:
-    job = _require_job(job_id)
-    state = _require_page(job, page_num)
-    items = _final_extracted(state).get("entities", []) or []
-    return {"page_num": page_num, "count": len(items), "entities": items}
-
-
-# ---------------------------------------------------------------------------
-# Per-page extraction trace (debugging / observability)
-# ---------------------------------------------------------------------------
-
-
-@router.get(
-    "/{job_id}/pages/{page_num}/trace",
-    summary="Per-page extraction trace (extractor / validator / escalation timings)",
-)
-async def get_page_trace(job_id: str, page_num: int) -> dict[str, Any]:
-    job = _require_job(job_id)
-    state = _require_page(job, page_num)
-    return {
-        "page_num": page_num,
-        "iteration": state.get("iteration"),
-        "escalated": state.get("escalated"),
-        "validation": state.get("validation"),
-        "trace": state.get("trace", []),
-    }

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from app.config import get_settings
 from app.utils.logging import get_logger
 from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
@@ -14,25 +13,19 @@ from app.vectorstore.qdrant_store import QdrantVectorStore
 logger = get_logger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
 
-# Lazy singletons — initialized on first request via _get_clients().
-_embedder: GeminiEmbedder | None = None
-_vector_store: QdrantVectorStore | None = None
 
-
-def _get_clients() -> tuple[GeminiEmbedder, QdrantVectorStore]:
-    """Return (embedder, vector_store), creating them once."""
-    global _embedder, _vector_store  # noqa: PLW0603
-    if _embedder is None:
-        settings = get_settings()
-        if not settings.gemini_api_key:
-            raise HTTPException(status_code=503, detail="Gemini API key not configured")
-        _embedder = GeminiEmbedder(settings)
-        _vector_store = QdrantVectorStore(settings)
-    return _embedder, _vector_store  # type: ignore[return-value]
+def _get_clients(request: Request) -> tuple[GeminiEmbedder, QdrantVectorStore]:
+    """Pull the process-wide singletons from app.state (built in lifespan)."""
+    embedder: GeminiEmbedder | None = getattr(request.app.state, "embedder", None)
+    store: QdrantVectorStore | None = getattr(request.app.state, "qdrant", None)
+    if embedder is None or store is None:
+        raise HTTPException(status_code=503, detail="Gemini API key not configured")
+    return embedder, store
 
 
 @router.get("", summary="Semantic search across ingested documents")
 async def search(
+    request: Request,
     q: str = Query(..., min_length=1, description="Search query"),
     limit: int = Query(10, ge=1, le=100, description="Max results"),
     job_id: str | None = Query(None, description="Filter by job ID"),
@@ -41,7 +34,7 @@ async def search(
     score_threshold: float | None = Query(None, ge=0.0, le=1.0, description="Min similarity score"),
 ) -> dict[str, Any]:
     """Embed the query and search Qdrant for similar document chunks."""
-    embedder, store = _get_clients()
+    embedder, store = _get_clients(request)
 
     query_vector = await embedder.embed_query(q)
     results = await store.search(
