@@ -27,5 +27,11 @@ redis>=5.0.0
 # Task queue
 celery[redis]>=5.4.0
 
+# Supabase (auth + Postgres + Storage + Realtime)
+supabase>=2.9.0
+asyncpg>=0.29.0
+sqlalchemy>=2.0.0
+pyjwt[crypto]>=2.9.0
+
 # Logging
 structlog>=24.4.0

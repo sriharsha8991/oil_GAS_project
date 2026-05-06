@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     output_dir: Path = Path("./data/output")
     upload_dir: Path = Path("./data/uploads")
 
+    # --- Supabase (PR-5: auth + Postgres; PR-6: Storage; PR-7: Realtime) ---
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_service_role_key: str = ""
+    supabase_jwks_url: str = ""
+    database_url: str = ""
+    worker_database_url: str = ""
+
+    # --- CORS ---
+    cors_allow_origins: str = "http://localhost:3000"  # comma-separated
+
     # --- Logging ---
     log_level: str = "INFO"
     log_format: str = "json"  # "json" | "console"

@@ -7,10 +7,12 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
+from app.auth.middleware import SupabaseAuthMiddleware
+from app.auth.routes import router as auth_router
 from app.config import get_settings
+from app.db.engine import dispose_engine
 from app.routes.chat import router as chat_router
 from app.routes.ingest import router as ingest_router
 from app.routes.search import router as search_router
@@ -61,6 +63,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await _app.state.qdrant.close()
         except Exception:
             logger.warning("qdrant_close_failed", exc_info=True)
+        try:
+            await dispose_engine()
+        except Exception:
+            logger.warning("db_dispose_failed", exc_info=True)
         logger.info("app_stopped")
 
 
@@ -106,34 +112,28 @@ app = FastAPI(
 )
 
 
-# CORS — permissive for pilot; tighten in production.
+# CORS — env-driven allow-list. Set CORS_ALLOW_ORIGINS to a comma-separated
+# list of origins (e.g. "http://localhost:3000,https://app.wellsynth.ai").
+_settings_for_cors = get_settings()
+_cors_origins = [
+    o.strip() for o in _settings_for_cors.cors_allow_origins.split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Auth — verifies Supabase JWT on every non-anonymous route.
+app.add_middleware(SupabaseAuthMiddleware)
 
+
+app.include_router(auth_router)
 app.include_router(ingest_router)
 app.include_router(search_router)
 app.include_router(chat_router)
-
-
-# Static UI — minimal chat frontend served at /ui
-from pathlib import Path as _Path
-_static_dir = _Path(__file__).parent / "static"
-if _static_dir.is_dir():
-    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
-
-    @app.get("/ui", tags=["system"], include_in_schema=False)
-    async def chat_ui() -> FileResponse:
-        return FileResponse(_static_dir / "chat.html")
-
-    @app.get("/ingest-ui", tags=["system"], include_in_schema=False)
-    async def ingest_ui() -> FileResponse:
-        return FileResponse(_static_dir / "ingest.html")
 
 
 # ---------------------------------------------------------------------------
