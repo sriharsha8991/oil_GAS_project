@@ -79,6 +79,17 @@ services:
     volumes:
       - ./data:/app/data
       - ./app:/app/app  # dev: live-mount source code
+    # 2 uvicorn workers so a long /chat stream can't block /ingest polls.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --workers
+      - "2"
+    mem_limit: 2g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3).status==200 else 1)"]
       interval: 20s
@@ -87,12 +98,12 @@ services:
       start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # Celery worker pool (§4.L1.1.d) — per-page extraction tasks.
+  # Celery worker pool — per-page extraction tasks.
   #   prefork pool because each task spawns its own asyncio loop internally.
-  #   concurrency=2 keeps Gemini semaphore math per-worker predictable:
-  #     per-worker in-flight cap = GeminiClient Semaphore(100) / concurrency
-  #   Scale horizontally by running multiple replicas, NOT by raising
-  #   concurrency (see §4.L1.1.n pitfall #1 — cluster-level rate limit).
+  #   concurrency=8 lifts demo-scale throughput. Each Celery slot drives an
+  #   asyncio event loop that pipelines up to `max_concurrent_pages` Gemini
+  #   calls; with concurrency=8 × max_concurrent_pages=50 the cluster ceiling
+  #   is ~400 in-flight Gemini calls — sized for a single Gemini API key.
   # ---------------------------------------------------------------------------
   celery-worker:
     build: .
@@ -124,11 +135,12 @@ services:
       - app.workers.celery_app:celery_app
       - worker
       - --loglevel=info
-      - --concurrency=2
-      - --prefetch-multiplier=1        # §4.L1.1.n pitfall #7
+      - --concurrency=8
+      - --prefetch-multiplier=1        # one task per worker slot at a time
       - --without-heartbeat            # reduce broker chatter
       - -Q
       - extract,rasterize,aggregate,default
+    mem_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
       interval: 30s

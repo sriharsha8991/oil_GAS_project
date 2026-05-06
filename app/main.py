@@ -7,13 +7,16 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.routes.chat import router as chat_router
 from app.routes.ingest import router as ingest_router
 from app.routes.search import router as search_router
+from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger, setup_logging
+from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
 
 logger = get_logger(__name__)
@@ -21,7 +24,13 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Application startup / shutdown lifecycle."""
+    """Application startup / shutdown lifecycle.
+
+    Constructs process-wide singletons for the Gemini client, embedder,
+    and Qdrant store. Sharing these across all requests is what enforces
+    the global concurrency cap (one ``Semaphore(max_concurrent_pages)``
+    inside ``GeminiClient`` instead of one per request).
+    """
     settings = get_settings()
     setup_logging(log_level=settings.log_level, log_format=settings.log_format)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
@@ -30,21 +39,29 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         "app_started",
         max_concurrent_pages=settings.max_concurrent_pages,
         render_dpi=settings.render_dpi,
-        max_iterations=settings.max_iterations,
+        pass_confidence_threshold=settings.pass_confidence_threshold,
         gemini_configured=bool(settings.gemini_api_key),
     )
 
-    # Ensure Qdrant collection exists
+    _app.state.settings = settings
+    _app.state.gemini = GeminiClient(settings) if settings.gemini_api_key else None
+    _app.state.embedder = GeminiEmbedder(settings) if settings.gemini_api_key else None
+    _app.state.qdrant = QdrantVectorStore(settings)
+
     try:
-        vs = QdrantVectorStore(settings)
-        await vs.ensure_collection()
-        await vs.close()
+        await _app.state.qdrant.ensure_collection()
         logger.info("qdrant_ready", collection=settings.qdrant_collection)
     except Exception:
         logger.warning("qdrant_init_failed", exc_info=True)
 
-    yield
-    logger.info("app_stopped")
+    try:
+        yield
+    finally:
+        try:
+            await _app.state.qdrant.close()
+        except Exception:
+            logger.warning("qdrant_close_failed", exc_info=True)
+        logger.info("app_stopped")
 
 
 tags_metadata = [
@@ -80,10 +97,10 @@ app = FastAPI(
     title="WellSynth AI",
     description=(
         "Well Operations Intelligence — Document Intelligence layer (L1). "
-        "Per-page rasterized extraction with Gemini 3 Flash Preview + Gemini 3.1 Pro Preview escalation, "
-        "validator-gated, with bbox grounding for every table, image, and entity."
+        "Per-page rasterized extraction with Gemini 3 Flash Preview self-validation + Gemini 3.1 Pro Preview escalation "
+        "on flagged gaps, with bbox grounding for every table, image, and entity."
     ),
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
     openapi_tags=tags_metadata,
 )
@@ -104,6 +121,21 @@ app.include_router(search_router)
 app.include_router(chat_router)
 
 
+# Static UI — minimal chat frontend served at /ui
+from pathlib import Path as _Path
+_static_dir = _Path(__file__).parent / "static"
+if _static_dir.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
+    @app.get("/ui", tags=["system"], include_in_schema=False)
+    async def chat_ui() -> FileResponse:
+        return FileResponse(_static_dir / "chat.html")
+
+    @app.get("/ingest-ui", tags=["system"], include_in_schema=False)
+    async def ingest_ui() -> FileResponse:
+        return FileResponse(_static_dir / "ingest.html")
+
+
 # ---------------------------------------------------------------------------
 # System endpoints
 # ---------------------------------------------------------------------------
@@ -118,7 +150,7 @@ async def root() -> dict:
         "docs": "/docs",
         "capability_layers": {
             "L1_document_intelligence": "available",
-            "L2_domain_knowledge": "planned",
+            "L2_domain_knowledge": "available",
             "L3_tenant_hierarchy": "planned",
             "L4_artifact_linkage": "planned",
             "L5_retrieval_backbone": "available",
@@ -129,7 +161,7 @@ async def root() -> dict:
         "config": {
             "render_dpi": settings.render_dpi,
             "max_concurrent_pages": settings.max_concurrent_pages,
-            "max_iterations": settings.max_iterations,
+            "pass_confidence_threshold": settings.pass_confidence_threshold,
             "extraction_model": settings.extraction_model,
             "escalation_model": settings.escalation_model,
             "gemini_configured": bool(settings.gemini_api_key),

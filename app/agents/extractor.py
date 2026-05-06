@@ -1,4 +1,9 @@
-"""Extractor agent — Gemini 3 Flash Preview per-page extraction with inline image bytes."""
+"""Extractor agent — Gemini 3 Flash Preview self-validating per-page extraction.
+
+The extractor is a single-shot node that returns BOTH the extracted content
+and its own confidence + gap assessment. The graph routes directly to the
+escalator (Pro) when self_confidence is below threshold or gaps is non-empty.
+"""
 
 from __future__ import annotations
 
@@ -18,30 +23,20 @@ async def extractor_node(
     *,
     client: GeminiClient,
     model: str,
+    pass_threshold: float,
 ) -> PageState:
-    """LangGraph node: extract content from one PDF page (PNG bytes).
-
-    On iter 1, baseline is passed as a hint. On iter 2, previous gaps
-    from the validator are appended as retry instructions.
-    """
+    """LangGraph node: extract content from one PDF page (PNG bytes) AND self-validate."""
     page_num = state["page_num"]
-    iteration = state.get("iteration", 0) + 1
-
-    gap_feedback = ""
-    if iteration > 1 and state.get("validation"):
-        gaps = state["validation"].get("gaps", [])
-        if gaps:
-            gap_feedback = "\n".join(f"- {g}" for g in gaps)
 
     prompt = build_extractor_prompt(
         page_num=page_num,
         is_scanned=state.get("is_scanned", False),
         baseline_text=state.get("baseline_text", ""),
-        gap_feedback=gap_feedback,
+        pass_threshold=pass_threshold,
     )
 
     start = time.perf_counter()
-    raw = await client.generate_with_image(
+    raw, usage = await client.generate_with_image(
         model=model,
         prompt=prompt,
         png_bytes=state["png_bytes"],
@@ -51,35 +46,45 @@ async def extractor_node(
     )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-    extracted = _parse_extraction(raw, page_num)
+    extracted, validation = _parse_extraction(raw, page_num, pass_threshold)
 
     logger.info(
         "extractor_done",
         page_num=page_num,
-        iteration=iteration,
         time_ms=elapsed_ms,
         chars=len(extracted.get("markdown", "")),
+        self_confidence=validation["confidence"],
+        self_gaps=len(validation["gaps"]),
+        passed=validation["passed"],
+        input_tokens=usage["input_tokens"],
+        output_tokens=usage["output_tokens"],
     )
 
     trace = list(state.get("trace", []))
     trace.append({
         "phase": "extractor",
         "model": model,
-        "iteration": iteration,
+        "iteration": 1,
         "time_ms": elapsed_ms,
         "output_chars": len(raw),
+        "self_confidence": validation["confidence"],
+        "passed": validation["passed"],
+        "usage": usage,
     })
 
     return {
         **state,
         "extracted": extracted,
-        "iteration": iteration,
+        "validation": validation,
+        "iteration": 1,
         "trace": trace,
     }
 
 
-def _parse_extraction(raw: str, page_num: int) -> dict:
-    """Parse the JSON object response from the extractor."""
+def _parse_extraction(
+    raw: str, page_num: int, pass_threshold: float
+) -> tuple[dict, dict]:
+    """Parse the JSON response. Returns (extracted_dict, validation_dict)."""
     cleaned = raw.strip()
     if cleaned.startswith("```"):
         nl = cleaned.index("\n") if "\n" in cleaned else len(cleaned)
@@ -91,22 +96,29 @@ def _parse_extraction(raw: str, page_num: int) -> dict:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         logger.error("extractor_parse_error", page_num=page_num, raw_preview=raw[:300])
-        return {
-            "page_num": page_num,
-            "markdown": "",
-            "tables": [],
-            "images": [],
-            "entities": [],
-            "cross_page_notes": "",
-        }
+        # Force escalation on parse failure.
+        return (
+            {
+                "page_num": page_num,
+                "markdown": "",
+                "tables": [],
+                "images": [],
+                "entities": [],
+                "cross_page_notes": "",
+            },
+            {
+                "passed": False,
+                "confidence": 0.0,
+                "gaps": ["extractor response was not valid JSON; re-extract the page"],
+            },
+        )
 
-    # If the model returned a list (one-element wrapper), unwrap
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
         data = {}
 
-    return {
+    extracted = {
         "page_num": data.get("page_num", page_num),
         "markdown": data.get("markdown", ""),
         "tables": data.get("tables", []),
@@ -114,3 +126,24 @@ def _parse_extraction(raw: str, page_num: int) -> dict:
         "entities": data.get("entities", []),
         "cross_page_notes": data.get("cross_page_notes", ""),
     }
+
+    try:
+        confidence = float(data.get("self_confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    gaps_raw = data.get("self_gaps") or []
+    if not isinstance(gaps_raw, list):
+        gaps_raw = [str(gaps_raw)]
+    gaps = [str(g).strip() for g in gaps_raw if str(g).strip()]
+
+    passed = confidence >= pass_threshold and not gaps
+
+    validation = {
+        "passed": passed,
+        "confidence": confidence,
+        "gaps": gaps,
+    }
+
+    return extracted, validation

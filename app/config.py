@@ -18,14 +18,30 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
 
     # --- Pipeline (v3: streaming per-page) ---
-    max_concurrent_pages: int = 200   # Worker pool size; one Gemini call per worker
+    max_concurrent_pages: int = 150   # Per-process Gemini in-flight cap; cluster ceiling = this × celery_concurrency (Tier 3: 20K RPM Flash)
     render_dpi: int = 200             # PNG rasterization DPI (200 default, 300 for small print)
-    max_iterations: int = 3           # Hard cap: iter1 Flash, iter2 Flash, iter3 Pro (FINAL)
-    pass_confidence_threshold: float = 0.85
+    pass_confidence_threshold: float = 0.85  # Below this OR with gaps -> escalate to Pro
+
+    # --- Resilience ---
+    gemini_call_timeout_seconds: float = 120.0   # Per-call hard timeout for Gemini
+    embed_call_timeout_seconds: float = 60.0     # Per-call hard timeout for embeddings
+    max_upload_mb: int = 500                     # Reject uploads larger than this
 
     # --- Models ---
     extraction_model: str = "models/gemini-3-flash-preview"   # iter 1 & 2
     escalation_model: str = "models/gemini-3.1-pro-preview"           # iter 3 (FINAL)
+
+    # --- Chat models (cheap, fast — context already curated by retrieval) ---
+    chat_planner_model: str = "models/gemini-3-flash-lite-preview"   # LLM 1: query plan
+    chat_synth_model: str = "models/gemini-3-flash-preview"          # LLM 2: grounded answer
+
+    # --- Pricing (USD per 1M tokens, approximate; override via env) ---
+    # Used purely for ingestion cost estimation in job summaries.
+    flash_input_usd_per_1m: float = 0.30
+    flash_output_usd_per_1m: float = 2.50
+    pro_input_usd_per_1m: float = 1.25
+    pro_output_usd_per_1m: float = 10.00
+    embedding_usd_per_1m: float = 0.15
 
     # --- Qdrant ---
     qdrant_url: str = "http://localhost:6333"
