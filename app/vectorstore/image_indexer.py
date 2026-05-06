@@ -26,6 +26,11 @@ IMAGE_COLLECTION = "wellsynthai_images"
 class ImagePoint:
     """A single image description ready for Qdrant upsert."""
     text: str               # embedding source (description)
+    user_id: str
+    role: str
+    organization: str | None
+    project_id: str
+    document_id: str
     image_id: str
     description: str
     image_type: str          # log_strip | schematic | plot | photo | table_image | other
@@ -40,6 +45,11 @@ class ImagePoint:
 def build_image_points(
     page_map: dict[int, dict],
     *,
+    user_id: str,
+    role: str,
+    organization: str | None,
+    project_id: str,
+    document_id: str,
     doc_name: str,
     job_id: str,
     filename: str,
@@ -76,6 +86,11 @@ def build_image_points(
 
             points.append(ImagePoint(
                 text=text,
+                user_id=user_id,
+                role=role,
+                organization=organization,
+                project_id=project_id,
+                document_id=document_id,
                 image_id=str(img.get("id") or f"img_{page_num}_{len(points)}"),
                 description=desc,
                 image_type=img_type,
@@ -123,6 +138,11 @@ async def upsert_image_points(
             vector=embedding,
             payload={
                 "text": point.text,
+                "user_id": point.user_id,
+                "role": point.role,
+                "organization": point.organization,
+                "project_id": point.project_id,
+                "document_id": point.document_id,
                 "image_id": point.image_id,
                 "description": point.description,
                 "image_type": point.image_type,

@@ -4,9 +4,80 @@
 >
 > **How to read:** §1 is the executive summary. §2 is the canonical commitment list (versioned action items). §3 answers every open question raised in `BACKEND_REPORT.md`. §4 is per-phase commentary. §5 covers the role-aware dashboard endorsement. §6 lists what we want from frontend in return.
 >
-> **Last updated:** 2026-05-06 — **v2.1**. **PR-5 (Supabase Auth + Postgres baseline) shipped and verified end-to-end.** v2.0 architectural pivot retained: Supabase-native (Postgres + Auth + Storage + Realtime). Product stage: internal-clients enterprise.
+> **Last updated:** 2026-05-06 — **v2.4**. **PR-7 (Projects + Documents + tenant-scoped vectors) shipped.** `owner_id`/`doc_id`/`job_id` are no longer part of any frontend-visible contract; identity is now `(user_id, project_id, document_id)` end-to-end. Qdrant was wiped and re-created with tenant payload indices. Storage paths are now `<bucket>/<user_id>/<project_id>/<document_id>/<file>`. Realtime channel + Postgres `jobs` row replace Redis polling. **Frontend must update: chat scope params, ingest contract, document/project endpoints. See §0 PR-7 contract block below.**
 > **Owner:** Backend team.
-> **Status:** §2.7 PR-5 ✅ **Done** (C-29 … C-35 closed; live e2e: admin-create user → trigger → sign-in → `GET /auth/me` 200 → cleanup). §2.8 / §2.9 still Open. **§11 added** — user creation / sign-up flow for the frontend team. Frontend can now integrate `@supabase/supabase-js` against staging.
+> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | **§2.10 PR-7 ✅** (new). §2.9 still Open.
+
+---
+
+## 0. PR-7 Contract Changes (frontend MUST read first)
+
+Effective 2026-05-06. The previous demo-shaped contract (`owner_id`, `doc_id`, `doc_name`, job-keyed image URLs) is gone.
+
+### 0.1 Identity model
+
+- **`user_id`** — `auth.users.id` (uuid). Always derived from the JWT, never sent in request bodies.
+- **`project_id`** — uuid. A user owns N projects. Documents belong to exactly one project.
+- **`document_id`** — uuid. Stable across re-ingestions of the same PDF (resolves the old §3.4 `doc_name` instability problem at the data-model level).
+- **`job_id`** — uuid. Per-ingestion-run only. Used to drive progress UI; not for citations or links.
+
+`owner_id` and `doc_id` no longer exist anywhere in the API. Remove all references.
+
+### 0.2 New endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST`   | `/projects`                                       | Create project `{ name, description? }` → `{ id, ... }` |
+| `GET`    | `/projects`                                       | List the calling user's projects |
+| `GET`    | `/projects/{id}`                                  | Project detail |
+| `PATCH`  | `/projects/{id}`                                  | Update `{ name?, description? }` |
+| `DELETE` | `/projects/{id}`                                  | Delete + cascade documents/jobs/Storage/Qdrant |
+| `GET`    | `/documents?project_id={id}`                      | List user's documents (optional project filter) |
+| `GET`    | `/documents/{id}`                                 | Document metadata + `latest_job` |
+| `DELETE` | `/documents/{id}`                                 | Delete + cascade Storage/Qdrant |
+| `GET`    | `/documents/{id}/full`                            | Full markdown |
+| `GET`    | `/documents/{id}/pages/{n}/image`                 | 302 → signed PNG URL |
+| `GET`    | `/documents/{id}/pages/{n}/image/crop?ymin&xmin&ymax&xmax` | Bbox crop PNG |
+
+### 0.3 Renamed / removed
+
+- `GET /ingest/{job_id}/full` — **REMOVED.** Use `GET /documents/{id}/full`.
+- `GET /ingest/{job_id}/pages/{n}/image` — **REMOVED.** Use `GET /documents/{id}/pages/{n}/image`.
+- `GET /ingest/{job_id}/pages/{n}/image/crop` — **REMOVED.** Use `GET /documents/{id}/pages/{n}/image/crop`.
+- `POST /chat` body — `job_id` and `doc_name` **REMOVED**. New optional fields: `project_id`, `document_id` (both uuid). `/chat` now requires authentication.
+- `GET /search` — `job_id` and `doc_name` query params **REMOVED**. New optional filters: `project_id`, `document_id`. Auth required.
+
+### 0.4 Changed contracts
+
+- **`POST /ingest`** body: now requires `project_id: uuid`. Shape: `{ project_id, file_paths: string[] }`. Each item in the response includes `{ job_id, document_id, filename, status }`.
+- **`POST /ingest/upload`** multipart: now requires a `project_id` form field alongside `files`. Response same as `/ingest`.
+- **`GET /ingest`** — now scoped to the calling user; sources from Postgres `jobs` table (not Redis). Each row: `{ job_id, document_id, filename, status, current_phase, pages_total, pages_done, error, created_at, started_at, ended_at }`.
+- **`GET /ingest/{job_id}`** — sources from Postgres; same row shape as above. 404 if not yours (super_admin sees all).
+- **Chat sources / evidence** — every `source` and `evidence` item now carries `document_id`. Image-evidence URLs are now `/documents/{id}/pages/{n}/image[?crop...]`. The `job_id` field on sources is still echoed but **must not be used for links**; treat it as opaque debug info.
+- **Attached pages** in chat response: `attached_pages[].url` is now `/documents/{id}/pages/{n}/image`. The legacy `job_id` key on each item is replaced by `document_id`.
+- **`GET /auth/me`** — now includes `organization: string | null`.
+- **`PATCH /auth/me/profile`** — body accepts `{ display_name?, organization? }`; only fields supplied are updated.
+- **`GET /admin/users`** — each row now includes `organization: string | null`.
+
+### 0.5 Realtime + polling
+
+- **Use Supabase Realtime** on the `jobs` table to drive ingest progress. Filter by `user_id = auth.uid()` (RLS already enforces this). The `jobs` row is the source of truth — `status ∈ {queued, running, succeeded, failed}`, plus `current_phase`, `pages_total`, `pages_done`, `error`.
+- The Redis-backed polling endpoint (`GET /ingest/{job_id}` returning a manifest) is **still available** as a fallback, but it now reads from Postgres and is sufficient if you don't want to subscribe.
+
+### 0.6 Tenant payload (informational)
+
+Every Qdrant point now carries `{ user_id, role, organization, project_id, document_id }` plus the existing artifact metadata. This is enforced server-side; frontend never sees raw Qdrant payloads, but knowing it exists explains why cross-user leakage is impossible — every search goes through a mandatory `user_id` filter.
+
+### 0.7 Migration checklist for the FE
+
+1. Replace every `job_id` used in citation links / image URLs with `document_id` from the new `sources[i].document_id` field.
+2. Update any "ingest a file" form to require/select a `project_id` first; show an empty-state CTA "Create your first project" when the user has none.
+3. Add a Projects page (list + create + delete) and a Documents page (list filtered by project + delete).
+4. Replace the `refetchInterval` polling on ingest progress with a Supabase Realtime subscription on `jobs` (still polling-acceptable as a fallback).
+5. Surface `organization` on the profile screen + admin user-management screen.
+6. Drop any code that ever sent `owner_id`, `doc_id`, `doc_name`, or `job_id` in a request body.
+
+---
 
 ---
 
@@ -49,7 +120,7 @@ This is the versioned to-do for the backend team. Each item has an ID, a target 
 | **C-01** | Generate + commit `openapi.json` to repo root | `npx openapi-typescript ../Wellsynthai/openapi.json` produces clean `lib/types.ts` | Open |
 | **C-02** | Commit sanitized real `JobManifest` JSON to `docs/fixtures/job_manifest.json` | Frontend Zod schema validates the file | Open |
 | **C-03** | Tighten CORS to env-driven allow-list (`CORS_ALLOW_ORIGINS`, default `http://localhost:3000`) | Browser preflight from `localhost:3000` succeeds with `credentials: 'include'` | Open |
-| **C-04** | Add `Cache-Control: public, max-age=86400, immutable` to `/ingest/{job_id}/pages/{n}/image` and `/crop` | DevTools network panel shows the header on second load (304 / from disk cache) | Open |
+| **C-04** | Add `Cache-Control: public, max-age=86400, immutable` to `/documents/{id}/pages/{n}/image` and `/crop` (replaces legacy `/ingest/{job_id}/...` paths) | DevTools network panel shows the header on second load (304 / from disk cache) | Open |
 | **C-05** | Document `Authorization: Bearer` pass-through in OpenAPI description | Description on every route mentions header is accepted-but-ignored in v1 | Open |
 
 ### 2.2 With PR-1 (Auto-Summary)
@@ -116,43 +187,72 @@ This is the versioned to-do for the backend team. Each item has an ID, a target 
 | **C-34** | **No** `/auth/signup`, `/auth/login`, `/auth/logout`, `PATCH /auth/me/role` on backend. Frontend uses Supabase JS SDK directly. Role changes via `PATCH /auth/me/profile` (display_name only) — role mutations require super_admin via `PATCH /admin/users/{id}/role`. | Endpoint surface matches OpenAPI; Supabase SDK is the only sign-up path | ✅ Done (admin role-mutation endpoint deferred — see [§11.5](#115-still-open--what-the-backend-will-add-when-asked)) |
 | **C-35** | Drop the existing `app/static/chat.html` and `app/static/ingest.html`. Frontend has its own; maintaining two auth paths is wasted work. | Files removed; `/ui` and `/ingest-ui` routes deleted from `app/main.py` | ✅ Done |
 
+### 2.7.1 PR-5.1 — User management endpoints ✅ **Done (2026-05-06)**
+
+**Why this exists:** product chose **open sign-up** for the internal-clients launch (no invite-only gate, no Dashboard juggling). Frontend builds Settings + Admin pages; backend provides the ops the Supabase JS SDK can't do (anything that needs the service-role key) plus the writable profile path.
+
+**Verification:** `python -m app.tools.e2e_admin` — admin-creates a `super_admin`, signs in, exercises every endpoint (profile update, invite, list, role change, 403 on non-admin, delete), and cleans up. Green.
+
+| ID | Endpoint | Auth | Notes |
+|---|---|---|---|
+| **C-49** | `PATCH /auth/me/profile` | self | Body `{ "display_name": string \| null }`. Returns the updated profile. |
+| **C-50** | `GET /admin/users?q=&role=&limit=&offset=` | super_admin | Paginated. Filters: substring `q` on email/display_name; exact `role`. Returns `{items,total,limit,offset}`. |
+| **C-51** | `PATCH /admin/users/{id}/role` | super_admin | Body `{ "role": "<one of locked enum>" }`. Returns the updated row. 400 on invalid role; 404 on missing user. |
+| **C-52** | `POST /admin/users/invite` | super_admin | Body `{ email, display_name?, role? }`. Wraps `auth.admin.invite_user_by_email`. 201 with the new profile row. **Email transport:** Supabase Auth SMTP is pointed at **Resend** (custom SMTP), so invite / confirm / reset / magic-link mails all flow through Resend. Ceiling is whatever's set under Supabase → Auth → Rate Limits (default 100/hr). |
+| **C-53** | `DELETE /admin/users/{id}` | super_admin | Cascades `users_profile` via FK. 204 on success. |
+| **C-54** | `require_role(*roles)` dependency | — | New helper at [app/auth/deps.py](../app/auth/deps.py). Returns 403 with `{error_code: "requires_role", required_roles, actual_role}`. |
+
+All admin routes return 403 (`requires_role`) when the caller is not super_admin — the frontend can hide the Admin tab on `auth/me.role !== 'super_admin'` and the backend enforces the same rule independently.
+
 ### 2.8 PR-6 — Storage migration (filesystem → Supabase Storage)
 
 Moves all per-document artifacts off `data/output/<doc>/` and into Supabase Storage buckets. This is what makes ownership-at-rest real — buckets get RLS policies that the filesystem can never enforce.
 
 | ID | Item | Acceptance | Status |
 |---|---|---|---|
-| **C-36** | Provision three Supabase Storage buckets: `pdfs` (originals), `pages` (rendered PNGs), `artifacts` (markdown + tables + entities JSON). All private; access via signed URLs only. | `supabase storage` CLI shows three buckets with private ACL | Open |
-| **C-37** | Bucket RLS policies: read-own + read-org-visible + super_admin-all. Path convention: `<bucket>/<owner_id>/<document_id>/<filename>`. | Two test users — each can read own paths only; super_admin reads both | Open |
-| **C-38** | Replace `app/storage/file_storage.py` with a Supabase Storage client wrapper. Same public interface (`save_page_png`, `save_markdown`, `save_table`, `read_*`) but writes/reads go to buckets. | Existing tests pass with bucket backend | Open |
-| **C-39** | Image-serving routes (`/ingest/{job_id}/pages/{n}/image`, `/crop`) redirect to short-TTL signed URLs (default 60 s). Crop endpoint still proxies because it dynamically slices. | DevTools shows 302 to Supabase URL; PNG renders | Open |
-| **C-40** | Worker tasks (`app/workers/tasks/ingest.py`) and orchestrator (`app/pipeline/orchestrator.py`) write artifacts to buckets via the new wrapper. **No dual-write.** Filesystem writes deleted in the same PR. | `data/output/` no longer mutated by new ingestions | Open |
+| **C-36** | Provision three Supabase Storage buckets: `pdfs` (originals), `pages` (rendered PNGs), `artifacts` (markdown + tables + entities JSON). All private; access via signed URLs only. | `supabase storage` CLI shows three buckets with private ACL | ✅ Done (2026-05-06) |
+| **C-37** | Bucket RLS policies: owner-scoped read/write/delete on path[1] = `auth.uid()`. Path convention: `<bucket>/<owner_id>/<doc_id>/<filename>`. (Super-admin scope-all is **not** an RLS policy — backend admin ops use the service-role key, which bypasses RLS; an RLS subquery against `users_profile` from the storage role context errors out.) | Two test users — each can read own paths only; intruder gets `StorageApiError` | ✅ Done (2026-05-06) |
+| **C-38** | Replace `app/storage/file_storage.py` with `app/storage/supabase_storage.py`. Same logical surface (`write_pdf`, `write_page_png`, `read_*`, `delete_doc`, …) but writes/reads go to buckets. `file_storage.py` deleted. | Existing tests pass with bucket backend | ✅ Done (2026-05-06) |
+| **C-39** | Image-serving route `/ingest/{job_id}/pages/{n}/image` returns 302 → short-TTL Supabase signed URL (default 60 s, configurable via `SIGNED_URL_TTL_SECONDS`). `/crop` continues to proxy because it dynamically slices. | DevTools shows 302 to Supabase URL; PNG renders | ✅ Done (2026-05-06) |
+| **C-40** | Worker (`app/workers/tasks/ingest.py`) downloads PDF from `pdfs` bucket into a temp file; orchestrator + postprocessor write all artifacts to buckets via `SupabaseStorage`. **No dual-write.** `OUTPUT_DIR` removed from config; `data/output/` no longer mutated by new ingestions. | E2E (`python -m app.tools.e2e_storage`) passes 7/7 incl. RLS denial | ✅ Done (2026-05-06) |
 
-### 2.9 PR-7 — Persistent documents + ownership + Realtime
+#### 2.8.1 PR-6 — what frontend needs to know
 
-The big one. Establishes durable document identity, per-user ownership, vector-layer isolation, and live progress via Realtime. Replaces v1.1's C-33→C-38.
+- **`POST /ingest` and `POST /ingest/upload` now require auth.** Send `Authorization: Bearer <supabase_jwt>` (the same token already used for `/auth/me`, `/admin/*`). Without it: `401 missing_token`. The PDF is stored under the authenticated user's `owner_id`.
+- **`GET /ingest/{job_id}/pages/{n}/image` now 302-redirects** to a short-TTL Supabase signed URL (default 60 s). `axios` and `fetch` follow redirects automatically; existing `<img src=…>` bindings keep working with no change. If you cache the URL, refetch when it 4xx's — the signature has expired.
+- **`GET /ingest/{job_id}/pages/{n}/image/crop`** continues to return image bytes directly (it dynamically crops a region; not a redirect).
+- **`GET /ingest/{job_id}/full` and `/ingest/{job_id}/manifest`** unchanged in shape; still require ownership (or `super_admin`). 403 `Not authorized for this job` otherwise.
+- **No FE config changes.** The bucket layout is invisible to the browser; everything still flows through the FastAPI routes.
 
-| ID | Item | Acceptance | Status |
-|---|---|---|---|
-| **C-41** | `documents` table: `id` (uuid pk), `owner_id` (→ auth.users), `filename`, `content_hash` (sha256), `total_pages`, `visibility` (`private \| org`), `created_at`, `current_job_id` (→ jobs). Unique on `(owner_id, content_hash)` so re-ingesting the same PDF resolves to the same `documents.id`. | Re-uploading the same PDF returns the existing `documents.id`; new `job_id` only | Open |
-| **C-42** | `jobs` table mirrors current `JobManifest` shape but as a row: `id` (=job_id), `document_id` (fk), `owner_id`, `status`, `current_phase`, `pages_processed`, `total_pages`, `tokens_in`, `tokens_out`, `cost_usd`, `started_at`, `completed_at`, `error`. RLS: own rows + super_admin scope-all. | `GET /ingest` reads from DB, not Redis | Open |
-| **C-43** | `briefings`, `lessons`, `pinboards` tables — same `owner_id` + `visibility` shape. Lands ahead of PR-3 / PR-4 so those endpoints are born owner-aware. | Schema in `supabase/migrations/0003_*.sql` | Open |
-| **C-44** | Qdrant payload: every point in `wellsynthai_chunks`, `wellsynthai_entities`, `wellsynthai_images` carries `owner_id` (uuid) + `visibility` + `document_id`. Payload index on `owner_id`. Retrieval filters in `app/vectorstore/qdrant_store.py` add `must` clause. | Cross-user search returns 0 hits (smoke test) | Open |
-| **C-45** | `?scope=mine\|all` on every list endpoint (`/ingest`, `/briefings`, `/lessons`, `/search`, `/entities/distinct`). `all` requires `super_admin`; else 403 `requires_super_admin`. | Non-admin gets 403 with locked error code | Open |
-| **C-46** | Backfill CLI `python -m app.tools.backfill_supabase` — imports legacy `data/output/<doc>/` artifacts into buckets, creates `documents` + `jobs` rows, updates Qdrant payloads with `owner_id`. Owner is configurable per-doc via CLI prompt for first-time migration. | Existing GSWA Harvey-1 corpus visible to its assigned owner only | Open |
-| **C-47** | Realtime: backend writes `jobs.status` / `jobs.current_phase` / `jobs.pages_processed` transitions to Postgres. Supabase Realtime fans them out. Frontend subscribes to `jobs WHERE owner_id = me`. Polling endpoints stay (backwards-compat) but become a fallback. | Frontend sees status change on `processing → completed` within 200 ms of DB write | Open |
-| **C-48** | Reserve URL shape `PATCH /documents/{id}/visibility` (501 in v1.0; ships in v1.1 alongside explicit per-user share primitive). | OpenAPI documents the future shape | Open |
+### 2.9 PR-7 — Persistent documents + ownership + Realtime ✅ **Done (2026-05-06)**
 
-**Realistic timeline (revised for Supabase-native).** Net effort is similar to the v1.1 plan but the deliverable is much stronger — we replace polling, fix `doc_name` at the data-model level, and inherit RLS-enforced storage.
+Shipped. Identity moved to `(user_id, project_id, document_id)`; Qdrant wiped + recreated with tenant payload indices; Postgres `projects` + `documents` + `jobs` are the source of truth; Realtime publication on `jobs` is enabled. The shape diverged from the original C-41..C-48 plan in three ways worth calling out:
 
+| Original plan | Actual shipped | Why |
+|---|---|---|
+| `content_hash` unique on `documents` so re-ingest reuses `documents.id` | Per-upload `documents.id` (uuid v4); user explicitly deletes + re-uploads | Avoids ambiguous "merge or replace?" UX; `DELETE /documents/{id}` is the explicit re-ingest path |
+| `?scope=mine\|all` on every list endpoint | All list endpoints scope to caller automatically; super_admin sees all on individual GET | Fewer params, fewer footguns |
+| Backfill CLI for legacy `data/output/` corpora | **Not shipped — wiped instead.** `python -m app.tools.qdrant_reset --yes` + re-ingest | User-approved: "we can wipe the qdrant and reingest as needed" |
+| `briefings`, `lessons`, `pinboards` tables | **Deferred** to PR-3 / PR-4 (will pick up the tenant-block convention then) | Out of scope for the ingest-then-chat MVP |
+
+| ID | Item | Status |
+|---|---|---|
+| **C-41** | `documents` table with `(id, user_id, project_id, filename, ...)` + RLS | ✅ |
+| **C-42** | `jobs` table; `GET /ingest` and `GET /ingest/{job_id}` read from DB | ✅ |
+| **C-43** | `projects` table + `/projects` CRUD + `organization` on `users_profile` | ✅ |
+| **C-44** | Qdrant payload `{ user_id, role, organization, project_id, document_id }` + payload indices on every tenant field across all 3 collections | ✅ |
+| **C-45** | Implicit owner-scoping on every list endpoint; super_admin sees all on `GET /ingest/{id}` and `GET /documents/{id}` | ✅ |
+| **C-46** | ~~Backfill CLI~~ → wipe-and-reingest via `app.tools.qdrant_reset` | ✅ (substituted) |
+| **C-47** | `jobs` table added to `supabase_realtime` publication; backend writes `queued → running → succeeded\|failed` transitions in the worker | ✅ |
+| **C-48** | `PATCH /documents/{id}/visibility` reserved | Deferred (no `visibility` column in v1.0; private-only) |
+
+**Wiping Qdrant:** the migration is destructive at the vector layer. Run once on each environment after pulling this PR:
+
+```bash
+python -m app.tools.qdrant_reset --yes
 ```
-Week 1: PR-5 — Supabase project provisioned, JWT verification, /auth/me, RLS on users_profile
-Week 2: PR-6 — Storage buckets + file_storage.py rewrite + signed-URL serving + worker cutover
-Week 3: PR-7a — documents/jobs tables + Qdrant payload migration + scope filtering
-Week 4: PR-7b — backfill CLI + Realtime wiring + integration tests + cutover smoke
-```
 
-Frontend continues against MSW mocks during weeks 1–2. Real integration starts week 3 once `/auth/me` and the documents/jobs schema land.
+This drops and recreates `wellsynthai_documents`, `wellsynthai_entities`, `wellsynthai_images` with the tenant payload indices. Existing Postgres rows are left alone — you'll need to delete + re-ingest documents you want vector-searchable again.
 
 ---
 
@@ -180,22 +280,22 @@ Frontend continues against MSW mocks during weeks 1–2. Real integration starts
   - Initial `pending` state has `tokens: 0` and `cost_usd: 0.0`.
 - C-02 commits a sanitized real manifest as the canonical fixture.
 
-### 3.4 `doc_name` is NOT deterministic ⚠️
+### 3.4 `doc_name` is NOT deterministic ⚠️ — **superseded by PR-7**
 
-**This is the single biggest mental-model mismatch in the frontend docs.**
+> **Resolved (2026-05-06).** PR-7 introduces a durable `documents.id` (uuid) which **is** stable across re-ingestions and is the correct grouping key for portfolio / dedupe / prevalence views. `doc_name` is now display-only metadata; `filename` remains the human label.
 
-- `doc_name` is computed as `f"{safe_stem}_{job_id[:8]}"` (see `_job_scoped_doc_name` in [app/routes/ingest.py](../app/routes/ingest.py)).
-- This is **intentional** — concurrent ingestions of the same PDF must not collide on disk under `data/output/`.
-- **Implication for frontend:** any block that says "group by `doc_name`" (Asset Manager portfolio, QA Steward dedupe, Geologist prevalence) will treat every re-ingest of the same file as a separate well.
-- **Recommendation:** group by **`filename`** (the original uploaded name, preserved on the manifest). It's the right semantic key.
-- If frontend wants a stable, semantic doc identifier (e.g. WGS-spec-compliant well name from L2 entity resolution), that's a future ask — not v1.
+Historical context (kept for reference):
+
+- `doc_name` is computed as `f"{safe_stem}_{job_id[:8]}"` so concurrent ingestions don't collide.
+- **Frontend should group by `document_id`** going forward. `filename` remains a fine fallback for purely cosmetic grouping.
 
 ### 3.5 Page image URL semantics (B-006)
 
-- Content-type: always `image/png`.
-- Cache: C-04 adds `Cache-Control: public, max-age=86400, immutable` (page PNGs never change for a given job_id).
-- Out-of-range `n` (≥ `total_pages`) → **404** (matches frontend preference).
-- Bbox out of `0..1000` range → **400** with detail (already enforced).
+- **Path is now `/documents/{document_id}/pages/{n}/image`** (was `/ingest/{job_id}/...`; see §0.3).
+- Returns a `302` redirect to a short-TTL Supabase signed URL. Browsers + axios + fetch follow automatically.
+- Crop variant `/documents/{document_id}/pages/{n}/image/crop?ymin&xmin&ymax&xmax` returns image bytes directly (no redirect).
+- Out-of-range `n` (≥ `total_pages`) → **404**.
+- Bbox out of `0..1000` range → **400** with detail.
 
 ### 3.6 Manifest fields & enums
 
@@ -644,33 +744,65 @@ Call this once on every page load (or React Query with a long `staleTime`). Don'
 
 ### 11.4 Defaults & gotchas
 
-- **Default role is always `drilling_engineer`.** Promotions are an admin operation, not a signup field. We will not honor any role hint in `signUp({ data: { role: ... } })` — the trigger ignores it.
-- **Display name field name is locked to `display_name`.** If you need a different shape, ping us before changing the trigger.
+- **Default role is always `drilling_engineer`.** Promotions are an admin operation, not a signup field. We will not honor any role hint in `signUp({ data: { role: ... } })` — the trigger ignores it. Use `PATCH /admin/users/{id}/role` ([§2.7.1](#271-pr-51--user-management-endpoints--done-2026-05-06)) to promote.
+- **Display name field name is locked to `display_name`.** If you need a different shape, ping us before changing the trigger. Self-service edits go through `PATCH /auth/me/profile`.
+- **Email transport: Resend via Supabase custom SMTP.** All transactional mail (invite, confirm, password reset, magic link) is routed through Resend by configuring Supabase Auth → SMTP Settings with `smtp.resend.com:465`, user `resend`, password = a Resend API key. Sender domain must be verified in Resend. **No backend code touches Resend directly** — we keep `auth.admin.invite_user_by_email` and let Supabase deliver via the custom SMTP. Rate limit is whatever's set under Supabase → Auth → Rate Limits.
 - **Email confirmations are ON by default** in the Supabase project. Until the user clicks the link, `signInWithPassword` returns `Email not confirmed`. Surface a useful message.
-- **Open public sign-up.** Anyone with the anon key can call `signUp`. For the internal-clients launch we strongly recommend one of two postures:
-  1. **Invite-only (recommended):** disable public sign-ups in Supabase Dashboard → Authentication → Providers → Email → "Enable email signups" off. Admins create users via the dashboard or the future `POST /admin/users/invite` endpoint.
-  2. **Domain allow-list:** keep sign-up on, add a Supabase Auth Hook (`before_user_created`) that rejects non-corporate emails. We can write the hook when product confirms the domain list.
+- **Open public sign-up is the chosen posture for internal clients v1.** Anyone with the anon key can call `signUp`; `users_profile` is created with default role `drilling_engineer`. Promotion / off-boarding lives entirely in the app via the admin endpoints — no Supabase Dashboard juggling.
 - **Anon key is safe to ship to the browser.** It's rate-limited and scoped by RLS. Service-role key is **never** sent to the browser — backend-only.
 
-### 11.5 Still open — what the backend will add when asked
+### 11.5 Profile + Admin endpoints (shipped in PR-5.1)
 
-These are out of PR-5 scope and not started; flag the priority and we'll slot them in.
+Full spec lives in [§2.7.1](#271-pr-51--user-management-endpoints--done-2026-05-06). Quick reference for the FE:
 
-| Need | Endpoint | Auth | Why deferred |
-|---|---|---|---|
-| Promote / demote a user | `PATCH /admin/users/{id}/role` | super_admin only | Not blocking signup; can be done via SQL editor today |
-| Invite a user from inside the app | `POST /admin/users/invite` (wraps `auth.admin.invite_user_by_email`) | super_admin only | Same; Supabase dashboard works for now |
-| Self-service display name change | `PATCH /auth/me/profile` (display_name only) | self | Trivial; ship with PR-7 alongside `users_profile` write paths |
+```ts
+// Self: update display name
+await fetch(`${API_BASE}/auth/me/profile`, {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ display_name: 'Jane Doe' }),
+})  // 200 -> { id, email, role, display_name }
 
-### 11.6 Smoke recipe (run against any environment)
+// Admin: list users (super_admin only; 403 otherwise)
+await fetch(`${API_BASE}/admin/users?q=jane&limit=50&offset=0`, {
+  headers: { Authorization: `Bearer ${token}` },
+})  // 200 -> { items: UserRow[], total, limit, offset }
 
-```bash
-# from the backend repo, with .env pointed at the target project:
-python -m app.tools.e2e_auth
+// Admin: promote / demote
+await fetch(`${API_BASE}/admin/users/${id}/role`, {
+  method: 'PATCH',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ role: 'geologist' }),
+})
+
+// Admin: invite by email (sends Supabase invite mail; 4/hr default rate limit)
+await fetch(`${API_BASE}/admin/users/invite`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  body: JSON.stringify({ email: 'new@example.com', display_name: 'New Hire', role: 'asset_manager' }),
+})  // 201 -> UserRow
+
+// Admin: off-board (cascades users_profile)
+await fetch(`${API_BASE}/admin/users/${id}`, {
+  method: 'DELETE',
+  headers: { Authorization: `Bearer ${token}` },
+})  // 204
 ```
 
-This script: admin-creates a throwaway user, asserts the trigger ran, signs in, hits `/auth/me`, then deletes the user. Frontend can run the same flow from a Playwright test once you wire sign-up.
+**Error contract:** non-super_admin caller → `403 { error_code: "requires_role", required_roles, actual_role }`. Hide the Admin tab from non-admins; backend re-checks anyway.
+
+### 11.6 Smoke recipes
+
+```bash
+# Auth flow (sign-up trigger + /auth/me)
+python -m app.tools.e2e_auth
+
+# Profile + admin endpoints (PR-5.1)
+python -m app.tools.e2e_admin
+```
+
+Both scripts admin-create throwaway users, exercise the full path, and clean up. Run them from the backend repo with `.env` pointing at the target environment.
 
 ---
 
-*End of Backend → Frontend Communication v2.1 — 2026-05-06 (PR-5 shipped, sign-up flow documented).*
+*End of Backend → Frontend Communication v2.3 — 2026-05-06 (PR-5 + PR-5.1 + PR-6 shipped; ingestion artifacts now in Supabase Storage; auth required on `/ingest*`; page-image route 302's to signed URLs).*

@@ -28,6 +28,11 @@ ENTITY_COLLECTION = "wellsynthai_entities"
 class EntityPoint:
     """A single entity ready for Qdrant upsert (deduplicated per document)."""
     text: str               # embedding source text
+    user_id: str
+    role: str
+    organization: str | None
+    project_id: str
+    document_id: str
     entity_type: str
     canonical_id: str
     canonical_value: str
@@ -46,6 +51,11 @@ class EntityPoint:
 def build_entity_points(
     resolved_by_page: dict[int, list[dict]],
     *,
+    user_id: str,
+    role: str,
+    organization: str | None,
+    project_id: str,
+    document_id: str,
     doc_name: str,
     job_id: str,
     filename: str,
@@ -94,6 +104,11 @@ def build_entity_points(
 
             bucket[key] = EntityPoint(
                 text=text,
+                user_id=user_id,
+                role=role,
+                organization=organization,
+                project_id=project_id,
+                document_id=document_id,
                 entity_type=entity_type,
                 canonical_id=canonical_id,
                 canonical_value=canonical_value,
@@ -142,6 +157,11 @@ async def upsert_entity_points(
             vector=embedding,
             payload={
                 "text": point.text,
+                "user_id": point.user_id,
+                "role": point.role,
+                "organization": point.organization,
+                "project_id": point.project_id,
+                "document_id": point.document_id,
                 "entity_type": point.entity_type,
                 "canonical_id": point.canonical_id,
                 "canonical_value": point.canonical_value,

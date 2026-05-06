@@ -1,8 +1,18 @@
 """Qdrant vector store — async collection management, upsert, and search.
 
-Uses ``qdrant-client`` AsyncQdrantClient for non-blocking operations.
-Collection is created on first use with cosine distance and the configured
-embedding dimensions (default 768 for text-embedding-004).
+Every point's payload carries a tenant-scoping block:
+
+    {
+        "user_id":       <auth.users.id>,
+        "role":          <users_profile.role at index time>,
+        "organization":  <users_profile.organization at index time>,
+        "project_id":    <projects.id>,
+        "document_id":   <documents.id>,
+        ...type-specific fields (text, page_num, ...)
+    }
+
+All retrieval queries MUST filter by ``user_id``. Cross-user leakage
+without that filter is a security bug.
 """
 
 from __future__ import annotations
@@ -21,6 +31,20 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+CHUNKS_COLLECTION_DEFAULT = "wellsynthai_documents"
+ENTITIES_COLLECTION = "wellsynthai_entities"
+IMAGES_COLLECTION = "wellsynthai_images"
+
+
+_TENANT_INDICES: dict[str, models.PayloadSchemaType] = {
+    "user_id": models.PayloadSchemaType.KEYWORD,
+    "project_id": models.PayloadSchemaType.KEYWORD,
+    "document_id": models.PayloadSchemaType.KEYWORD,
+    "organization": models.PayloadSchemaType.KEYWORD,
+    "role": models.PayloadSchemaType.KEYWORD,
+}
+
+
 class QdrantVectorStore:
     """Async Qdrant wrapper for document chunk storage and retrieval."""
 
@@ -29,23 +53,26 @@ class QdrantVectorStore:
         self._collection = settings.qdrant_collection
         self._dimensions = settings.embedding_dimensions
 
+    # ------------------------------------------------------------------
+    # Collection lifecycle
+    # ------------------------------------------------------------------
+
     async def ensure_collection(self) -> None:
         """Create all required collections if they don't exist."""
         await self._ensure_single_collection(
             self._collection,
             payload_indices={
-                "job_id": models.PayloadSchemaType.KEYWORD,
+                **_TENANT_INDICES,
                 "doc_name": models.PayloadSchemaType.KEYWORD,
                 "filename": models.PayloadSchemaType.KEYWORD,
                 "page_num": models.PayloadSchemaType.INTEGER,
                 "kind": models.PayloadSchemaType.KEYWORD,
             },
         )
-        # Entity facts collection
         await self._ensure_single_collection(
-            "wellsynthai_entities",
+            ENTITIES_COLLECTION,
             payload_indices={
-                "job_id": models.PayloadSchemaType.KEYWORD,
+                **_TENANT_INDICES,
                 "doc_name": models.PayloadSchemaType.KEYWORD,
                 "entity_type": models.PayloadSchemaType.KEYWORD,
                 "canonical_id": models.PayloadSchemaType.KEYWORD,
@@ -53,11 +80,10 @@ class QdrantVectorStore:
                 "page_num": models.PayloadSchemaType.INTEGER,
             },
         )
-        # Image descriptions collection
         await self._ensure_single_collection(
-            "wellsynthai_images",
+            IMAGES_COLLECTION,
             payload_indices={
-                "job_id": models.PayloadSchemaType.KEYWORD,
+                **_TENANT_INDICES,
                 "doc_name": models.PayloadSchemaType.KEYWORD,
                 "image_type": models.PayloadSchemaType.KEYWORD,
                 "page_num": models.PayloadSchemaType.INTEGER,
@@ -69,7 +95,6 @@ class QdrantVectorStore:
         name: str,
         payload_indices: dict[str, models.PayloadSchemaType],
     ) -> None:
-        """Create a single collection with payload indices if it doesn't exist."""
         exists = await self._client.collection_exists(name)
         if exists:
             logger.info("qdrant_collection_exists", collection=name)
@@ -95,15 +120,30 @@ class QdrantVectorStore:
             dimensions=self._dimensions,
         )
 
+    async def reset_all(self) -> None:
+        """Drop and recreate all three collections. Destructive."""
+        for name in (
+            self._collection,
+            ENTITIES_COLLECTION,
+            IMAGES_COLLECTION,
+        ):
+            try:
+                if await self._client.collection_exists(name):
+                    await self._client.delete_collection(name)
+                    logger.info("qdrant_collection_deleted", collection=name)
+            except Exception:
+                logger.warning("qdrant_collection_delete_failed", collection=name)
+        await self.ensure_collection()
+
+    # ------------------------------------------------------------------
+    # Upsert (chunks)
+    # ------------------------------------------------------------------
+
     async def upsert_chunks(
         self,
         chunks: list["Chunk"],
         embeddings: list[list[float]],
     ) -> int:
-        """Upsert chunk vectors + payloads into Qdrant.
-
-        Returns the number of points upserted.
-        """
         if not chunks:
             return 0
 
@@ -113,6 +153,11 @@ class QdrantVectorStore:
                 vector=embedding,
                 payload={
                     "text": chunk.text,
+                    "user_id": chunk.user_id,
+                    "role": chunk.role,
+                    "organization": chunk.organization,
+                    "project_id": chunk.project_id,
+                    "document_id": chunk.document_id,
                     "doc_name": chunk.doc_name,
                     "job_id": chunk.job_id,
                     "filename": chunk.filename,
@@ -127,7 +172,6 @@ class QdrantVectorStore:
             for chunk, embedding in zip(chunks, embeddings)
         ]
 
-        # Qdrant upsert supports batching internally; send in 100-point batches
         batch_size = 100
         total = 0
         for i in range(0, len(points), batch_size):
@@ -138,60 +182,67 @@ class QdrantVectorStore:
             )
             total += len(batch)
 
-        logger.info(
-            "qdrant_upserted",
-            collection=self._collection,
-            points=total,
-        )
+        logger.info("qdrant_upserted", collection=self._collection, points=total)
         return total
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _scope_filter(
+        *,
+        user_id: str,
+        project_id: str | None = None,
+        document_id: str | None = None,
+        extra: list[models.Condition] | None = None,
+    ) -> models.Filter:
+        must: list[models.Condition] = [
+            models.FieldCondition(
+                key="user_id", match=models.MatchValue(value=user_id)
+            ),
+        ]
+        if project_id:
+            must.append(
+                models.FieldCondition(
+                    key="project_id", match=models.MatchValue(value=project_id)
+                )
+            )
+        if document_id:
+            must.append(
+                models.FieldCondition(
+                    key="document_id", match=models.MatchValue(value=document_id)
+                )
+            )
+        if extra:
+            must.extend(extra)
+        return models.Filter(must=must)
 
     async def search(
         self,
         query_vector: list[float],
         *,
+        user_id: str,
         limit: int = 10,
-        job_id: str | None = None,
-        doc_name: str | None = None,
+        project_id: str | None = None,
+        document_id: str | None = None,
         page_num: int | None = None,
         score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Semantic similarity search over document chunks.
-
-        Args:
-            query_vector: Embedding of the search query.
-            limit: Max results to return.
-            job_id: Filter to a specific ingestion job.
-            doc_name: Filter to a specific document.
-            page_num: Filter to a specific page.
-            score_threshold: Minimum similarity score.
-
-        Returns:
-            List of dicts with ``text``, ``score``, and metadata fields.
-        """
-        must_filters: list[models.Condition] = []
-        if job_id:
-            must_filters.append(
-                models.FieldCondition(
-                    key="job_id",
-                    match=models.MatchValue(value=job_id),
-                )
-            )
-        if doc_name:
-            must_filters.append(
-                models.FieldCondition(
-                    key="doc_name",
-                    match=models.MatchValue(value=doc_name),
-                )
-            )
+        extra: list[models.Condition] = []
         if page_num is not None:
-            must_filters.append(
+            extra.append(
                 models.FieldCondition(
-                    key="page_num",
-                    match=models.MatchValue(value=page_num),
+                    key="page_num", match=models.MatchValue(value=page_num)
                 )
             )
 
-        query_filter = models.Filter(must=must_filters) if must_filters else None
+        query_filter = self._scope_filter(
+            user_id=user_id,
+            project_id=project_id,
+            document_id=document_id,
+            extra=extra,
+        )
 
         results = await self._client.query_points(
             collection_name=self._collection,
@@ -205,11 +256,18 @@ class QdrantVectorStore:
             {
                 "text": point.payload.get("text", ""),
                 "score": point.score,
+                "user_id": point.payload.get("user_id"),
+                "project_id": point.payload.get("project_id"),
+                "document_id": point.payload.get("document_id"),
                 "doc_name": point.payload.get("doc_name"),
                 "filename": point.payload.get("filename"),
                 "job_id": point.payload.get("job_id"),
                 "page_num": point.payload.get("page_num"),
                 "chunk_index": point.payload.get("chunk_index"),
+                "kind": point.payload.get("kind"),
+                "table_id": point.payload.get("table_id"),
+                "table_markdown": point.payload.get("table_markdown"),
+                "bbox": point.payload.get("bbox"),
             }
             for point in results.points
         ]
@@ -218,15 +276,14 @@ class QdrantVectorStore:
         self,
         keys: list[tuple[str, int, int]],
         *,
-        job_id: str | None = None,
+        user_id: str,
+        project_id: str | None = None,
+        document_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Look up chunks by exact ``(doc_name, page_num, chunk_index)`` triples.
+        """Look up chunks by ``(doc_name, page_num, chunk_index)`` triples.
 
-        Used for adjacent-chunk context expansion: given a top hit, fetch its
-        immediate neighbors so information that bleeds across chunk boundaries
-        is preserved when shown to the synthesizer.
-
-        Returns dicts in the same shape as :meth:`search` (with ``score=0.0``).
+        Always scoped to ``user_id`` so adjacent-chunk fetches cannot leak
+        cross-tenant data.
         """
         if not keys:
             return []
@@ -234,17 +291,34 @@ class QdrantVectorStore:
         should: list[models.Filter] = []
         for doc_name, page_num, chunk_index in keys:
             must: list[models.Condition] = [
-                models.FieldCondition(key="doc_name",
-                                      match=models.MatchValue(value=doc_name)),
-                models.FieldCondition(key="page_num",
-                                      match=models.MatchValue(value=page_num)),
-                models.FieldCondition(key="chunk_index",
-                                      match=models.MatchValue(value=chunk_index)),
+                models.FieldCondition(
+                    key="user_id", match=models.MatchValue(value=user_id)
+                ),
+                models.FieldCondition(
+                    key="doc_name", match=models.MatchValue(value=doc_name)
+                ),
+                models.FieldCondition(
+                    key="page_num", match=models.MatchValue(value=page_num)
+                ),
+                models.FieldCondition(
+                    key="chunk_index",
+                    match=models.MatchValue(value=chunk_index),
+                ),
             ]
-            if job_id:
-                must.append(models.FieldCondition(
-                    key="job_id", match=models.MatchValue(value=job_id),
-                ))
+            if project_id:
+                must.append(
+                    models.FieldCondition(
+                        key="project_id",
+                        match=models.MatchValue(value=project_id),
+                    )
+                )
+            if document_id:
+                must.append(
+                    models.FieldCondition(
+                        key="document_id",
+                        match=models.MatchValue(value=document_id),
+                    )
+                )
             should.append(models.Filter(must=must))
 
         scrolled, _ = await self._client.scroll(
@@ -258,6 +332,9 @@ class QdrantVectorStore:
             {
                 "text": p.payload.get("text", ""),
                 "score": 0.0,
+                "user_id": p.payload.get("user_id"),
+                "project_id": p.payload.get("project_id"),
+                "document_id": p.payload.get("document_id"),
                 "doc_name": p.payload.get("doc_name"),
                 "filename": p.payload.get("filename"),
                 "job_id": p.payload.get("job_id"),
@@ -271,26 +348,24 @@ class QdrantVectorStore:
             for p in scrolled
         ]
 
-    async def delete_by_job(self, job_id: str) -> None:
-        """Delete all vectors belonging to a job (for re-ingestion).
+    # ------------------------------------------------------------------
+    # Deletion (used by re-ingestion + delete-document/project endpoints)
+    # ------------------------------------------------------------------
 
-        Purges the main chunk collection AND the entity + image
-        collections so re-ingestion of the same job_id is fully idempotent.
-        """
+    async def _delete_by_field(self, field: str, value: str) -> None:
         selector = models.FilterSelector(
             filter=models.Filter(
                 must=[
                     models.FieldCondition(
-                        key="job_id",
-                        match=models.MatchValue(value=job_id),
+                        key=field, match=models.MatchValue(value=value)
                     )
                 ]
             )
         )
         for collection in (
             self._collection,
-            "wellsynthai_entities",
-            "wellsynthai_images",
+            ENTITIES_COLLECTION,
+            IMAGES_COLLECTION,
         ):
             try:
                 await self._client.delete(
@@ -301,11 +376,22 @@ class QdrantVectorStore:
                 logger.warning(
                     "qdrant_delete_skipped",
                     collection=collection,
-                    job_id=job_id,
+                    field=field,
+                    value=value,
                     exc_info=True,
                 )
-        logger.info("qdrant_deleted_job", job_id=job_id)
+
+    async def delete_by_document(self, document_id: str) -> None:
+        await self._delete_by_field("document_id", document_id)
+        logger.info("qdrant_deleted_document", document_id=document_id)
+
+    async def delete_by_project(self, project_id: str) -> None:
+        await self._delete_by_field("project_id", project_id)
+        logger.info("qdrant_deleted_project", project_id=project_id)
+
+    async def delete_by_user(self, user_id: str) -> None:
+        await self._delete_by_field("user_id", user_id)
+        logger.info("qdrant_deleted_user", user_id=user_id)
 
     async def close(self) -> None:
-        """Close the underlying client."""
         await self._client.close()

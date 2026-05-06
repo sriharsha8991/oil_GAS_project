@@ -30,6 +30,11 @@ class Chunk:
     """A single retrievable chunk with provenance + structure metadata."""
 
     text: str
+    user_id: str
+    role: str
+    organization: str | None
+    project_id: str
+    document_id: str
     doc_name: str
     job_id: str
     filename: str
@@ -82,6 +87,11 @@ class DocumentChunker:
         self,
         page_map: dict[int, dict],
         *,
+        user_id: str,
+        role: str,
+        organization: str | None,
+        project_id: str,
+        document_id: str,
         doc_name: str,
         job_id: str,
         filename: str,
@@ -94,6 +104,11 @@ class DocumentChunker:
             page_chunks = self._chunk_one_page(
                 page,
                 page_num=page_num,
+                user_id=user_id,
+                role=role,
+                organization=organization,
+                project_id=project_id,
+                document_id=document_id,
                 doc_name=doc_name,
                 job_id=job_id,
                 filename=filename,
@@ -111,6 +126,11 @@ class DocumentChunker:
         page: dict,
         *,
         page_num: int,
+        user_id: str,
+        role: str,
+        organization: str | None,
+        project_id: str,
+        document_id: str,
         doc_name: str,
         job_id: str,
         filename: str,
@@ -128,6 +148,11 @@ class DocumentChunker:
             out.append(
                 Chunk(
                     text=text,
+                    user_id=user_id,
+                    role=role,
+                    organization=organization,
+                    project_id=project_id,
+                    document_id=document_id,
                     doc_name=doc_name,
                     job_id=job_id,
                     filename=filename,
@@ -157,6 +182,11 @@ class DocumentChunker:
                 out.append(
                     Chunk(
                         text=clean,
+                        user_id=user_id,
+                        role=role,
+                        organization=organization,
+                        project_id=project_id,
+                        document_id=document_id,
                         doc_name=doc_name,
                         job_id=job_id,
                         filename=filename,
