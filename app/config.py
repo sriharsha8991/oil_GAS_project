@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     escalation_model: str = "models/gemini-3.1-pro-preview"           # iter 3 (FINAL)
 
     # --- Chat models (cheap, fast — context already curated by retrieval) ---
-    chat_planner_model: str = "models/gemini-3-flash-lite-preview"   # LLM 1: query plan
+    chat_planner_model: str = "models/gemini-3-flash-preview"   # LLM 1: query plan
     chat_synth_model: str = "models/gemini-3-flash-preview"          # LLM 2: grounded answer
 
     # --- Pricing (USD per 1M tokens, approximate; override via env) ---
@@ -57,8 +57,8 @@ class Settings(BaseSettings):
     chunk_overlap: int = 200     # overlap between consecutive chunks
 
     # --- Storage ---
-    output_dir: Path = Path("./data/output")
-    upload_dir: Path = Path("./data/uploads")
+    upload_dir: Path = Path("./data/uploads")  # transient PDF landing zone
+    signed_url_ttl_seconds: int = 60           # short TTL for image-serving redirects
 
     # --- Supabase (PR-5: auth + Postgres; PR-6: Storage; PR-7: Realtime) ---
     supabase_url: str = ""

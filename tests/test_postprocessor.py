@@ -20,7 +20,7 @@ from app.pipeline.postprocessor import (
     _remove_header_footer,
     _table_md_to_json,
 )
-from app.storage.file_storage import FileStorage
+from app.storage.supabase_storage import SupabaseStorage
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +310,38 @@ class TestTableMdToJson:
 
 @pytest.mark.asyncio
 async def test_postprocessor_run_writes_files(tmp_path: Path):
-    storage = FileStorage(tmp_path)
-    pp = PostProcessor(storage)
+    # In-memory stand-in that mimics the subset of SupabaseStorage that
+    # PostProcessor calls. Avoids any network or filesystem dependency.
+    written: dict[str, object] = {}
+
+    class _MemStorage:
+        async def write_page_markdown(self, user_id, project_id, document_id, page_num, content):
+            written[f"{user_id}/{project_id}/{document_id}/page_{page_num:03d}.md"] = content
+
+        async def write_full_document(self, user_id, project_id, document_id, content):
+            written[f"{user_id}/{project_id}/{document_id}/full_document.md"] = content
+
+        async def write_table_json(
+            self, user_id, project_id, document_id, page_num, table_index, data
+        ):
+            written[
+                f"{user_id}/{project_id}/{document_id}/tables/"
+                f"page_{page_num:03d}_table_{table_index:02d}.json"
+            ] = data
+
+        async def write_table_markdown(
+            self, user_id, project_id, document_id, page_num, table_index, content
+        ):
+            written[
+                f"{user_id}/{project_id}/{document_id}/tables/"
+                f"page_{page_num:03d}_table_{table_index:02d}.md"
+            ] = content
+
+        async def write_entities_json(self, user_id, project_id, document_id, data):
+            written[f"{user_id}/{project_id}/{document_id}/entities.json"] = data
+
+    storage: SupabaseStorage = _MemStorage()  # type: ignore[assignment]
+    pp = PostProcessor(storage, user_id="u1", project_id="p1", document_id="d1")
 
     baselines = [baseline(0, "page 0 baseline"), baseline(1, "page 1 baseline")]
     page_results = {
@@ -330,7 +360,7 @@ async def test_postprocessor_run_writes_files(tmp_path: Path):
 
     assert result.pages_written == 2
     assert result.tables_written >= 1
-    doc_dir = storage.doc_dir("test_doc")
-    assert (doc_dir / "page_000.md").exists()
-    assert (doc_dir / "page_001.md").exists()
-    assert (doc_dir / "full_document.md").exists()
+    assert "u1/p1/d1/page_000.md" in written
+    assert "u1/p1/d1/page_001.md" in written
+    assert "u1/p1/d1/full_document.md" in written
+    assert "u1/p1/d1/entities.json" in written

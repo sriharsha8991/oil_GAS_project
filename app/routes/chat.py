@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.agents.rag import AgentResponse, run_agent
+from app.auth.deps import AuthUser, current_user
 from app.config import get_settings
-from app.storage import redis_store
+from app.db.engine import get_session_factory
+from app.db.models import Document, Project
 from app.utils.logging import get_logger
 from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
@@ -29,8 +32,8 @@ def _get_clients(request: Request) -> tuple[GeminiEmbedder, QdrantVectorStore]:
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="User message / question")
     session_id: str | None = Field(None, description="Session ID for conversation continuity")
-    job_id: str | None = Field(None, description="Scope search to a specific ingestion job")
-    doc_name: str | None = Field(None, description="Scope search to a specific document")
+    project_id: str | None = Field(None, description="Scope search to a specific project")
+    document_id: str | None = Field(None, description="Scope search to a specific document")
 
 
 class SourceInfo(BaseModel):
@@ -94,20 +97,37 @@ class ChatResponse(BaseModel):
 
 
 @router.post("", summary="Chat with documents using RAG agent", response_model=ChatResponse)
-async def chat(request: Request, req: ChatRequest) -> ChatResponse:
+async def chat(
+    request: Request,
+    req: ChatRequest,
+    user: AuthUser = Depends(current_user),
+) -> ChatResponse:
     """Send a question and get an AI-synthesized answer grounded in documents."""
     embedder, vector_store = _get_clients(request)
     settings = get_settings()
 
-    # Validate scoping job_id early so a typo doesn't masquerade as
-    # "no evidence" in the demo.
-    if req.job_id:
-        manifest = redis_store.get_job(req.job_id)
-        if not manifest:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Job {req.job_id} not found. Was the document ingested?",
-            )
+    # Validate scope ownership before hitting Qdrant.
+    if req.project_id or req.document_id:
+        Session = get_session_factory()
+        async with Session() as sess:
+            if req.project_id:
+                row = (await sess.execute(
+                    select(Project).where(
+                        Project.id == req.project_id,
+                        Project.user_id == user.id,
+                    )
+                )).scalar_one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="project not found")
+            if req.document_id:
+                row = (await sess.execute(
+                    select(Document).where(
+                        Document.id == req.document_id,
+                        Document.user_id == user.id,
+                    )
+                )).scalar_one_or_none()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="document not found")
 
     session_id = req.session_id or str(uuid.uuid4())
 
@@ -118,11 +138,21 @@ async def chat(request: Request, req: ChatRequest) -> ChatResponse:
             settings=settings,
             embedder=embedder,
             vector_store=vector_store,
-            job_id=req.job_id,
-            doc_name=req.doc_name,
+            user_id=user.id,
+            project_id=req.project_id,
+            document_id=req.document_id,
         )
-    except Exception:
-        logger.error("chat_agent_error", exc_info=True, session_id=session_id)
+    except Exception as exc:
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        logger.error(
+            "chat_agent_error",
+            exc_info=True,
+            session_id=session_id,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            traceback=tb_str,
+        )
         raise HTTPException(status_code=500, detail="Agent failed to generate a response")
 
     # Deduplicate sources for the wire response.
