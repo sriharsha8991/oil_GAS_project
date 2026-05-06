@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from pathlib import Path
+from pathlib import Path  # noqa: F401  (kept for backwards compatibility with imports)
 from typing import Any
 
 from google import genai
@@ -22,7 +22,7 @@ from app.agents.rag.types import (
 )
 from app.agents.rag.validator import validate_claims
 from app.config import Settings
-from app.storage.file_storage import FileStorage
+from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -177,15 +177,28 @@ def _parse_envelope(text: str) -> dict[str, Any]:
             return {}
 
 
-def _load_page_png(storage: FileStorage, doc_name: str, page_num: int) -> bytes | None:
+async def _load_page_png(
+    storage: SupabaseStorage,
+    hit_user_id: str | None,
+    hit_project_id: str | None,
+    hit_document_id: str | None,
+    page_num: int,
+) -> bytes | None:
+    """Resolve a page PNG via Supabase Storage using the hit's tenant tags."""
+    if not hit_user_id or not hit_project_id or not hit_document_id:
+        return None
     try:
-        path: Path = storage.page_png_path(doc_name, page_num)
-        if not path.is_file():
-            return None
-        return path.read_bytes()
+        return await storage.read_page_png(
+            hit_user_id, hit_project_id, hit_document_id, page_num
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("page_png_load_failed",
-                       doc_name=doc_name, page_num=page_num, error=str(exc))
+        logger.warning(
+            "page_png_load_failed",
+            user_id=hit_user_id,
+            document_id=hit_document_id,
+            page_num=page_num,
+            error=str(exc),
+        )
         return None
 
 
@@ -193,12 +206,15 @@ async def synthesize(
     *,
     client: genai.Client,
     settings: Settings,
-    storage: FileStorage,
+    storage: SupabaseStorage,
     user_message: str,
     plan: QueryPlan,
     bundle: Bundle,
     assessment: RetrievalAssessment,
     history_text: str = "",
+    user_id: str,
+    project_id: str | None = None,
+    document_id: str | None = None,
 ) -> AgentResponse:
     """Run the synthesizer, validate, and return a structured AgentResponse."""
     sources = build_sources(bundle)
@@ -253,8 +269,12 @@ async def synthesize(
             if key in seen_pages:
                 continue
             seen_pages.add(key)
-            png = await asyncio.to_thread(
-                _load_page_png, storage, hit.doc_name, hit.page_num
+            png = await _load_page_png(
+                storage,
+                hit.user_id or user_id,
+                hit.project_id or project_id,
+                hit.document_id or document_id,
+                hit.page_num,
             )
             if not png:
                 logger.warning("synth_page_png_missing",
@@ -268,13 +288,13 @@ async def synthesize(
             attached_pages.append({
                 "doc_name": hit.doc_name,
                 "page_num": hit.page_num,
-                "job_id": hit.job_id,
+                "document_id": hit.document_id,
                 "image_type": hit.image_type,
                 "description": hit.description,
                 "size_bytes": len(png),
                 "url": (
-                    f"/ingest/{hit.job_id}/pages/{hit.page_num}/image"
-                    if hit.job_id else None
+                    f"/documents/{hit.document_id}/pages/{hit.page_num}/image"
+                    if hit.document_id else None
                 ),
             })
         if attached_pages:

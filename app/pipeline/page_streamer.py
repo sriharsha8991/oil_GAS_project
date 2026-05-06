@@ -17,8 +17,8 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
+from typing import Awaitable, Callable
 
-import aiofiles
 import fitz  # PyMuPDF
 
 from app.models.schemas import PageBaseline, PageImage
@@ -131,7 +131,7 @@ async def rasterize_pages(
     deque: PageDeque,
     *,
     dpi: int = 200,
-    pages_dir: Path | None = None,
+    on_png_persisted: Callable[[int, bytes], Awaitable[str | None]] | None = None,
     use_adaptive_dpi: bool = True,
 ) -> int:
     """Render each PDF page to PNG and push to the deque (streaming).
@@ -141,8 +141,11 @@ async def rasterize_pages(
         baselines: Phase 0 baselines, indexed by page_num.
         deque: Target async deque for downstream consumers.
         dpi: BASE render DPI (default 200). Adaptive logic may override.
-        pages_dir: If provided, every rendered PNG is also persisted to
-            ``{pages_dir}/page_{N:03d}.png`` for downstream image grounding.
+        on_png_persisted: Optional async callback ``(page_num, png_bytes) ->
+            png_path|None``. When provided, every rendered PNG is handed to
+            it (typically to upload to Supabase Storage). Whatever it
+            returns is stashed on ``PageImage.png_path`` so downstream
+            consumers (UI, synthesizer) can resolve it later.
         use_adaptive_dpi: If True, per-page DPI is chosen via :func:`adaptive_dpi`.
 
     Returns:
@@ -150,9 +153,6 @@ async def rasterize_pages(
     """
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    if pages_dir is not None:
-        pages_dir.mkdir(parents=True, exist_ok=True)
 
     baseline_by_page: dict[int, PageBaseline] = {b.page_num: b for b in baselines}
 
@@ -192,26 +192,19 @@ async def rasterize_pages(
     render_tasks = [
         asyncio.create_task(_render_one(pn)) for pn in range(page_count)
     ]
-    persist_tasks: list[asyncio.Task] = []
-
-    async def _persist_png(target: Path, data: bytes) -> None:
-        async with aiofiles.open(target, "wb") as f:
-            await f.write(data)
+    persist_tasks: list[asyncio.Task[str | None]] = []
 
     pushed = 0
     for task in render_tasks:
         page_num, png_bytes, width, height, page_dpi, baseline = await task
 
         png_path: str | None = None
-        if pages_dir is not None:
-            target = pages_dir / f"page_{page_num:03d}.png"
-            # Fire-and-forget: workers don't need the on-disk file, only
-            # downstream post-processing does — we await all persists
-            # before returning so the API can serve them immediately after.
+        if on_png_persisted is not None:
             persist_tasks.append(
-                asyncio.create_task(_persist_png(target, png_bytes))
+                asyncio.create_task(on_png_persisted(page_num, png_bytes))
             )
-            png_path = str(target)
+            # png_path will be resolved below once the task finishes; for
+            # now we leave it None so workers fall back to in-memory bytes.
 
         page_image = PageImage(
             page_num=page_num,
@@ -232,11 +225,11 @@ async def rasterize_pages(
             page_num=page_num,
             png_kb=len(png_bytes) // 1024,
             dpi=page_dpi,
-            persisted=png_path is not None,
+            persisted=on_png_persisted is not None,
         )
 
-    # Ensure every PNG is flushed to disk before we hand control back.
+    # Ensure every PNG is flushed before we hand control back.
     if persist_tasks:
-        await asyncio.gather(*persist_tasks)
+        await asyncio.gather(*persist_tasks, return_exceptions=True)
 
     return pushed

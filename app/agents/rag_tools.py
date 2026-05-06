@@ -35,6 +35,9 @@ class SearchResult:
 
     text: str
     score: float
+    user_id: str | None = None
+    project_id: str | None = None
+    document_id: str | None = None
     doc_name: str | None = None
     filename: str | None = None
     job_id: str | None = None
@@ -64,19 +67,29 @@ class SearchResult:
 # Shared helpers
 # -------------------------------------------------------------------
 
-def _base_filters(
-    job_id: str | None,
-    doc_name: str | None,
+def _scope_filters(
+    *,
+    user_id: str,
+    project_id: str | None,
+    document_id: str | None,
 ) -> list[models.Condition]:
-    """Build common Qdrant filter conditions."""
-    filters: list[models.Condition] = []
-    if job_id:
+    """Required tenant filter (user_id) plus optional project/document scope."""
+    filters: list[models.Condition] = [
+        models.FieldCondition(
+            key="user_id", match=models.MatchValue(value=user_id)
+        ),
+    ]
+    if project_id:
         filters.append(
-            models.FieldCondition(key="job_id", match=models.MatchValue(value=job_id))
+            models.FieldCondition(
+                key="project_id", match=models.MatchValue(value=project_id)
+            )
         )
-    if doc_name:
+    if document_id:
         filters.append(
-            models.FieldCondition(key="doc_name", match=models.MatchValue(value=doc_name))
+            models.FieldCondition(
+                key="document_id", match=models.MatchValue(value=document_id)
+            )
         )
     return filters
 
@@ -119,6 +132,9 @@ def _to_search_results(ranked: list[RankedResult]) -> list[SearchResult]:
         SearchResult(
             text=r.text,
             score=r.adjusted_score,
+            user_id=r.user_id or None,
+            project_id=r.project_id or None,
+            document_id=r.document_id or None,
             doc_name=r.doc_name or None,
             filename=r.filename or None,
             job_id=r.job_id or None,
@@ -151,9 +167,10 @@ async def search_chunks(
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
+    user_id: str,
     limit: int = 10,
-    job_id: str | None = None,
-    doc_name: str | None = None,
+    project_id: str | None = None,
+    document_id: str | None = None,
     score_threshold: float = 0.3,
     kinds: list[str] | None = None,
 ) -> list[SearchResult]:
@@ -166,12 +183,14 @@ async def search_chunks(
     logger.info("tool_search_chunks", query=query, limit=limit, kinds=kinds)
 
     query_vector = await embedder.embed_query(query)
-    filters = _base_filters(job_id, doc_name)
+    filters = _scope_filters(
+        user_id=user_id, project_id=project_id, document_id=document_id
+    )
     if kinds:
         filters.append(
             models.FieldCondition(key="kind", match=models.MatchAny(any=list(kinds)))
         )
-    qf = models.Filter(must=filters) if filters else None
+    qf = models.Filter(must=filters)
 
     raw = await _query_collection(
         vector_store._client, _CHUNKS_COLLECTION, query_vector,
@@ -193,9 +212,10 @@ async def search_entities(
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
+    user_id: str,
     limit: int = 10,
-    job_id: str | None = None,
-    doc_name: str | None = None,
+    project_id: str | None = None,
+    document_id: str | None = None,
     entity_type: str | None = None,
     unit: str | None = None,
     score_threshold: float = 0.3,
@@ -211,7 +231,9 @@ async def search_entities(
     )
 
     query_vector = await embedder.embed_query(query)
-    filters = _base_filters(job_id, doc_name)
+    filters = _scope_filters(
+        user_id=user_id, project_id=project_id, document_id=document_id
+    )
     if entity_type:
         filters.append(
             models.FieldCondition(key="entity_type", match=models.MatchValue(value=entity_type))
@@ -220,7 +242,7 @@ async def search_entities(
         filters.append(
             models.FieldCondition(key="unit", match=models.MatchValue(value=unit))
         )
-    qf = models.Filter(must=filters) if filters else None
+    qf = models.Filter(must=filters)
 
     raw = await _query_collection(
         vector_store._client, _ENTITY_COLLECTION, query_vector,
@@ -242,9 +264,10 @@ async def search_images(
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
+    user_id: str,
     limit: int = 5,
-    job_id: str | None = None,
-    doc_name: str | None = None,
+    project_id: str | None = None,
+    document_id: str | None = None,
     score_threshold: float = 0.3,
     image_types: list[str] | None = None,
 ) -> list[SearchResult]:
@@ -260,14 +283,16 @@ async def search_images(
     )
 
     query_vector = await embedder.embed_query(query)
-    filters = _base_filters(job_id, doc_name)
+    filters = _scope_filters(
+        user_id=user_id, project_id=project_id, document_id=document_id
+    )
     if image_types:
         filters.append(
             models.FieldCondition(
                 key="image_type", match=models.MatchAny(any=list(image_types))
             )
         )
-    qf = models.Filter(must=filters) if filters else None
+    qf = models.Filter(must=filters)
 
     raw = await _query_collection(
         vector_store._client, _IMAGE_COLLECTION, query_vector,

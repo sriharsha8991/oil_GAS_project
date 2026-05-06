@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from app.auth.deps import AuthUser, current_user
 from app.utils.logging import get_logger
 from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
@@ -28,10 +29,11 @@ async def search(
     request: Request,
     q: str = Query(..., min_length=1, description="Search query"),
     limit: int = Query(10, ge=1, le=100, description="Max results"),
-    job_id: str | None = Query(None, description="Filter by job ID"),
-    doc_name: str | None = Query(None, description="Filter by document name"),
+    project_id: str | None = Query(None, description="Filter by project"),
+    document_id: str | None = Query(None, description="Filter by document"),
     page_num: int | None = Query(None, ge=0, description="Filter by page number"),
     score_threshold: float | None = Query(None, ge=0.0, le=1.0, description="Min similarity score"),
+    user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """Embed the query and search Qdrant for similar document chunks."""
     embedder, store = _get_clients(request)
@@ -39,9 +41,10 @@ async def search(
     query_vector = await embedder.embed_query(q)
     results = await store.search(
         query_vector,
+        user_id=user.id,
         limit=limit,
-        job_id=job_id,
-        doc_name=doc_name,
+        project_id=project_id,
+        document_id=document_id,
         page_num=page_num,
         score_threshold=score_threshold,
     )

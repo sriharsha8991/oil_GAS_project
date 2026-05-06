@@ -39,8 +39,9 @@ async def retrieve(
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
-    job_id: str | None = None,
-    doc_name: str | None = None,
+    user_id: str,
+    project_id: str | None = None,
+    document_id: str | None = None,
     score_threshold: float = 0.3,
     chunk_limit: int = 10,
     entity_limit: int = 12,
@@ -64,9 +65,10 @@ async def retrieve(
             q,
             embedder=embedder,
             vector_store=vector_store,
+            user_id=user_id,
             limit=chunk_limit,
-            job_id=job_id,
-            doc_name=doc_name,
+            project_id=project_id,
+            document_id=document_id,
             score_threshold=score_threshold,
             kinds=plan.chunk_kinds,
         )))
@@ -77,9 +79,10 @@ async def retrieve(
             eq.q,
             embedder=embedder,
             vector_store=vector_store,
+            user_id=user_id,
             limit=entity_limit,
-            job_id=job_id,
-            doc_name=doc_name,
+            project_id=project_id,
+            document_id=document_id,
             entity_type=eq.entity_type,
             unit=eq.unit,
             score_threshold=score_threshold,
@@ -92,9 +95,10 @@ async def retrieve(
                 q,
                 embedder=embedder,
                 vector_store=vector_store,
+                user_id=user_id,
                 limit=image_limit,
-                job_id=job_id,
-                doc_name=doc_name,
+                project_id=project_id,
+                document_id=document_id,
                 score_threshold=score_threshold,
                 image_types=plan.image_types,
             )))
@@ -244,8 +248,9 @@ async def broaden_retry(
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
-    job_id: str | None,
-    doc_name: str | None,
+    user_id: str,
+    project_id: str | None = None,
+    document_id: str | None = None,
 ) -> Bundle:
     """Rung 1 — drop kind/entity_type filters, lower threshold, raise limits."""
     broadened = QueryPlan(
@@ -266,8 +271,9 @@ async def broaden_retry(
         broadened,
         embedder=embedder,
         vector_store=vector_store,
-        job_id=job_id,
-        doc_name=doc_name,
+        user_id=user_id,
+        project_id=project_id,
+        document_id=document_id,
         score_threshold=0.15,
         chunk_limit=20,
         entity_limit=20,
@@ -373,8 +379,10 @@ async def expand_neighbors(
     bundle: Bundle,
     *,
     vector_store: QdrantVectorStore,
+    user_id: str,
     top_k: int = 3,
-    job_id: str | None = None,
+    project_id: str | None = None,
+    document_id: str | None = None,
 ) -> int:
     """Append same-page ``chunk_index ± 1`` neighbors of the top-K chunks.
 
@@ -411,7 +419,12 @@ async def expand_neighbors(
     if not keys:
         return 0
 
-    raw = await vector_store.fetch_chunks_by_keys(keys, job_id=job_id)
+    raw = await vector_store.fetch_chunks_by_keys(
+        keys,
+        user_id=user_id,
+        project_id=project_id,
+        document_id=document_id,
+    )
     if not raw:
         return 0
 
@@ -426,6 +439,9 @@ async def expand_neighbors(
         bundle.chunks.append(SearchResult(
             text=r.get("text", ""),
             score=0.0,
+            user_id=r.get("user_id"),
+            project_id=r.get("project_id"),
+            document_id=r.get("document_id"),
             doc_name=r.get("doc_name"),
             filename=r.get("filename"),
             job_id=r.get("job_id"),

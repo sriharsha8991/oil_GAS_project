@@ -13,8 +13,11 @@ from app.auth.middleware import SupabaseAuthMiddleware
 from app.auth.routes import router as auth_router
 from app.config import get_settings
 from app.db.engine import dispose_engine
+from app.routes.admin_users import router as admin_users_router
 from app.routes.chat import router as chat_router
+from app.routes.documents import router as documents_router
 from app.routes.ingest import router as ingest_router
+from app.routes.projects import router as projects_router
 from app.routes.search import router as search_router
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger, setup_logging
@@ -35,7 +38,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """
     settings = get_settings()
     setup_logging(log_level=settings.log_level, log_format=settings.log_format)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     logger.info(
         "app_started",
@@ -131,6 +133,9 @@ app.add_middleware(SupabaseAuthMiddleware)
 
 
 app.include_router(auth_router)
+app.include_router(admin_users_router)
+app.include_router(projects_router)
+app.include_router(documents_router)
 app.include_router(ingest_router)
 app.include_router(search_router)
 app.include_router(chat_router)

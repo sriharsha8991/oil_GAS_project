@@ -45,6 +45,10 @@ class RankedResult:
     raw_score: float
     adjusted_score: float
     tier_weight: float
+    # Tenant scope (echoed from payload)
+    user_id: str = ""
+    project_id: str = ""
+    document_id: str = ""
     # Pass through all original metadata
     doc_name: str = ""
     filename: str = ""
@@ -107,6 +111,9 @@ def rerank(
             raw_score=raw_score,
             adjusted_score=round(adjusted, 4),
             tier_weight=tier_weight,
+            user_id=r.get("user_id", "") or "",
+            project_id=r.get("project_id", "") or "",
+            document_id=r.get("document_id", "") or "",
             doc_name=r.get("doc_name", ""),
             filename=r.get("filename", ""),
             job_id=r.get("job_id", ""),

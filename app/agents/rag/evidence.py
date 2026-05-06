@@ -14,6 +14,9 @@ def source_dict(r: SearchResult, source_id: str) -> dict[str, Any]:
         "source_id": source_id,
         "text": r.text,
         "score": r.score,
+        "user_id": r.user_id,
+        "project_id": r.project_id,
+        "document_id": r.document_id,
         "doc_name": r.doc_name,
         "filename": r.filename,
         "job_id": r.job_id,
@@ -56,7 +59,7 @@ def build_evidence(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple] = set()
 
     for s in sources:
-        job_id = s.get("job_id")
+        document_id = s.get("document_id")
         page_num = s.get("page_num")
         doc_name = s.get("doc_name")
         if page_num is None:
@@ -74,15 +77,18 @@ def build_evidence(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "page_num": page_num,
                 "table_id": s.get("table_id"),
                 "table_markdown": s.get("table_markdown"),
-                "url": f"/ingest/{job_id}/pages/{page_num}/image" if job_id else None,
+                "url": (
+                    f"/documents/{document_id}/pages/{page_num}/image"
+                    if document_id else None
+                ),
             })
             continue
 
         if s.get("collection") == "wellsynthai_images":
             bbox = s.get("bbox")
-            if bbox and len(bbox) == 4 and job_id:
+            if bbox and len(bbox) == 4 and document_id:
                 ymin, xmin, ymax, xmax = bbox
-                key = ("crop", job_id, page_num, ymin, xmin, ymax, xmax)
+                key = ("crop", document_id, page_num, ymin, xmin, ymax, xmax)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -95,12 +101,12 @@ def build_evidence(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "description": s.get("description"),
                     "bbox": bbox,
                     "url": (
-                        f"/ingest/{job_id}/pages/{page_num}/image/crop"
+                        f"/documents/{document_id}/pages/{page_num}/image/crop"
                         f"?ymin={ymin}&xmin={xmin}&ymax={ymax}&xmax={xmax}"
                     ),
                 })
-            elif job_id:
-                key = ("page", job_id, page_num)
+            elif document_id:
+                key = ("page", document_id, page_num)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -111,7 +117,7 @@ def build_evidence(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "page_num": page_num,
                     "image_type": s.get("image_type"),
                     "description": s.get("description"),
-                    "url": f"/ingest/{job_id}/pages/{page_num}/image",
+                    "url": f"/documents/{document_id}/pages/{page_num}/image",
                 })
 
     return evidence

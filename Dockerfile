@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Ensure data directories exist (volume mount overlays at runtime)
-RUN mkdir -p /app/data/output /app/data/uploads
+RUN mkdir -p /app/data/uploads
 
 EXPOSE 8080
 

@@ -23,7 +23,7 @@ from app.agents.rag.retriever import (
 from app.agents.rag.synthesizer import synthesize, synthesize_no_evidence
 from app.agents.rag.types import AgentResponse, Bundle, get_session
 from app.config import Settings
-from app.storage.file_storage import FileStorage
+from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
 from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
@@ -38,8 +38,9 @@ async def run_agent(
     settings: Settings,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
-    job_id: str | None = None,
-    doc_name: str | None = None,
+    user_id: str,
+    project_id: str | None = None,
+    document_id: str | None = None,
 ) -> AgentResponse:
     """Single-turn pipeline:
 
@@ -54,7 +55,7 @@ async def run_agent(
     """
     session = get_session(session_id)
     client = genai.Client(api_key=settings.gemini_api_key)
-    storage = FileStorage(settings.output_dir)
+    storage = SupabaseStorage(settings)
 
     model_calls = 0  # counts LLM calls (planner + rewrite + synth)
 
@@ -99,7 +100,7 @@ async def run_agent(
     bundle = await retrieve(
         plan,
         embedder=embedder, vector_store=vector_store,
-        job_id=job_id, doc_name=doc_name,
+        user_id=user_id, project_id=project_id, document_id=document_id,
     )
 
     # 3b. Coreferent-followup seeding — when the planner had to rewrite
@@ -140,7 +141,7 @@ async def run_agent(
         b1 = await broaden_retry(
             plan,
             embedder=embedder, vector_store=vector_store,
-            job_id=job_id, doc_name=doc_name,
+            user_id=user_id, project_id=project_id, document_id=document_id,
         )
         bundle.merge(b1)
         a = assess(plan, bundle)
@@ -158,7 +159,7 @@ async def run_agent(
         b2 = await retrieve(
             rewritten,
             embedder=embedder, vector_store=vector_store,
-            job_id=job_id, doc_name=doc_name,
+            user_id=user_id, project_id=project_id, document_id=document_id,
             score_threshold=0.2,
         )
         bundle.merge(b2)
@@ -198,14 +199,21 @@ async def run_agent(
     # a high-confidence direct match. If top_score > 0.90 the answer is
     # almost certainly inside that single chunk and adding noise hurts.
     if a.top_score <= 0.90:
-        await expand_neighbors(trimmed, vector_store=vector_store, top_k=3,
-                               job_id=job_id)
+        await expand_neighbors(
+            trimmed,
+            vector_store=vector_store,
+            user_id=user_id,
+            project_id=project_id,
+            document_id=document_id,
+            top_k=3,
+        )
     else:
         logger.info("rag_neighbors_skipped_high_score", top_score=a.top_score)
     response = await synthesize(
         client=client, settings=settings, storage=storage,
         user_message=user_message, plan=plan, bundle=trimmed,
         assessment=a, history_text=history_text,
+        user_id=user_id, project_id=project_id, document_id=document_id,
     )
     model_calls += 1
     response.tool_calls_made = model_calls

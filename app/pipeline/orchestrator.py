@@ -26,8 +26,8 @@ from app.models.state import PageState
 from app.pipeline.page_streamer import PageDeque, rasterize_pages
 from app.pipeline.postprocessor import PostProcessor, _build_page_map
 from app.pipeline.preprocessing import Preprocessor
-from app.storage.file_storage import FileStorage
 from app.storage.redis_store import save_job
+from app.storage.supabase_storage import SupabaseStorage
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
 from app.vectorstore.chunker import DocumentChunker
@@ -46,6 +46,11 @@ class JobResult:
         self.job_id = job_id
         self.filename = filename
         self.doc_name: str | None = None
+        self.user_id: str | None = None
+        self.role: str | None = None
+        self.organization: str | None = None
+        self.project_id: str | None = None
+        self.document_id: str | None = None
         self.status: JobStatus = JobStatus.PENDING
         self.total_pages: int = 0
         self.pages_processed: int = 0
@@ -55,7 +60,6 @@ class JobResult:
         # {page_num: PageState dict}
         self.page_results: dict[int, dict] = {}
         self.phase_timings: dict[str, int] = {}
-        self.output_dir: Path | None = None
         # Wall-clock timing
         self.started_at: float = time.time()
         self.finished_at: float | None = None
@@ -106,7 +110,11 @@ class JobResult:
             },
             "tokens": usage,
             "cost_usd": cost,
-            "output_dir": str(self.output_dir) if self.output_dir else None,
+            "user_id": self.user_id,
+            "role": self.role,
+            "organization": self.organization,
+            "project_id": self.project_id,
+            "document_id": self.document_id,
         }
 
     def _aggregate_usage(self) -> dict[str, Any]:
@@ -215,11 +223,12 @@ class PipelineOrchestrator:
         settings: Settings,
         gemini_client: GeminiClient | None = None,
         vector_store: QdrantVectorStore | None = None,
+        storage: SupabaseStorage | None = None,
     ) -> None:
         self._settings = settings
         self._gemini = gemini_client
         self._preprocessor = Preprocessor(use_ocr=False)
-        self._storage = FileStorage(settings.output_dir)
+        self._storage = storage if storage is not None else SupabaseStorage(settings)
         self._vector_store = vector_store
         self._embedder = (
             GeminiEmbedder(settings) if settings.gemini_api_key else None
@@ -238,15 +247,25 @@ class PipelineOrchestrator:
         pdf_path: Path,
         filename: str,
         *,
+        user_id: str,
+        role: str,
+        organization: str | None,
+        project_id: str,
+        document_id: str,
         job_id: str | None = None,
         doc_name: str | None = None,
     ) -> JobResult:
         """Execute the pipeline end-to-end.
 
-        ``doc_name`` controls the on-disk output directory and Qdrant
-        ``doc_name`` payload field. When omitted it falls back to the
-        filename stem (legacy behaviour); routes pass an explicit
-        job-scoped name to avoid collisions when two PDFs share a name.
+        ``user_id`` is the Supabase ``auth.users.id`` of the user who
+        triggered the ingestion; every Storage path and every Qdrant
+        point will be scoped by it (plus ``project_id`` / ``document_id``).
+
+        ``document_id`` is the durable identifier used inside Storage
+        paths and Qdrant payloads (== ``documents.id``).
+
+        ``doc_name`` controls the Qdrant ``doc_name`` payload field.
+        When omitted it falls back to the filename stem (display only).
         """
         job_id = job_id or str(uuid.uuid4())
         doc_name = doc_name or Path(filename).stem
@@ -256,6 +275,11 @@ class PipelineOrchestrator:
         _evict_old_jobs()
         job = JobResult(job_id=job_id, filename=filename)
         job.doc_name = doc_name
+        job.user_id = user_id
+        job.role = role
+        job.organization = organization
+        job.project_id = project_id
+        job.document_id = document_id
         _jobs[job_id] = job
 
         try:
@@ -296,16 +320,30 @@ class PipelineOrchestrator:
                             graph,
                             job,
                             worker_id=i,
-                            output_dir=self._storage.doc_dir(doc_name),
                             storage=self._storage,
-                            doc_name=doc_name,
+                            user_id=user_id,
+                            project_id=project_id,
+                            document_id=document_id,
                         )
                     )
                     for i in range(num_workers)
                 ]
 
-                # Producer
-                pages_dir = self._storage.pages_dir(doc_name)
+                # Producer: each rendered PNG gets uploaded to the
+                # ``pages`` bucket via this callback.
+                async def _upload_png(page_num: int, data: bytes) -> str | None:
+                    try:
+                        return await self._storage.write_page_png(
+                            user_id, project_id, document_id, page_num, data
+                        )
+                    except Exception:
+                        logger.warning(
+                            "page_png_upload_failed",
+                            page_num=page_num,
+                            exc_info=True,
+                        )
+                        return None
+
                 pushed = 0
                 try:
                     pushed = await rasterize_pages(
@@ -313,7 +351,7 @@ class PipelineOrchestrator:
                         baselines=baselines,
                         deque=deque,
                         dpi=self._settings.render_dpi,
-                        pages_dir=pages_dir,
+                        on_png_persisted=_upload_png,
                         use_adaptive_dpi=True,
                     )
                 finally:
@@ -354,14 +392,18 @@ class PipelineOrchestrator:
             t0 = time.perf_counter()
 
 
-            postprocessor = PostProcessor(self._storage)
+            postprocessor = PostProcessor(
+                self._storage,
+                user_id=user_id,
+                project_id=project_id,
+                document_id=document_id,
+            )
             pp_result = await postprocessor.run(
                 doc_name=doc_name,
                 filename=filename,
                 baselines=baselines,
                 page_results=job.page_results,
             )
-            job.output_dir = self._storage.doc_dir(doc_name)
             job.phase_timings["postprocessing"] = _ms_since(t0)
 
             logger.info(
@@ -384,11 +426,16 @@ class PipelineOrchestrator:
                     doc_name=doc_name,
                     job_id=job_id,
                     filename=filename,
+                    user_id=user_id,
+                    role=role,
+                    organization=organization,
+                    project_id=project_id,
+                    document_id=document_id,
                 )
 
                 if chunks:
-                    # Delete old vectors for this job (idempotent re-ingestion)
-                    await self._vector_store.delete_by_job(job_id)
+                    # Delete old vectors for this document (idempotent re-ingestion)
+                    await self._vector_store.delete_by_document(document_id)
 
                     embeddings = await self._embedder.embed_texts(
                         [c.text for c in chunks]
@@ -419,6 +466,11 @@ class PipelineOrchestrator:
                     doc_name=doc_name,
                     job_id=job_id,
                     filename=filename,
+                    user_id=user_id,
+                    role=role,
+                    organization=organization,
+                    project_id=project_id,
+                    document_id=document_id,
                 )
                 entities_upserted = 0
                 if entity_points:
@@ -433,6 +485,11 @@ class PipelineOrchestrator:
                     doc_name=doc_name,
                     job_id=job_id,
                     filename=filename,
+                    user_id=user_id,
+                    role=role,
+                    organization=organization,
+                    project_id=project_id,
+                    document_id=document_id,
                 )
                 images_upserted = 0
                 if image_points:
@@ -492,9 +549,10 @@ async def _worker(
     job: JobResult,
     *,
     worker_id: int,
-    output_dir: Path | None = None,
-    storage: FileStorage | None = None,
-    doc_name: str | None = None,
+    storage: SupabaseStorage,
+    user_id: str,
+    project_id: str,
+    document_id: str,
 ) -> None:
     """Single worker: pop a PageImage, run the per-page graph, store result."""
     while True:
@@ -504,34 +562,35 @@ async def _worker(
 
         try:
             # ── Idempotency check ──────────────────────────────────────
-            # If page markdown already exists on disk (from a previous run
-            # that was interrupted after extraction but before completion),
-            # skip the expensive Gemini calls entirely.
-            if output_dir is not None:
-                marker = output_dir / f"page_{page.page_num:03d}.md"
-                if marker.exists():
-                    job.page_results[page.page_num] = {
+            # If page markdown already exists in Storage (from a previous
+            # run that was interrupted after extraction but before
+            # completion), skip the expensive Gemini calls entirely.
+            existing_md = await storage.read_page_markdown(
+                user_id, project_id, document_id, page.page_num
+            )
+            if existing_md is not None:
+                job.page_results[page.page_num] = {
+                    "page_num": page.page_num,
+                    "iteration": 0,
+                    "escalated": False,
+                    "png_path": page.png_path,
+                    "final": {
                         "page_num": page.page_num,
-                        "iteration": 0,
-                        "escalated": False,
-                        "png_path": page.png_path,
-                        "final": {
-                            "page_num": page.page_num,
-                            "markdown": marker.read_text(encoding="utf-8"),
-                            "tables": [],
-                            "images": [],
-                            "entities": [],
-                            "cross_page_notes": "",
-                        },
-                        "skipped": True,
-                    }
-                    job.pages_processed = len(job.page_results)
-                    logger.info(
-                        "worker_page_skipped_idempotent",
-                        worker_id=worker_id,
-                        page_num=page.page_num,
-                    )
-                    continue
+                        "markdown": existing_md,
+                        "tables": [],
+                        "images": [],
+                        "entities": [],
+                        "cross_page_notes": "",
+                    },
+                    "skipped": True,
+                }
+                job.pages_processed = len(job.page_results)
+                logger.info(
+                    "worker_page_skipped_idempotent",
+                    worker_id=worker_id,
+                    page_num=page.page_num,
+                )
+                continue
 
             initial_state: PageState = page_image_to_state(page)
             result = await graph.ainvoke(initial_state)
@@ -556,17 +615,16 @@ async def _worker(
 
             # Persist per-page state JSON so a future run can resume
             # without losing tables/entities/images.
-            if storage is not None and doc_name is not None:
-                try:
-                    await storage.write_page_state(
-                        doc_name, page.page_num, result_to_store
-                    )
-                except Exception:
-                    logger.warning(
-                        "worker_state_persist_failed",
-                        page_num=page.page_num,
-                        exc_info=True,
-                    )
+            try:
+                await storage.write_page_state(
+                    user_id, project_id, document_id, page.page_num, result_to_store
+                )
+            except Exception:
+                logger.warning(
+                    "worker_state_persist_failed",
+                    page_num=page.page_num,
+                    exc_info=True,
+                )
 
             logger.info(
                 "worker_page_complete",

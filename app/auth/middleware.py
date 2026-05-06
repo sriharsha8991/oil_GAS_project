@@ -37,6 +37,7 @@ class AuthUser:
     email: str
     role: str
     display_name: str | None
+    organization: str | None
 
 
 def _is_anonymous(path: str) -> bool:
@@ -58,6 +59,7 @@ async def _load_profile(user_id: str, email: str) -> AuthUser | None:
             email=prof.email or email,
             role=prof.role,
             display_name=prof.display_name,
+            organization=prof.organization,
         )
 
 

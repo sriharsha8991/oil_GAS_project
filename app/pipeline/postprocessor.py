@@ -6,7 +6,7 @@ Inputs:
   - page_results: dict[page_num, PageState_dict] from the worker pool;
     each dict has .final = PageExtraction-shaped dict
 
-Outputs (written to disk via FileStorage):
+Outputs (written to Supabase Storage via SupabaseStorage):
   1. per-page markdown:                pages/page_NNN.md
   2. per-page table JSON + markdown:   tables/page_NNN_table_MM.{json,md}
   3. merged cross-page table JSON:     tables/merged_table_NN.{json,md}
@@ -19,7 +19,7 @@ import re
 
 from app.domain.entity_resolver import CanonicalEntity, EntityResolver, ResolvedEntity
 from app.models.schemas import PageBaseline
-from app.storage.file_storage import FileStorage
+from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -28,8 +28,17 @@ logger = get_logger(__name__)
 class PostProcessor:
     """Transforms per-page extraction results into structured output files."""
 
-    def __init__(self, storage: FileStorage) -> None:
+    def __init__(
+        self,
+        storage: SupabaseStorage,
+        user_id: str,
+        project_id: str,
+        document_id: str,
+    ) -> None:
         self._storage = storage
+        self._user_id = user_id
+        self._project_id = project_id
+        self._document_id = document_id
 
     async def run(
         self,
@@ -60,7 +69,9 @@ class PostProcessor:
                 else _format_baseline_page(baseline)
             )
 
-            await self._storage.write_page_markdown(doc_name, pn, md)
+            await self._storage.write_page_markdown(
+                self._user_id, self._project_id, self._document_id, pn, md
+            )
             pages_written += 1
 
         # Step 5: Per-page table files
@@ -70,19 +81,25 @@ class PostProcessor:
                 json_data = table.get("json_data", {})
                 if not json_data:
                     json_data = _table_md_to_json(table.get("markdown", ""))
-                await self._storage.write_table_json(doc_name, pn, idx + 1, json_data)
+                await self._storage.write_table_json(
+                    self._user_id, self._project_id, self._document_id,
+                    pn, idx + 1, json_data
+                )
 
                 table_md = table.get("markdown", "")
                 if table_md:
                     await self._storage.write_table_markdown(
-                        doc_name, pn, idx + 1, table_md
+                        self._user_id, self._project_id, self._document_id,
+                        pn, idx + 1, table_md
                     )
                 tables_written += 1
 
         # Step 6: Merged cross-page tables
         for mt in merged_tables:
             await self._storage.write_table_json(
-                doc_name,
+                self._user_id,
+                self._project_id,
+                self._document_id,
                 mt["page_start"],
                 mt["table_index"],
                 {
@@ -93,13 +110,20 @@ class PostProcessor:
             )
             if mt.get("markdown"):
                 await self._storage.write_table_markdown(
-                    doc_name, mt["page_start"], mt["table_index"], mt["markdown"]
+                    self._user_id,
+                    self._project_id,
+                    self._document_id,
+                    mt["page_start"],
+                    mt["table_index"],
+                    mt["markdown"],
                 )
             tables_written += 1
 
         # Step 7: Combined full document
         full_md = _build_full_document(filename, baselines, page_map, header_footer)
-        await self._storage.write_full_document(doc_name, full_md)
+        await self._storage.write_full_document(
+            self._user_id, self._project_id, self._document_id, full_md
+        )
 
         # Step 8: Entity resolution (L2 domain knowledge)
         resolver = EntityResolver()
@@ -150,7 +174,9 @@ class PostProcessor:
         ]
         entities_count = sum(len(v) for v in entities_doc["entities_by_page"].values())
         resolved_count = sum(len(v) for v in resolved_by_page.values())
-        await self._storage.write_entities_json(doc_name, entities_doc)
+        await self._storage.write_entities_json(
+            self._user_id, self._project_id, self._document_id, entities_doc
+        )
 
         result = PostProcessResult(
             pages_written=pages_written,
