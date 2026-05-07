@@ -2,11 +2,131 @@
 
 > **Purpose:** Living document the **backend team** uses to respond to the frontend team. Mirrors [BACKEND_REPORT.md](BACKEND_REPORT.md) (which is frontend → backend). Forward-replace this doc whenever a backend commitment changes status.
 >
-> **How to read:** §1 is the executive summary. §2 is the canonical commitment list (versioned action items). §3 answers every open question raised in `BACKEND_REPORT.md`. §4 is per-phase commentary. §5 covers the role-aware dashboard endorsement. §6 lists what we want from frontend in return.
+> **How to read:** §0.0 is the **current auth contract** and supersedes any earlier statement about Supabase JS, public signup, or "no /auth/login on backend." §0 is the PR-7 identity/storage contract. §1+ is historical commentary; treat it as background.
 >
-> **Last updated:** 2026-05-06 — **v2.4**. **PR-7 (Projects + Documents + tenant-scoped vectors) shipped.** `owner_id`/`doc_id`/`job_id` are no longer part of any frontend-visible contract; identity is now `(user_id, project_id, document_id)` end-to-end. Qdrant was wiped and re-created with tenant payload indices. Storage paths are now `<bucket>/<user_id>/<project_id>/<document_id>/<file>`. Realtime channel + Postgres `jobs` row replace Redis polling. **Frontend must update: chat scope params, ingest contract, document/project endpoints. See §0 PR-7 contract block below.**
+> **Last updated:** 2026-05-07 — **v2.5**. **Auth pivoted to invite-only.** Frontend no longer imports `@supabase/supabase-js`. Backend owns the entire credential surface (`/auth/login`, `/auth/refresh`, `/auth/change-password`, `/auth/me`, `/auth/me/profile`). Public signup is **gone**. New tier 'admin' between super_admin and end users; admins are org-scoped and quota-limited. See §0.0.
 > **Owner:** Backend team.
-> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | **§2.10 PR-7 ✅** (new). §2.9 still Open.
+> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | **§0.0 Invite-only auth ✅** (new). §2.9 still Open.
+
+---
+
+## 0.0 Auth Contract — INVITE-ONLY (read this first, supersedes everything below)
+
+Effective 2026-05-07. **Reverses prior guidance** that said "FE talks to Supabase Auth directly" and "BE has no /auth/login." Backend now owns the credential surface end-to-end; FE makes plain HTTP calls.
+
+### 0.0.1 Tiers
+
+| Role | Who | Scope |
+|---|---|---|
+| `super_admin` | The product owner. One bootstrapped per environment. | Unrestricted across orgs. Adds & deletes admins. Sets per-admin user quotas. |
+| `admin` | An organisation's account owner. | Org-scoped. Invites users into their own `organization`. Subject to a `user_quota` set by super_admin. Cannot create other admins. |
+| `drilling_engineer` / `geologist` / `asset_manager` / `qa_steward` | End users. | Sign in, use the product. |
+
+There is **no public sign-up screen.** Every account is created via `/admin/users/invite`.
+
+### 0.0.2 Endpoints (FE-facing)
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `POST` | `/auth/login` | none | `{ email, password } → { access_token, refresh_token, expires_in, token_type:"bearer", user }`. 401 `invalid_credentials`. |
+| `POST` | `/auth/refresh` | none | `{ refresh_token } → same shape`. 401 `invalid_refresh_token`. |
+| `POST` | `/auth/change-password` | bearer | `{ current_password, new_password }` → 204. 401 `invalid_current_password` on bad current. min new length 8. |
+| `GET`  | `/auth/me` | bearer | `{ id, email, role, display_name, organization }`. |
+| `PATCH`| `/auth/me/profile` | bearer | `{ display_name?, organization? }` (partial). Returns refreshed `me`. |
+| `GET`  | `/admin/users` | bearer (admin/super_admin) | Org-scoped for admin; global for super_admin. Each row includes `user_quota` and `invited_by`. |
+| `POST` | `/admin/users/invite` | bearer (admin/super_admin) | Generates a random password and emails it to the invitee. Body: `{ email, display_name?, role?, organization?, user_quota? }`. See §0.0.4 for rules. 201 returns the new `UserRow` + `message`. |
+| `PATCH`| `/admin/users/{id}/role` | bearer (super_admin) | `{ role }`. |
+| `PATCH`| `/admin/users/{id}/quota` | bearer (super_admin) | `{ user_quota: int }` (0 = unlimited). |
+| `DELETE`| `/admin/users/{id}` | bearer (admin/super_admin) | Admin can delete only same-org non-admin users. Cannot delete self. |
+| `POST` | `/admin/users/{id}/resend-invite` | bearer (admin/super_admin) | Generate a new temp password and email it. Same scoping rules as DELETE. |
+
+There is **no `/auth/signup`**. Anything that used to call it must be removed.
+
+### 0.0.3 Tokens
+
+- `access_token` is the Supabase-issued JWT — send as `Authorization: Bearer <jwt>` on every non-anonymous endpoint. Anonymous endpoints: `/`, `/health`, `/openapi.json`, `/docs`, `/redoc`, `/auth/login`, `/auth/refresh`.
+- Treat `expires_in` (seconds) as a hint; refresh ~60s before expiry by calling `/auth/refresh` with the saved `refresh_token`. The response always rotates both tokens.
+- Persist tokens in memory + a refresh-token-only cookie or `localStorage` (FE choice — backend has no opinion). Do **not** store the service-role key, the anon key, or the Supabase URL on the client.
+
+### 0.0.4 Invite rules (admin vs. super_admin)
+
+`POST /admin/users/invite` body:
+```json
+{
+  "email": "alice@acme.com",
+  "display_name": "Alice",
+  "role": "drilling_engineer",
+  "organization": "Acme Drilling",
+  "user_quota": 0
+}
+```
+
+- `email` (required): plain string, validated server-side.
+- `display_name` (optional).
+- `role` (optional, default `drilling_engineer`):
+  - super_admin may pick any role including `admin` **and `super_admin`** (yes — super_admin can mint additional super_admins through the same invite flow; that's how you add a second product owner without dropping into the `bootstrap_super_admin` CLI).
+  - admin may pick only one of `drilling_engineer | geologist | asset_manager | qa_steward`. Passing `admin` or `super_admin` returns 403 `role_not_assignable_by_admin`.
+- `organization` (optional):
+  - super_admin must supply it for admin invites (otherwise the new admin has no org and `/admin/users` returns 409 `admin_missing_organization` for them).
+  - For admin callers it is **ignored** — invitees auto-inherit the caller's `organization`.
+- `user_quota` (optional, super_admin only, only meaningful when inviting an `admin`): how many users that admin may invite. 0 = unlimited.
+
+Quota enforcement: when an admin calls `/admin/users/invite`, the backend counts existing rows where `users_profile.invited_by = caller.id`. If that count `>= caller.user_quota` (and quota > 0), 403 `quota_exceeded` with `{ user_quota, current_invitees }`.
+
+### 0.0.5 Mailing
+
+Invites are mailed via Resend. From-address `Wellsynth <no-reply@rax-resume.xyz>` (verified domain — confirm in Resend dashboard before relying on it). The mail body contains the email + temporary password and tells the user to change it from the profile screen.
+
+If Resend rejects the send, backend rolls the user back (deletes the auth.users row) and returns 502 `email_send_failed`. FE should surface this as a retryable error.
+
+### 0.0.6 First sign-in flow (UX guidance)
+
+1. Admin invites user → user receives email with `email + temp password`.
+2. User opens FE, lands on the login screen, enters those credentials.
+3. FE stores tokens, calls `/auth/me`, routes to the role-appropriate dashboard.
+4. FE prompts/encourages the user to visit Profile → Change Password (`POST /auth/change-password`). Suggested copy: "You're signed in with a temporary password. Set a permanent one now."
+5. After change, FE re-uses the existing tokens (Supabase keeps the same session valid).
+
+### 0.0.7 Required FE screens
+
+- **Login** (public): `/auth/login`.
+- **Profile** (any authed role): shows `/auth/me` fields, lets user `PATCH /auth/me/profile` and `POST /auth/change-password`.
+- **Admin Console** (role `admin` or `super_admin`):
+  - User list (`GET /admin/users` with q/role/limit/offset). Show columns: email, display_name, role, organization, user_quota, invited_by, created_at.
+  - "Invite user" form (admin: just email + display_name + role from the limited set; quota text reads `X of Y used`). Calls `POST /admin/users/invite`.
+  - "Resend invite" action on each row → `POST /admin/users/{id}/resend-invite`. Replaces the user's password with a new random one and emails it. Existing password stops working immediately.
+  - "Delete user" action (with confirm dialog).
+- **Super Admin Console** (role `super_admin` only — separate route, do not merge with the regular admin console):
+  - "Add admin" form: `email`, `display_name`, `organization` (required), `user_quota` (int ≥ 0). Posts to `POST /admin/users/invite` with `role: "admin"`.
+  - "Add super admin" form (same screen, separate tab/section): `email`, `display_name`. Posts to `POST /admin/users/invite` with `role: "super_admin"`. Use sparingly; this hands a second person full keys to the kingdom.
+  - List view filtered to `role=admin` (and a second tab for `role=super_admin`), with inline `PATCH /admin/users/{id}/quota` and `PATCH /admin/users/{id}/role`.
+  - **Resend invite** button on every row → `POST /admin/users/{id}/resend-invite`. UI confirm "Email <addr> a new temporary password? The previous password will stop working." Toast on 200; show 502 `email_send_failed` as a retryable error.
+  - Optional global view (all users across orgs) for support.
+
+### 0.0.8 Error codes (FE should map to UI strings)
+
+| HTTP | `detail` / `error_code` | Meaning |
+|---|---|---|
+| 401 | `invalid_credentials` | Wrong email or password on `/auth/login`. |
+| 401 | `invalid_refresh_token` | Stale or wrong refresh token; force re-login. |
+| 401 | `invalid_current_password` | On change-password. |
+| 401 | `unauthorized` | Missing/invalid bearer; force re-login. |
+| 403 | `requires_role` | Caller's role isn't in `required_roles`. |
+| 403 | `role_not_assignable_by_admin` | Admin tried to invite an `admin`/`super_admin`. |
+| 403 | `quota_exceeded` | Admin hit their `user_quota`. |
+| 403 | `cross_org_forbidden` | Admin tried to delete someone outside their org. |
+| 403 | `cannot_delete_admin_or_super` | Admin tried to delete an admin/super_admin. |
+| 400 | `cannot_delete_self` | Self-deletion blocked. |
+| 400 | `invalid_role` | Role string not in the locked enum. |
+| 409 | `email_already_registered` | Invite hit a duplicate. |
+| 409 | `admin_missing_organization` | Admin caller has null `organization`. |
+| 502 | `email_send_failed` | Resend rejected the send (transient — retry). |
+
+### 0.0.9 What FE must remove
+
+- All imports of `@supabase/supabase-js`.
+- All references to a `/auth/signup` endpoint or sign-up screen.
+- Any code that reads `SUPABASE_URL` / `SUPABASE_ANON_KEY` on the client. Drop them from the FE env entirely; the only env vars FE needs now are `NEXT_PUBLIC_API_BASE_URL` (or equivalent) and any analytics keys.
 
 ---
 

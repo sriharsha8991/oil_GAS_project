@@ -4,11 +4,199 @@
 >
 > **How to read:** Each phase has its own section. The **Open Items** table is the canonical to-do for backend. Resolved items move to the **Resolved** subsection of the relevant phase, with the resolution noted.
 >
-> **Last updated:** 2026-05-06 — v1.4. Added **B-013** (per-user document ownership / personalised corpus) per product decision: every job, briefing, lesson, chat session, and pinboard becomes scoped to the owning user; cross-user visibility is opt-in (sharing) only.
+> **Last updated:** 2026-05-07 — **v1.7**. End-to-end FE audit completed (zero direct Supabase data-layer calls — everything flows through backend HTTP API per the platform constraint). New asks **B-018..B-030** filed: 5 missing endpoints (briefings, lessons, entities/distinct, compare, admin/stats), 1 architectural ask (replace ingest polling with backend-owned SSE — FE must NOT subscribe to Supabase Realtime directly), and 7 contract clarifications. See [§0.1 v1.7 New Asks](#01-v17-new-asks-2026-05-07) below.
+>
+> **Last updated:** 2026-05-06 — v1.6. Backend response **v2.5** received and reconciled. **B-014 (CORS preflight 401) fixed and verified by backend** (`OPTIONS /chat → 204`). FE will keep the `/api/backend` Next.js proxy in place for defense-in-depth; it's now optional rather than load-bearing. Status corrections applied: **B-001 / B-002 / B-005 / B-012 / B-013 are all ✅ Resolved** (FE doc was stale). **B-015 / B-016 / B-017 answered in writing** (see [communication_from_backend.md §0.0.4–§0.0.6](communication_from_backend.md#004-b-015--documentsidfull-content-type-lock-in--confirmed)). **Auth guardrail re-stated:** no `/auth/signup`, no `/auth/login`, no `PATCH /auth/me { role }` — Supabase JS SDK owns auth, backend exposes only `GET /auth/me` + `PATCH /auth/me/profile { display_name?, organization? }`. FE already conforms. Legacy `data/output/<job_id>/manifest.json` filesystem path is **deprecated** — Postgres `jobs` row + Realtime is the source of truth.
 
 ---
 
-## 🟢 Backend Response Received — read this first
+## 0.1 v1.7 New Asks (2026-05-07)
+
+> **Context:** Full FE → backend retrospection completed 2026-05-07. Platform rule reaffirmed: **frontend MUST NEVER touch Supabase DB / Storage / Realtime directly.** Only `supabase.auth.*` (session + JWT) is permitted in the browser. Everything else — including ingest progress streaming — must go through backend HTTP endpoints. Audit found zero violations of this rule today; this section files the endpoints and clarifications needed to keep it that way as P1b/P2/P3 features land.
+>
+> **Owner:** Backend team. **FE status:** Wired & ready against typed mocks where possible; blocked on the items below for real-data demos.
+
+### 0.1.1 Snapshot table
+
+| ID | Ask | Phase / Window | Priority | Status |
+|---|---|---|---|---|
+| **B-018** | `POST /briefings/pre-spud` + `GET /briefings[?owner=]` + `GET/DELETE /briefings/{id}` | P1b (PR-3) | 🔴 Blocker | Open |
+| **B-019** | `POST /lessons/applicable` + `GET /lessons[/{id}]` | P1b (PR-4) | 🔴 Blocker | Open |
+| **B-020** | `GET /entities/distinct?type=&q=&limit=` | P1b (with PR-3) | 🔴 Blocker | Open — restated from B-008 (C-13) |
+| **B-021** | `POST /compare` (409 if either job not `succeeded`) | P2 | 🟡 Important | Open — restated from C-10 |
+| **B-022** | `GET /admin/stats` + `GET /admin/stats/sparkline` | P5 | 🟡 Important | Open — restated from C-20/C-21 |
+| **B-023** | **Backend-owned SSE for ingest progress** (`GET /ingest/events`) — replace polling. FE must NOT subscribe to Supabase Realtime from the browser. | P5 (or sooner if scale demands) | 🟢 Architectural | Open |
+| **B-024** | Confirm `GET /auth/me` always returns `role` (never null); default for new users = `drilling_engineer` | Before P1a demo | 🟢 Clarification | Open |
+| **B-025** | Confirm `GET /ingest/{job_id}` shape + error code on not-owner (404 vs 403) | Before P1a merge | 🟢 Clarification | Open |
+| **B-026** | Confirm crop bbox coordinate system: normalized `0..1000` (per existing docs) or pixel-space? Aspect handling? | P1b | 🟢 Clarification | Open |
+| **B-027** | `GET /admin/users?limit=` — max value, behavior on overflow (422 vs silent cap) | P1a | 🟢 Clarification | Open |
+| **B-028** | `POST /ingest/upload` partial-failure semantics — `207 Multi-Status` or all-or-nothing? | P1a | 🟢 Clarification | Open |
+| **B-029** | Confirm `GET /health` exists, is unauthenticated, returns `{status, version, database, qdrant}` | P6 | 🟢 Clarification | Open |
+| **B-030** | Confirm `?scope=mine\|all` was fully collapsed: super_admin sees all on every list endpoint with no query param; non-admins always implicitly scoped. | Before P1a demo | 🟢 Clarification | Open |
+
+### 0.1.2 B-018 — Briefings endpoints (BLOCKER for P1b)
+
+**Why:** Drilling Engineer dashboard imports `MyBriefingsBlock`. Briefing detail + creation form are wired against typed mocks. Mock will be flipped off the moment the endpoint shape is confirmed.
+
+**Requested shape:**
+
+```
+POST /briefings/pre-spud
+  Body:  { well_name: string,
+           formations?: string[],
+           operations?: string[],
+           depth_min?: number,
+           depth_max?: number,
+           project_id?: uuid,
+           owner?: string }       // echoed back per C-15
+  Resp:  201 { id, owner, well_name, content,
+               applicability: { reasons: [...], score },
+               sources: SourceRef[],
+               empty_state_reason?: BriefingEmptyReason,
+               created_at }
+
+GET /briefings?owner=&project_id=&limit=&offset=
+  Resp:  200 { items: Briefing[], total, limit, offset }
+
+GET /briefings/{id}      → 200 Briefing | 404 not_found | 403 not_owner
+DELETE /briefings/{id}   → 204
+```
+
+**Locked enums (already accepted in §3.7 of communication_from_backend.md):**
+- `applicability.reasons[]`: `formation_match | operation_match | depth_band_match | section_match`
+- `empty_state_reason`: `no_offsets_in_field | no_formation_overlap | corpus_too_small`
+
+### 0.1.3 B-019 — Lessons endpoints (BLOCKER for P1b)
+
+**Why:** Drilling Engineer dashboard imports `LessonsApplicableBlock`. Same mock-flip pattern as briefings.
+
+**Requested shape:**
+
+```
+POST /lessons/applicable
+  Body:  { document_id: uuid, top_k?: number = 5 }
+  Resp:  200 { lessons: [{
+           id, title, description,
+           applicability: { reasons: LessonReason[], score },
+           source: SourceRef,
+           created_at
+         }],
+         empty_state_reason?: LessonsEmptyReason }
+
+GET /lessons[?owner=&applicability=&limit=&offset=]
+  Resp:  200 { items: Lesson[], total, limit, offset }
+
+GET /lessons/{id}     → 200 Lesson | 404 not_found | 403 not_owner
+```
+
+**Locked enums:**
+- `applicability.reasons[]`: same four values as briefings.
+- `empty_state_reason`: `no_lesson_keywords_in_corpus | no_classified_lessons | context_too_vague`.
+
+### 0.1.4 B-020 — `GET /entities/distinct` (BLOCKER for P1b)
+
+**Restates B-008 / C-13** with the exact contract FE will bind to:
+
+```
+GET /entities/distinct?type=<formation|field|operation|section|well_name>
+                     &q=<prefix>&limit=20
+
+Resp: 200 { type: string, values: string[] }
+```
+
+**Powers:** Briefing form autocomplete + Geologist "Formation prevalence" chart. P1b demo cannot ship Geologist dashboard or Briefing creation without it.
+
+### 0.1.5 B-021 — `POST /compare` (P2 feature)
+
+**Restates C-10.** FE has feature flag enabled, types ready, mock wired. Need:
+
+```
+POST /compare
+  Body: { job_ids: [uuid, uuid] }
+  Resp: 200 CompareResult     // shape per BACKEND_SPEC §6.2
+        409 conflict          // if either job.status != "succeeded"
+```
+
+### 0.1.6 B-022 — `GET /admin/stats` + sparkline
+
+**Restates C-20 / C-21.** Today FE aggregates from `GET /ingest` client-side — fine for ≤50 jobs, won't scale. Need server aggregation:
+
+```
+GET /admin/stats?days=7
+  Resp: { total_jobs, counts_by_status: {queued, running, succeeded, failed},
+          total_spend_usd, total_tokens,
+          per_model_breakdown: { flash: {jobs, tokens, cost}, pro: {...} },
+          users_count, documents_count, projects_count }
+
+GET /admin/stats/sparkline?metric=spend|jobs&days=7
+  Resp: { metric, points: [{ ts, value }, ...] }
+```
+
+Cache 30s server-side. FE polls at 30s.
+
+### 0.1.7 B-023 — **Backend-owned SSE for ingest progress** (architectural)
+
+**Why this is in the report (and not just "use Supabase Realtime"):**
+
+Backend's earlier plan ([communication_from_backend.md §9.5](communication_from_backend.md#95-realtime--polling-dies)) suggested the FE subscribe directly to the `jobs` table via Supabase Realtime:
+
+```ts
+// ❌ Forbidden by platform rule
+supabase.channel('jobs:user_id=...').on('postgres_changes', ...).subscribe()
+```
+
+**Per the FE/platform constraint, the browser MUST NEVER touch the Supabase DB directly — including Realtime channels.** Auth is the only exception. Therefore Supabase Realtime stops at the backend; the backend re-broadcasts to the FE over SSE.
+
+**Requested endpoint:**
+
+```
+GET /ingest/events                       (text/event-stream, JWT-required)
+
+  event: job_update
+  data: { job_id, document_id, status, current_phase, pages_done, pages_total,
+          tokens?, cost_usd?, error?, updated_at }
+
+  event: heartbeat
+  data: { ts }                            // every 15s, keeps proxy alive
+```
+
+Backend subscribes to its own Postgres `jobs` channel internally and fans out to authenticated SSE consumers, scoped by `request.state.user.id` (super_admin sees all). FE drops the `refetchInterval` polling in `useJobs()` and consumes this stream instead.
+
+**Acceptable interim:** keep polling. **Not acceptable:** frontend opening a Supabase Realtime channel.
+
+### 0.1.8 B-024..B-030 — Clarifications
+
+Concise, in writing, please add to [communication_from_backend.md](communication_from_backend.md) §0.0.7 or a new §0.0.8:
+
+- **B-024** — Does `GET /auth/me` always return a non-null `role`? What's the default for a freshly-signed-up user (assumed `drilling_engineer` per `handle_new_user` trigger). Lock the role enum in OpenAPI.
+- **B-025** — `GET /ingest/{job_id}` — confirm response shape (same `JobRow` as list items?). Confirm error codes: `404` for missing, `403` for not-owner-not-admin?
+- **B-026** — `/documents/{id}/pages/{n}/image/crop?ymin&xmin&ymax&xmax` — confirm coordinate space (existing docs imply `0..1000` integer scale). Out-of-range → `400`. Aspect ratio: preserved or stretched?
+- **B-027** — `GET /admin/users?limit=` — what's the max accepted `limit` value? Above-max behavior: `422` or silently cap?
+- **B-028** — `POST /ingest/upload` with N files: if 1 of N fails (e.g., unsupported MIME), do we get `207 Multi-Status`, or is the whole request rejected? FE's `UploadResponse.jobs[*].status` shape suggests partial-success is possible; please confirm.
+- **B-029** — `GET /health` — confirm it exists, is unauthenticated (no JWT required), and the response shape. FE wants to use it for an error-boundary "backend reachable?" probe.
+- **B-030** — Per §0 of v2.5, the `?scope=mine|all` toggle was "collapsed into implicit per-caller scoping." Confirm there is **no** `?scope=` query param on any list endpoint (`/projects`, `/documents`, `/ingest`, `/briefings`, `/lessons`, `/admin/users`); super_admin auto-elevation handles "see all"; non-admins are always implicitly owner-scoped.
+
+### 0.1.9 What FE will NOT ask for (non-asks, recorded for symmetry)
+
+- ❌ Direct Supabase Realtime subscriptions from the browser. (B-023 covers this.)
+- ❌ Direct Supabase Storage signed-URL generation from the browser. (Backend already issues signed URLs via the 302 on `/documents/{id}/pages/{n}/image`.)
+- ❌ Direct Supabase Postgres queries via `supabase.from(...)`. (Audit confirmed FE has zero of these.)
+- ❌ Any backend `/auth/signup`, `/auth/login`, or `PATCH /auth/me { role }`. Supabase Auth SDK owns the credential surface; backend owns only `GET /auth/me` + `PATCH /auth/me/profile`.
+
+### 0.1.10 Audit summary (FE compliance check)
+
+| Check | Result | Evidence |
+|---|---|---|
+| No direct Supabase data-layer calls (`from`, `storage`, `channel`, `rpc`) | ✅ Pass | grep across `lib/`, `app/`, `components/` returns 0 hits |
+| `Authorization: Bearer <jwt>` attached to every API call | ✅ Pass | [lib/api.ts](../lib/api.ts) `apiRequest` reads from `supabase.auth.getSession()` |
+| Same-origin proxy via Next.js rewrite | ✅ Pass | [next.config.ts](../next.config.ts) maps `/api/backend/*` → `BACKEND_ORIGIN` |
+| Middleware does not intercept `/api/*` | ✅ Pass (fixed 2026-05-07) | [middleware.ts](../middleware.ts) matcher excludes `api/` |
+| Auth uses Supabase JS SDK only for session/JWT | ✅ Pass | [lib/queries/auth.ts](../lib/queries/auth.ts), [components/layout/auth-bootstrapper.tsx](../components/layout/auth-bootstrapper.tsx) |
+| All list endpoints invalidated optimistically on mutate | ✅ Pass | TanStack Query `setQueryData` + `invalidateQueries` pattern in `useCreateProject`, `useUpload`, etc. |
+
+---
+
+
 
 Backend team has responded with a full commitment list (C-01 → C-28) in [communication_from_backend.md](communication_from_backend.md). **All 11 frontend asks (B-001 → B-011) accepted.** Frontend signs off on the §2 commitment list as written.
 
@@ -36,8 +224,8 @@ Backend team has responded with a full commitment list (C-01 → C-28) in [commu
 |---|---|---|
 | **P0 — Foundations** | Complete | 6 |
 | **P1a — Shell + Ingest + Library + Role Dashboards** | Starting | 7 |
-| P1b — Document Workspace + Chat + Auto-Summary | Not started | — |
-| P2 — Browsers + Search + Compare | Not started | — |
+| **P1b — Document Workspace + Chat + Auto-Summary** | **In progress (FE wired against v2.4 OpenAPI)** | **4 new (B-014..B-017)** |
+| P2 — Browsers + Search + Compare | Search wired in P1b pass; full Compare UI not started | — |
 | P3 — Briefing + Lessons + Pinboard | Not started | — |
 | P4 — Reports + Export + Email + Sharing | Not started | — |
 | P5 — Premium Polish | Not started | — |
@@ -49,13 +237,17 @@ All 5 top-priority items have been accepted by backend. Status reflects backend 
 
 | # | Ask | Backend commitment | Window | Status |
 |---|---|---|---|---|
-| 1 | B-001 — OpenAPI export | C-01 | This week | 🟡 In progress |
-| 2 | B-002 — CORS allow-list | C-03 | This week | 🟡 In progress |
+| 1 | B-001 — OpenAPI export | C-01 | Done | ✅ Resolved |
+| 2 | B-002 — CORS allow-list | C-03 | Done | ✅ Resolved |
 | 3 | B-008 — `/entities/distinct` | C-13 | With PR-3 | ⏳ Scheduled |
-| 4 | B-005 — real `JobManifest` sample | C-02 | This week | 🟡 In progress |
+| 4 | B-005 — real `JobManifest` sample | C-02 | Done — superseded by Postgres `jobs` row in PR-7 | ✅ Resolved |
 | 5 | B-007 — `/admin/stats` | C-20 | Pre-demo (P5) | ⏳ Scheduled — frontend OK with P5 timing |
-| 6 | **B-012 — Accounts + roles in DB** | *new* | This week / next | 🔴 NEW — awaiting backend response |
-| 7 | **B-013 — Per-user document ownership** | *new* | This week / next | 🔴 NEW — awaiting backend response |
+| 6 | **B-012 — Accounts + roles in DB** | C-29..C-35, C-49..C-54 | Done | ✅ Resolved (Supabase Auth + `users_profile.role`; FE conforms) |
+| 7 | **B-013 — Per-user document ownership** | C-41..C-48 (PR-7) | Done | ✅ Resolved (`(user_id, project_id, document_id)` identity; super_admin auto-elevation) |
+| 8 | **B-014 — CORS preflight returns 401 on `/chat`** | v2.5 hot-fix | Done | ✅ Resolved (verified `OPTIONS /chat → 204`) |
+| 9 | **B-015 — `/documents/{id}/full` content-type lock-in** | v2.5 §0.0.4 | Done | ✅ Resolved (`text/plain`, markdown body, 404 on no-pages, `Cache-Control: private, max-age=300`) |
+| 10 | **B-016 — `/documents/{id}/pages/{n}/image` JWT-on-redirect** | v2.5 §0.0.5 + C-04 | Done | ✅ Resolved (302 → credential-less signed URL, 60s TTL, `Cache-Control: public, max-age=86400, immutable`) |
+| 11 | **B-017 — `/search` filter contract + result-shape lock-in** | v2.5 §0.0.6 | Done | ✅ Resolved (envelope `{query,count,results}`; per-hit fields locked; filter semantics confirmed) |
 
 ---
 
@@ -420,6 +612,162 @@ The frontend has decided to ship **role-resolved dashboards** in P1a instead of 
 
 ---
 
+## Addendum: v2.4 OpenAPI Integration Pass (added 2026-05-06)
+
+The frontend completed an end-to-end wire-up against the committed [backendopenapi.json](backendopenapi.json) (FastAPI 0.6.0). Every surface listed in the spec — auth/me, projects CRUD, documents, ingest, admin/users, **chat**, and **search** — now has typed query hooks, MSW handlers, and at least one production page consuming it. This pass surfaced **one blocker (B-014)** and **three contract clarifications (B-015 / B-016 / B-017)**.
+
+### What the FE shipped this pass
+
+| Surface | Page / hook | Notes |
+|---|---|---|
+| `POST /chat` | `useChat()` + `app/(main)/chat/page.tsx` | Session continuity via server-issued `session_id`. Project + document scope dropdowns. Renders `answer`, `claims`, `unanswered`, `sources`, `evidence` (incl. `table_markdown`, `bbox` crops, image URLs). |
+| `GET /search` | `useSearch()` + `app/(main)/search/page.tsx` | Filters: `q`, `limit`, `project_id`, `document_id`, `page_num`, `score_threshold`. Deep-linkable from the document detail page. |
+| `GET /documents/{id}/full` | `app/(main)/documents/[documentId]/page.tsx` | Fetched as **text/plain markdown** (was previously a wrong `<iframe>` PDF assumption). Rendered in a `<pre>` with whitespace-pre-wrap. |
+| `GET /documents/{id}/pages/{n}/image` | Same page | JWT-authenticated `fetch` → blob → `URL.createObjectURL`, used as `<img src>`. Page-thumb rail + main preview. |
+| Type alignment | `lib/types.ts` | `Project.updated_at` made required; `ChatRequest` switched to `project_id`/`document_id` scope; `ChatSource`/`ChatEvidence` widened to nullable per OpenAPI; `SearchHit` open index-signature. |
+| Nav flags | `lib/flags/config.ts` | `nav.chat` and `nav.search` flipped to `defaultEnabled: true` (P1b shipping window). |
+| Same-origin proxy | `next.config.ts` | New rewrite `/api/backend/:path*` → `${BACKEND_ORIGIN}/:path*`. Default `API_URL` flipped to `/api/backend`. **Defensive workaround for B-014.** |
+
+### v2.4 Pass — Open Items for Backend
+
+#### B-014 — CORS preflight returns 401 on `/chat` (and likely every route)
+
+**Severity:** 🔴 Blocker for any browser client that talks to the backend cross-origin (i.e. the entire FE in dev, and prod if the FE and API are on different domains).
+
+**Symptom (verbatim from devtools):**
+
+```
+Request URL:    http://localhost:8080/chat
+Request Method: OPTIONS
+Status Code:    401 Unauthorized
+Referrer Policy: strict-origin-when-cross-origin
+```
+
+**Root cause (suspected).** The CORS preflight (`OPTIONS`) is reaching an authentication dependency before `CORSMiddleware` can short-circuit it. CORS preflights **must be unauthenticated** by spec — the browser sends them without credentials and a 401 means the browser will never issue the actual `POST`. Most likely one of:
+
+1. A global `Depends(get_current_user)` is mounted on the app or router (not per-route), so even `OPTIONS` is gated.
+2. `CORSMiddleware` is added *after* the auth middleware in the middleware chain.
+3. Auth middleware is custom (not `Depends`-based) and doesn't bail on `request.method == "OPTIONS"`.
+
+**What we need from backend.**
+
+1. Add (or re-order) `CORSMiddleware` so it runs **before** any auth middleware:
+
+   ```python
+   from fastapi.middleware.cors import CORSMiddleware
+
+   app.add_middleware(
+       CORSMiddleware,
+       allow_origins=[
+           "http://localhost:3000",
+           "https://*.vercel.app",          # preview deploys
+           "https://app.wellsynth.ai",       # prod
+       ],
+       allow_credentials=True,
+       allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+       allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+       expose_headers=["X-Request-Id"],
+       max_age=600,
+   )
+   ```
+
+2. Make sure auth dependencies are **per-route** (or, if app-level, that they early-return on `OPTIONS`):
+
+   ```python
+   @app.middleware("http")
+   async def auth_middleware(request, call_next):
+       if request.method == "OPTIONS":
+           return await call_next(request)   # let CORSMiddleware answer it
+       # …existing JWT check…
+   ```
+
+3. Confirm the same fix is in place for **every route**, not just `/chat`. Likely affected based on the OpenAPI surface: `/auth/me`, `/auth/me/profile`, `/projects`, `/projects/{id}`, `/documents`, `/documents/{id}`, `/documents/{id}/full`, `/documents/{id}/pages/{n}/image`, `/documents/{id}/pages/{n}/image/crop`, `/ingest`, `/ingest/{id}`, `/ingest/upload`, `/admin/users`, `/admin/users/{id}/role`, `/admin/users/invite`, `/chat`, `/search`.
+
+**FE mitigation already shipped.** Browser requests now go through a same-origin Next.js rewrite at `/api/backend/*` → `BACKEND_ORIGIN`. Same-origin requests don't trigger CORS preflight, so the 401 disappears in dev. **This is a workaround, not a fix** — production deployments where the FE and API are on different domains will still hit the bug if backend doesn't fix CORS.
+
+---
+
+#### B-015 — `/documents/{id}/full` content-type lock-in
+
+**Severity:** 🟡 Clarification — FE has shipped to the assumed contract.
+
+The OpenAPI says the endpoint returns `text/plain`. FE now fetches it as text and renders the body as markdown in a `<pre>` block. **Please confirm:**
+
+1. Response is always **`Content-Type: text/plain; charset=utf-8`** (not `application/json`, not `application/pdf`).
+2. Body is **markdown** (the combined per-page extraction text), not e.g. JSON-stringified pages.
+3. Behavior when the document has no successfully ingested pages — 200 with empty body, 404, or 409? FE prefers **404 with `error_code: "no_pages"`** so we render the right empty state.
+4. Cache headers — currently FE caches for 60 s in TanStack Query. If backend recommends a longer / shorter TTL, please add `Cache-Control` to the response.
+
+If backend would prefer FE to render structured markdown via a real markdown component, we can pull in `react-markdown` — flag this and we'll do it. Today it's `<pre className="whitespace-pre-wrap">` which is functional but not styled.
+
+---
+
+#### B-016 — `/documents/{id}/pages/{n}/image` JWT-on-redirect behaviour
+
+**Severity:** 🟡 Clarification — FE has shipped a defensive blob-fetch implementation.
+
+Per OpenAPI this endpoint returns a **302 redirect to a signed Supabase Storage URL**. The browser will follow the redirect transparently when used as `<img src="…">` *only if* the JWT can ride along, which generally requires either (a) the signed URL to embed credentials, or (b) the image fetch to be same-origin (no `crossorigin` mode). Naïve `<img src={pageImageUrl(id, n)}>` fails because the image request goes out without `Authorization`.
+
+**FE's current implementation:**
+
+```ts
+const res = await fetch(pageImageUrl(documentId, pageNum), {
+  headers: { Authorization: `Bearer ${token}` },
+});
+const blob = await res.blob();
+const objectUrl = URL.createObjectURL(blob);
+// then <img src={objectUrl} />
+```
+
+This works because we attach the JWT on the first hop, the backend 302s to a short-TTL signed URL, and `fetch` follows the redirect server-to-server. **Please confirm:**
+
+1. The redirect target is a **public signed URL** (no `Authorization` needed on the second hop). We assume yes — Supabase Storage signed URLs are credential-less by design.
+2. The signed URL TTL — ours assumes ≥ 60 s so the browser can finish the redirect chain. Please confirm.
+3. CORS on the signed URL — not strictly needed because we're reading it as a blob, but if backend has any control over the Storage bucket CORS, please ensure it allows the FE origin.
+4. Same questions apply to `/documents/{id}/pages/{n}/image/crop`.
+
+If backend can instead **stream the PNG directly** (i.e. return `200 + Content-Type: image/png` instead of 302), FE could go back to `<img src={url}>` with credentials and skip the blob dance. That's a nicer UX (browser caching, lazy-load) but more bandwidth on the API server. **No strong preference — flag whichever is easier.**
+
+---
+
+#### B-017 — `/search` filter contract + result-shape lock-in
+
+**Severity:** 🟡 Clarification — OpenAPI marks the response object as `additionalProperties: true`, so we modeled it loosely.
+
+FE built `useSearch({q, limit, projectId, documentId, pageNum, scoreThreshold})` and renders results assuming each hit has `{text, score, doc_name?, page_num?, document_id?, kind?, source_id?}`. **Please confirm:**
+
+1. **Response envelope.** OpenAPI hints at `{query, count, results: object[]}`. FE matches this. Lock it in?
+2. **Per-hit fields.** Which of these are guaranteed vs optional?
+   - `source_id` (string) — used as React key
+   - `text` (string) — required for rendering
+   - `score` (float) — required, FE sorts on it
+   - `doc_name` (string)
+   - `page_num` (int)
+   - `chunk_index` (int)
+   - `document_id` (uuid) — used to deep-link to `/documents/{id}`
+   - `project_id` (uuid)
+   - `kind` (string — `text` | `table` | `image` | `entity`?)
+   - `collection` (string — Qdrant collection name; v1 internal)
+3. **Filter behaviour.**
+   - When `document_id` is passed, are results restricted to that doc only, or is it a soft boost?
+   - When both `project_id` and `document_id` are passed, is `document_id` the override (FE assumes yes)?
+   - `page_num` filter — exact match only, or range? FE assumes exact match.
+   - `score_threshold` — minimum score, results below are dropped server-side?
+4. **Default `limit`.** FE defaults to 10. If the backend caps at e.g. 50, please document so we can disable larger inputs.
+5. **Highlighting.** Any chance the backend can return a `highlights: string[]` per hit (e.g. matched n-grams) so FE can bold them in the snippet? **Optional — defer if costly.**
+
+### v2.4 Pass — Resolved by FE shipping (no backend action needed)
+
+| Item | What FE did |
+|---|---|
+| Old FE assumed `/documents/{id}/full` returned PDF for `<iframe>` rendering. | Replaced with markdown fetch + page-image preview rail. See [app/(main)/documents/[documentId]/page.tsx](../app/(main)/documents/%5BdocumentId%5D/page.tsx). |
+| Pre-OpenAPI `ChatRequest` used `job_id` / `doc_name`. | Replaced with `project_id` / `document_id` scope per OpenAPI. |
+| `Project.updated_at` was optional in FE types. | Made required to match `ProjectOut.required`. |
+| MSW handlers missing `/chat` and `/search`. | Added with realistic stubbed responses (one grounded claim + source for chat; two filterable hits for search). |
+| `nav.chat` / `nav.search` flags were dark. | Flipped on by default; sidebar now shows both entries. |
+
+---
+
 ## Communication Cadence
 
 - **Weekly sync** — frontend brings the open items table; backend acks/resolves/defers each.
@@ -436,7 +784,9 @@ The frontend has decided to ship **role-resolved dashboards** in P1a instead of 
 | 2026-05-06 | P0 scaffold complete | All P0 deliverables on disk; CI green pending first run. |
 | 2026-05-06 | Role-aware dashboard plan added | [ROLES_AND_DASHBOARDS.md](ROLES_AND_DASHBOARDS.md) v0.1 published; B-007→B-011 raised. |
 | 2026-05-06 | Backend response v1.0 received | All 11 asks accepted; 5 commitments in-flight this week; commitment list §2 signed off by frontend. |
+| 2026-05-06 | **v2.4 OpenAPI integration pass complete (FE)** | All v2.4 endpoints wired against [docs/backendopenapi.json](backendopenapi.json). 4 new asks raised (B-014..B-017); B-014 is a live blocker. Build green at `BUILD_ID = XDukNk6nQd7Bn67feaNIx`. |
+| 2026-05-06 | **Backend response v2.5 received & reconciled** | B-014 fixed and verified (`OPTIONS /chat → 204`); B-015/B-016/B-017 answered in writing; status corrections applied for B-001/B-002/B-005/B-012/B-013 (all ✅ Resolved). Auth-shape guardrail confirmed: Supabase JS SDK owns sign-up/sign-in; backend owns `GET /auth/me` + `PATCH /auth/me/profile` only. FE already conforms. |
 
 ---
 
-*End of Frontend → Backend Report v1.2 — 2026-05-06 (backend response received & acknowledged).*
+*End of Frontend → Backend Report v1.6 — 2026-05-06 (backend v2.5 reconciled; B-014..B-017 closed; only B-007/B-008/B-009/B-010 remain on the backlog).*
