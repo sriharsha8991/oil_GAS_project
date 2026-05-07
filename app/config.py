@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     database_url: str = ""
     worker_database_url: str = ""
 
+    # --- Email (Resend) — used to mail generated passwords on invite ---
+    resend_api_key: str = ""
+    resend_from_email: str = "no-reply@rax-resume.xyz"
+    resend_from_name: str = "Wellsynth"
+
     # --- CORS ---
     cors_allow_origins: str = "http://localhost:3000"  # comma-separated
 

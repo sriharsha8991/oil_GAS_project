@@ -15,14 +15,19 @@ class Base(DeclarativeBase):
 
 
 # Locked role enum — must match the SQL enum in migrations/0001_users_profile.sql
-# and the frontend's role list (FRONTEND_SPEC, ROLES_AND_DASHBOARDS).
+# + 0004_admin_role_and_quota.sql, and the frontend's role list.
 ROLE_VALUES = (
     "super_admin",
+    "admin",
     "drilling_engineer",
     "geologist",
     "asset_manager",
     "qa_steward",
 )
+
+# Roles permitted to invite users. 'admin' is org-scoped and quota-limited;
+# 'super_admin' is unrestricted.
+INVITER_ROLES = ("super_admin", "admin")
 
 
 class UserProfile(Base):
@@ -37,6 +42,15 @@ class UserProfile(Base):
         default="drilling_engineer",
     )
     organization: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Max users this admin may invite. 0 = unlimited (default for super_admin
+    # or unconfigured admins). Enforced in app layer at invite time.
+    user_quota: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    # auth.users.id of the inviter (null for super_admin or pre-existing users).
+    invited_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -27,6 +27,8 @@ ANON_PATHS: tuple[str, ...] = (
     "/docs",
     "/redoc",
     "/docs/oauth2-redirect",
+    "/auth/login",
+    "/auth/refresh",
 )
 ANON_PREFIXES: tuple[str, ...] = ("/static/",)
 
@@ -65,6 +67,11 @@ async def _load_profile(user_id: str, email: str) -> AuthUser | None:
 
 class SupabaseAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # CORS preflights must never be authenticated — let CORSMiddleware
+        # answer them. Without this, browsers see 401 on OPTIONS and never
+        # issue the real request.
+        if request.method == "OPTIONS":
+            return await call_next(request)
         if _is_anonymous(request.url.path):
             return await call_next(request)
 

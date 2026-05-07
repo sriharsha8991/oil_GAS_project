@@ -114,15 +114,12 @@ app = FastAPI(
 )
 
 
-# CORS — env-driven allow-list. Set CORS_ALLOW_ORIGINS to a comma-separated
-# list of origins (e.g. "http://localhost:3000,https://app.wellsynth.ai").
-_settings_for_cors = get_settings()
-_cors_origins = [
-    o.strip() for o in _settings_for_cors.cors_allow_origins.split(",") if o.strip()
-]
+# CORS — wide-open for now (any origin). We use allow_origin_regex=".*" instead
+# of allow_origins=["*"] so it composes with allow_credentials=True (the spec
+# forbids "*" + credentials, but echoing the request Origin is fine).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
