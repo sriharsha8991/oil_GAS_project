@@ -65,21 +65,53 @@ def _doc_to_dict(d: Document, latest_job: Job | None = None) -> dict[str, Any]:
     return out
 
 
-@router.get("", summary="List the calling user's documents")
+@router.get(
+    "",
+    summary="List documents (inlines latest_job per row)",
+)
 async def list_documents(
     user: AuthUser = Depends(current_user),
     project_id: str | None = Query(None),
+    scope: str = Query(
+        "mine",
+        regex="^(mine|all)$",
+        description="'mine' (default) returns the caller's documents. "
+                    "'all' returns every document and requires super_admin.",
+    ),
 ) -> dict[str, Any]:
+    if scope == "all" and user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="requires_super_admin")
+
     Session = get_session_factory()
     async with Session() as sess:
-        stmt = select(Document).where(Document.user_id == user.id)
+        stmt = select(Document)
+        if scope == "mine":
+            stmt = stmt.where(Document.user_id == user.id)
         if project_id:
             stmt = stmt.where(Document.project_id == project_id)
         stmt = stmt.order_by(desc(Document.created_at))
-        rows = (await sess.execute(stmt)).scalars().all()
+        rows = list((await sess.execute(stmt)).scalars().all())
+
+        # Inline the latest job per doc in a single bounded query (B-048).
+        latest_by_doc: dict[str, Job] = {}
+        if rows:
+            doc_ids = [r.id for r in rows]
+            jobs = (await sess.execute(
+                select(Job)
+                .where(Job.document_id.in_(doc_ids))
+                .order_by(Job.document_id, desc(Job.created_at))
+            )).scalars().all()
+            for j in jobs:
+                key = str(j.document_id)
+                if key not in latest_by_doc:
+                    latest_by_doc[key] = j
+
     return {
         "count": len(rows),
-        "documents": [_doc_to_dict(r) for r in rows],
+        "scope": scope,
+        "documents": [
+            _doc_to_dict(r, latest_by_doc.get(str(r.id))) for r in rows
+        ],
     }
 
 

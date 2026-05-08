@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from app.agents.rag import AgentResponse, run_agent
+from app.agents.rag import AgentResponse, run_agent, run_agent_stream
 from app.auth.deps import AuthUser, current_user
 from app.config import get_settings
 from app.db.engine import get_session_factory
 from app.db.models import Document, Project
+from app.db.queries.context_card import build_context_card, is_corpus_empty
 from app.utils.logging import get_logger
+from app.utils.sse import sse_pack
 from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
 
@@ -94,6 +98,7 @@ class ChatResponse(BaseModel):
     tool_calls_made: int = 0
     plan: dict | None = None
     assessment: dict | None = None
+    meta: dict | None = None
 
 
 @router.post("", summary="Chat with documents using RAG agent", response_model=ChatResponse)
@@ -131,6 +136,38 @@ async def chat(
 
     session_id = req.session_id or str(uuid.uuid4())
 
+    # ------------------------------------------------------------------
+    # Build context card (used by the guard + empty-corpus check).
+    # ------------------------------------------------------------------
+    try:
+        card = await build_context_card(
+            user_id=user.id,
+            role=user.role,
+            email=user.email,
+            display_name=user.display_name,
+            organization=user.organization,
+            project_id=req.project_id,
+            document_id=req.document_id,
+        )
+    except Exception:
+        logger.warning("chat_context_card_failed", exc_info=True)
+        card = {}
+
+    # Empty-corpus precondition — no point running the heavy pipeline if
+    # the user has zero documents under the relevant scope. This still
+    # short-circuits BEFORE the guard so we don't burn an LLM call.
+    if card and is_corpus_empty(card):
+        logger.info("chat_empty_corpus_softland", session_id=session_id)
+        return ChatResponse(
+            session_id=session_id,
+            status="no_evidence",
+            answer=(
+                "I don't have any documents indexed for you yet. "
+                "Upload a PDF and I'll be able to answer questions grounded in it."
+            ),
+            meta={"path": "empty_corpus_softland", "rag_invoked": False},
+        )
+
     try:
         result: AgentResponse = await run_agent(
             req.message,
@@ -139,6 +176,7 @@ async def chat(
             embedder=embedder,
             vector_store=vector_store,
             user_id=user.id,
+            card=card,
             project_id=req.project_id,
             document_id=req.document_id,
         )
@@ -192,22 +230,161 @@ async def chat(
         ))
 
     evidence = [EvidenceItem(**e) for e in result.evidence]
-    claims = [ClaimItem(text=c.text, source_id=c.source_id, confidence=c.confidence)
-              for c in result.claims]
-    unanswered = [UnansweredItem(facet=u.facet, reason=u.reason)
-                  for u in result.unanswered]
 
     return ChatResponse(
         session_id=session_id,
         status=result.status,
         answer=result.answer,
-        claims=claims,
-        unanswered=unanswered,
         followup=result.followup,
         sources=unique_sources,
         evidence=evidence,
         attached_pages=result.attached_pages,
         tool_calls_made=result.tool_calls_made,
-        plan=result.plan,
-        assessment=result.assessment,
+        meta=result.meta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming endpoint — Server-Sent Events
+# ---------------------------------------------------------------------------
+
+async def _validate_chat_scope(
+    *, user: AuthUser, project_id: str | None, document_id: str | None,
+) -> None:
+    if not (project_id or document_id):
+        return
+    Session = get_session_factory()
+    async with Session() as sess:
+        if project_id:
+            row = (await sess.execute(
+                select(Project).where(
+                    Project.id == project_id,
+                    Project.user_id == user.id,
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                raise HTTPException(status_code=404, detail="project not found")
+        if document_id:
+            row = (await sess.execute(
+                select(Document).where(
+                    Document.id == document_id,
+                    Document.user_id == user.id,
+                )
+            )).scalar_one_or_none()
+            if row is None:
+                raise HTTPException(status_code=404, detail="document not found")
+
+
+@router.post("/stream", summary="Chat with documents using RAG agent (SSE stream)")
+async def chat_stream(
+    request: Request,
+    req: ChatRequest,
+    user: AuthUser = Depends(current_user),
+) -> StreamingResponse:
+    """Streaming counterpart of ``POST /chat``.
+
+    Returns ``text/event-stream`` with a sequence of JSON-encoded SSE frames:
+
+    - ``{"event": "status", "phase": "guard"|"rag_search"|"synthesizing", ...}``
+    - ``{"event": "token",  "text": "..."}``
+    - ``{"event": "done",   "session_id", "status", "answer", "sources",
+                            "attached_pages", "tool_calls_made", "meta"}``
+
+    The non-streaming ``POST /chat`` remains the canonical path; this
+    endpoint is additive.
+    """
+    embedder, vector_store = _get_clients(request)
+    settings = get_settings()
+
+    await _validate_chat_scope(
+        user=user, project_id=req.project_id, document_id=req.document_id,
+    )
+
+    session_id = req.session_id or str(uuid.uuid4())
+
+    try:
+        card = await build_context_card(
+            user_id=user.id,
+            role=user.role,
+            email=user.email,
+            display_name=user.display_name,
+            organization=user.organization,
+            project_id=req.project_id,
+            document_id=req.document_id,
+        )
+    except Exception:
+        logger.warning("chat_stream_context_card_failed", exc_info=True)
+        card = {}
+
+    empty_softland: dict | None = None
+    if card and is_corpus_empty(card):
+        logger.info("chat_stream_empty_corpus_softland", session_id=session_id)
+        empty_softland = {
+            "event": "done",
+            "session_id": session_id,
+            "status": "no_evidence",
+            "answer": (
+                "I don't have any documents indexed for you yet. "
+                "Upload a PDF and I'll be able to answer questions grounded in it."
+            ),
+            "sources": [],
+            "attached_pages": [],
+            "tool_calls_made": 0,
+            "meta": {"path": "empty_corpus_softland", "rag_invoked": False},
+        }
+
+    async def event_source():
+        if empty_softland is not None:
+            yield sse_pack({
+                "event": "token",
+                "text": empty_softland["answer"],
+            })
+            yield sse_pack(empty_softland)
+            return
+
+        try:
+            async for ev in run_agent_stream(
+                req.message,
+                session_id=session_id,
+                settings=settings,
+                embedder=embedder,
+                vector_store=vector_store,
+                user_id=user.id,
+                card=card,
+                project_id=req.project_id,
+                document_id=req.document_id,
+            ):
+                if ev.get("event") == "done":
+                    ev = {**ev, "session_id": session_id}
+                yield sse_pack(ev)
+        except asyncio.CancelledError:
+            logger.info("chat_stream_client_disconnect", session_id=session_id)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "chat_stream_agent_error",
+                exc_info=True,
+                session_id=session_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            yield sse_pack({
+                "event": "done",
+                "session_id": session_id,
+                "status": "no_evidence",
+                "answer": "",
+                "sources": [],
+                "attached_pages": [],
+                "tool_calls_made": 0,
+                "meta": {"path": "error", "error": "agent_failed"},
+            })
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "Connection": "keep-alive",
+        },
     )

@@ -390,7 +390,11 @@ async def invite_user(
     # ---- 6. Email the password; roll back on send failure -----------------
     try:
         await send_password_email(
-            to_email=email, password=password, display_name=payload.display_name
+            to_email=email,
+            password=password,
+            display_name=payload.display_name,
+            kind="invite",
+            inviter_name=caller.display_name or caller.email,
         )
     except Exception as exc:
         logger.error("invite_email_failed_rollback", error=str(exc), email=email)
@@ -503,6 +507,8 @@ async def resend_invite(
             to_email=target.email,
             password=new_password,
             display_name=target.display_name,
+            kind="reset",
+            inviter_name=caller.display_name or caller.email,
         )
     except Exception as exc:
         logger.error("resend_email_failed", error=str(exc), email=target.email)

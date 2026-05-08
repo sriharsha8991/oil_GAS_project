@@ -111,7 +111,34 @@ app = FastAPI(
     version="0.6.0",
     lifespan=lifespan,
     openapi_tags=tags_metadata,
+    swagger_ui_parameters={"persistAuthorization": True},
 )
+
+
+# Make the Swagger UI "Authorize" button appear and apply a Bearer JWT to
+# every request. Paste a Supabase access_token (from POST /auth/login) once
+# and Swagger will reuse it for every call in this tab.
+def _custom_openapi() -> dict:
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=tags_metadata,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})[
+        "BearerAuth"
+    ] = {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+    schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[assignment]
 
 
 # CORS — wide-open for now (any origin). We use allow_origin_regex=".*" instead

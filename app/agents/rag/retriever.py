@@ -1,18 +1,23 @@
-"""Retrieval — fan out a QueryPlan across the 3 search tools, assess coverage,
-and run the recovery ladder when results are weak.
+"""Single-query fan-out RAG search across the 3 Qdrant collections.
+
+Used by the synthesizer's ``rag_search`` tool. The synthesizer (an LLM
+with function-calling) decides if/when/how to call this — including
+whether to decompose into multiple sub-queries (max 3 calls per turn).
+
+Images are pulled only when the caller asks for them; the synthesizer
+sets ``include_images=True`` only when the user explicitly mentioned a
+visual ("image", "figure", "diagram", "chart", "show me", etc.).
+
+Each search result is followed by a +/- 1 chunk_index neighbor expansion
+on the top narrative chunks to recover info that crosses chunk boundaries
+(definitions split across chunks, multi-paragraph procedures, etc.).
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
 
-from app.agents.rag.types import (
-    Bundle,
-    QueryPlan,
-    RetrievalAssessment,
-)
 from app.agents.rag_tools import (
     SearchResult,
     search_chunks,
@@ -25,447 +30,197 @@ from app.vectorstore.qdrant_store import QdrantVectorStore
 
 logger = get_logger(__name__)
 
-# Coverage / sufficiency thresholds
-_TOP_SCORE_OK = 0.45
-_TOP_SCORE_FLOOR = 0.40    # below this with no facet coverage → no_evidence
+# Number of top narrative chunks to expand neighbors for, per call.
+NEIGHBOR_EXPAND_TOP_K = 3
 
 
-# ---------------------------------------------------------------------------
-# Fan-out
-# ---------------------------------------------------------------------------
+_IMAGE_TRIGGER_RE = re.compile(
+    r"\b(image|images|figure|figures|diagram|diagrams|chart|charts|plot|plots|"
+    r"picture|pictures|photo|photos|map|maps|graph|graphs|visual|visuals|"
+    r"illustrat|sketch|screenshot|render|show me|see the)\b",
+    re.IGNORECASE,
+)
 
-async def retrieve(
-    plan: QueryPlan,
+
+def wants_images(message: str) -> bool:
+    """True iff the user message explicitly asks for visual content."""
+    return bool(_IMAGE_TRIGGER_RE.search(message or ""))
+
+
+async def rag_search(
+    query: str,
     *,
     embedder: GeminiEmbedder,
     vector_store: QdrantVectorStore,
     user_id: str,
     project_id: str | None = None,
     document_id: str | None = None,
+    include_images: bool = False,
+    chunk_limit: int = 8,
+    entity_limit: int = 6,
+    image_limit: int = 4,
     score_threshold: float = 0.3,
-    chunk_limit: int = 10,
-    entity_limit: int = 12,
-    image_limit: int = 5,
-) -> Bundle:
-    """Run all queries in the plan in parallel and return a merged Bundle."""
-    # Tabular intent → force table-kind chunks and pull more entities.
-    # Casing programs / BHA lists / depth tables live in the table chunks
-    # and the entity collection; making this deterministic removes a class
-    # of misses where the planner forgot to set chunk_kinds.
-    if plan.intent == "tabular":
-        if not plan.chunk_kinds:
-            plan.chunk_kinds = ["table"]
-        entity_limit = max(entity_limit, 20)
+) -> list[SearchResult]:
+    """Run chunks + entities (and optionally images) in parallel.
 
-    coros: list[asyncio.Task] = []
-    tags: list[str] = []
+    Returns a flat list deduped across collections and sorted by score.
+    """
+    if not query or not query.strip():
+        return []
 
-    for q in plan.chunk_queries:
-        coros.append(asyncio.create_task(search_chunks(
-            q,
-            embedder=embedder,
-            vector_store=vector_store,
-            user_id=user_id,
-            limit=chunk_limit,
-            project_id=project_id,
-            document_id=document_id,
+    coros: list = [
+        search_chunks(
+            query, embedder=embedder, vector_store=vector_store,
+            user_id=user_id, limit=chunk_limit,
+            project_id=project_id, document_id=document_id,
             score_threshold=score_threshold,
-            kinds=plan.chunk_kinds,
-        )))
-        tags.append("chunks")
-
-    for eq in plan.entity_queries:
-        coros.append(asyncio.create_task(search_entities(
-            eq.q,
-            embedder=embedder,
-            vector_store=vector_store,
-            user_id=user_id,
-            limit=entity_limit,
-            project_id=project_id,
-            document_id=document_id,
-            entity_type=eq.entity_type,
-            unit=eq.unit,
+        ),
+        search_entities(
+            query, embedder=embedder, vector_store=vector_store,
+            user_id=user_id, limit=entity_limit,
+            project_id=project_id, document_id=document_id,
             score_threshold=score_threshold,
-        )))
-        tags.append("entities")
-
-    if plan.use_images:
-        for q in plan.image_queries:
-            coros.append(asyncio.create_task(search_images(
-                q,
-                embedder=embedder,
-                vector_store=vector_store,
-                user_id=user_id,
-                limit=image_limit,
-                project_id=project_id,
-                document_id=document_id,
-                score_threshold=score_threshold,
-                image_types=plan.image_types,
-            )))
-            tags.append("images")
-
-    if not coros:
-        return Bundle()
+        ),
+    ]
+    if include_images:
+        coros.append(search_images(
+            query, embedder=embedder, vector_store=vector_store,
+            user_id=user_id, limit=image_limit,
+            project_id=project_id, document_id=document_id,
+            score_threshold=score_threshold,
+        ))
 
     results = await asyncio.gather(*coros, return_exceptions=True)
 
-    bundle = Bundle()
     seen: set[tuple] = set()
-
-    def _add(target: list[SearchResult], hits: list[SearchResult]) -> None:
-        for h in hits:
-            k = (h.collection, h.doc_name, h.page_num, h.chunk_index,
-                 h.table_id, h.canonical_id, tuple(h.bbox) if h.bbox else None)
-            if k in seen:
+    out: list[SearchResult] = []
+    for part in results:
+        if isinstance(part, Exception):
+            logger.warning("rag_search_part_failed", error=str(part))
+            continue
+        for h in part:
+            key = (
+                h.collection, h.doc_name, h.page_num, h.chunk_index,
+                h.table_id, h.canonical_id,
+                tuple(h.bbox) if h.bbox else None,
+            )
+            if key in seen:
                 continue
-            seen.add(k)
-            target.append(h)
+            seen.add(key)
+            out.append(h)
 
-    for tag, res in zip(tags, results):
-        if isinstance(res, Exception):
-            logger.warning("retrieve_tool_failed", tool=tag, error=str(res))
-            continue
-        if tag == "chunks":
-            _add(bundle.chunks, res)
-        elif tag == "entities":
-            _add(bundle.entities, res)
-        elif tag == "images":
-            _add(bundle.images, res)
-
-    # Re-sort each list by score (highest first).
-    bundle.chunks.sort(key=lambda r: r.score, reverse=True)
-    bundle.entities.sort(key=lambda r: r.score, reverse=True)
-    bundle.images.sort(key=lambda r: r.score, reverse=True)
-
-    logger.info(
-        "retrieve_done",
-        chunks=len(bundle.chunks),
-        entities=len(bundle.entities),
-        images=len(bundle.images),
-    )
-    return bundle
-
-
-# ---------------------------------------------------------------------------
-# Assessment — does the bundle cover what the plan asked for?
-# ---------------------------------------------------------------------------
-
-def _facet_tokens(facet: str) -> list[str]:
-    """Crude tokenization — split on _ and drop short stopwords."""
-    parts = [p.lower() for p in facet.replace("-", "_").split("_") if len(p) > 2]
-    return parts
-
-
-def _hit_text(r: SearchResult) -> str:
-    bits: list[str] = [r.text or ""]
-    if r.canonical_value:
-        bits.append(r.canonical_value)
-    if r.entity_type:
-        bits.append(r.entity_type)
-    if r.image_type:
-        bits.append(r.image_type)
-    if r.description:
-        bits.append(r.description)
-    if r.table_markdown:
-        bits.append(r.table_markdown[:500])
-    return " ".join(bits).lower()
-
-
-def assess(
-    plan: QueryPlan,
-    bundle: Bundle,
-    *,
-    top_score_threshold: float = _TOP_SCORE_OK,
-) -> RetrievalAssessment:
-    """Compute facet coverage + a sufficiency verdict."""
-    hits = bundle.all_hits()
-    if not hits:
-        return RetrievalAssessment(
-            sufficient=False,
-            top_score=0.0,
-            covered_facets=[],
-            missing_facets=list(plan.required_facets),
-            reason="no_hits",
-        )
-
-    top_score = max(h.score for h in hits)
-
-    if not plan.required_facets:
-        # No facet contract — fall back to score-only.
-        sufficient = top_score >= top_score_threshold
-        return RetrievalAssessment(
-            sufficient=sufficient,
-            top_score=top_score,
-            covered_facets=[],
-            missing_facets=[],
-            reason="ok" if sufficient else "low_score",
-        )
-
-    # Facet coverage: a facet is covered if any hit's text contains
-    # at least one meaningful token from the facet name.
-    blob = " ".join(_hit_text(h) for h in hits[:30])  # cap for speed
-    covered: list[str] = []
-    missing: list[str] = []
-    for facet in plan.required_facets:
-        toks = _facet_tokens(facet)
-        if not toks:
-            covered.append(facet)
-            continue
-        if any(t in blob for t in toks):
-            covered.append(facet)
-        else:
-            missing.append(facet)
-
-    sufficient = (
-        not missing
-        and top_score >= top_score_threshold
-    )
-    if not sufficient:
-        if missing and top_score >= top_score_threshold:
-            reason = "missing_facets"
-        elif top_score < top_score_threshold and not missing:
-            reason = "low_score"
-        else:
-            reason = "missing_facets"
-    else:
-        reason = "ok"
-
-    return RetrievalAssessment(
-        sufficient=sufficient,
-        top_score=top_score,
-        covered_facets=covered,
-        missing_facets=missing,
-        reason=reason,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Recovery ladder
-# ---------------------------------------------------------------------------
-
-async def broaden_retry(
-    plan: QueryPlan,
-    *,
-    embedder: GeminiEmbedder,
-    vector_store: QdrantVectorStore,
-    user_id: str,
-    project_id: str | None = None,
-    document_id: str | None = None,
-) -> Bundle:
-    """Rung 1 — drop kind/entity_type filters, lower threshold, raise limits."""
-    broadened = QueryPlan(
-        intent=plan.intent,
-        required_facets=plan.required_facets,
-        chunk_queries=plan.chunk_queries or [],
-        chunk_kinds=None,
-        entity_queries=[
-            type(eq)(q=eq.q, entity_type=None, unit=None)
-            for eq in plan.entity_queries
-        ],
-        image_queries=plan.image_queries,
-        image_types=None,
-        use_images=plan.use_images,
-        raw={"broadened": True},
-    )
-    return await retrieve(
-        broadened,
-        embedder=embedder,
+    out.sort(key=lambda h: h.score, reverse=True)
+    # Same-document +/-1 chunk_index neighbor expansion on the top narrative
+    # chunks. Cheap (one bounded scroll) and frequently turns "near miss"
+    # answers into complete ones when the relevant sentence sat across a
+    # chunk boundary.
+    await _expand_neighbors(
+        out,
         vector_store=vector_store,
         user_id=user_id,
         project_id=project_id,
         document_id=document_id,
-        score_threshold=0.15,
-        chunk_limit=20,
-        entity_limit=20,
-        image_limit=8,
     )
 
-
-def is_hard_floor(assessment: RetrievalAssessment) -> bool:
-    """Return True when retrieval is so weak we should refuse to answer."""
-    return (
-        assessment.top_score < _TOP_SCORE_FLOOR
-        and not assessment.covered_facets
+    logger.info(
+        "rag_search_done", query=query[:80], hits=len(out),
+        include_images=include_images,
     )
-
-
-def truncate_for_synth(
-    bundle: Bundle,
-    *,
-    chunk_top_k: int = 6,
-    entity_top_k: int = 12,
-    image_top_k: int = 4,
-) -> Bundle:
-    """Trim to top-K per collection before sending to the synthesizer."""
-    return Bundle(
-        chunks=bundle.chunks[:chunk_top_k],
-        entities=bundle.entities[:entity_top_k],
-        images=bundle.images[:image_top_k],
-    )
+    return out
 
 
 # ---------------------------------------------------------------------------
-# MMR — diversify chunks before truncation
+# Neighbor expansion (+/- 1 chunk_index within same doc + page)
 # ---------------------------------------------------------------------------
 
-_TOK_RE = re.compile(r"[a-z0-9]+")
-
-
-def _toks(text: str) -> set[str]:
-    if not text:
-        return set()
-    return {t for t in _TOK_RE.findall(text.lower()) if len(t) > 2}
-
-
-def _jaccard(a: set[str], b: set[str]) -> float:
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    if not inter:
-        return 0.0
-    return inter / len(a | b)
-
-
-def mmr_diversify_chunks(
-    bundle: Bundle,
-    *,
-    k: int = 8,
-    lambda_: float = 0.7,
-) -> None:
-    """Greedy lexical MMR over ``bundle.chunks`` (in place).
-
-    Cuts near-duplicate paragraphs that bloat the synthesizer prompt
-    without adding information. Operates on token Jaccard similarity so
-    we don't need to re-embed; cheap and effective for chunk-level dedup.
-
-    Mutates ``bundle.chunks`` in place: replaces the list with a
-    re-ordered, MMR-selected subset (size ≤ k). Original score is kept.
-    """
-    pool = list(bundle.chunks)
-    if len(pool) <= 1:
-        return
-
-    # Pre-tokenize once.
-    tokens = [_toks(c.text or "") for c in pool]
-    rel = [c.score for c in pool]  # relevance = retrieval score
-
-    selected: list[int] = []
-    # Seed with the top-scoring item.
-    selected.append(0)
-    remaining = list(range(1, len(pool)))
-
-    while remaining and len(selected) < k:
-        best_i = -1
-        best_score = -1e9
-        for i in remaining:
-            sim_to_selected = max(
-                _jaccard(tokens[i], tokens[s]) for s in selected
-            )
-            mmr = lambda_ * rel[i] - (1 - lambda_) * sim_to_selected
-            if mmr > best_score:
-                best_score = mmr
-                best_i = i
-        if best_i < 0:
-            break
-        selected.append(best_i)
-        remaining.remove(best_i)
-
-    bundle.chunks = [pool[i] for i in selected]
-    logger.info("retrieve_mmr_applied",
-                before=len(pool), after=len(bundle.chunks), lambda_=lambda_)
-
-
-async def expand_neighbors(
-    bundle: Bundle,
+async def _expand_neighbors(
+    results: list[SearchResult],
     *,
     vector_store: QdrantVectorStore,
     user_id: str,
-    top_k: int = 3,
-    project_id: str | None = None,
-    document_id: str | None = None,
-) -> int:
-    """Append same-page ``chunk_index ± 1`` neighbors of the top-K chunks.
+    project_id: str | None,
+    document_id: str | None,
+) -> None:
+    """Append +/- 1 chunk_index neighbors of the top narrative chunks (in place).
 
-    Mitigates information loss across chunk boundaries: a fact that starts at
-    the end of chunk N often continues at the start of chunk N+1, but vector
-    search may only surface one of them. We fetch and append the missing
-    neighbors as additional context (score=0.0), de-duped against existing
-    hits. Mutates ``bundle.chunks`` in place. Returns the number of neighbors
-    added.
+    - Only narrative chunks are expanded (table chunks are self-contained).
+    - Neighbors share (doc_name, page_num); we don't cross page boundaries
+      because the chunker resets chunk_index per page.
+    - Neighbor score is set just below the seed chunk so it never displaces
+      a real high-score hit in the synthesizer's view.
+    - Already-present (doc_name, page_num, chunk_index) keys are skipped.
     """
-    if not bundle.chunks:
-        return 0
-
-    # Existing (doc, page, idx) triples we already have.
-    existing: set[tuple[str | None, int | None, int | None]] = {
-        (c.doc_name, c.page_num, c.chunk_index) for c in bundle.chunks
-    }
-
-    keys: list[tuple[str, int, int]] = []
-    seen_keys: set[tuple[str, int, int]] = set()
-    for hit in bundle.chunks[:top_k]:
-        if not hit.doc_name or hit.page_num is None or hit.chunk_index is None:
+    seeds: list[SearchResult] = []
+    for r in results:
+        if r.collection != "wellsynthai_documents":
             continue
+        if r.kind == "table":
+            continue
+        if r.doc_name is None or r.page_num is None or r.chunk_index is None:
+            continue
+        seeds.append(r)
+        if len(seeds) >= NEIGHBOR_EXPAND_TOP_K:
+            break
+    if not seeds:
+        return
+
+    have: set[tuple] = {
+        (r.doc_name, r.page_num, r.chunk_index)
+        for r in results
+        if r.doc_name is not None
+        and r.page_num is not None
+        and r.chunk_index is not None
+    }
+    keys: list[tuple[str, int, int]] = []
+    for s in seeds:
         for delta in (-1, 1):
-            ci = hit.chunk_index + delta
+            ci = (s.chunk_index or 0) + delta
             if ci < 0:
                 continue
-            triple = (hit.doc_name, hit.page_num, ci)
-            if triple in existing or triple in seen_keys:
+            key = (s.doc_name, s.page_num, ci)
+            if key in have:
                 continue
-            seen_keys.add(triple)
-            keys.append(triple)
+            have.add(key)
+            keys.append(key)  # type: ignore[arg-type]
 
     if not keys:
-        return 0
+        return
 
-    raw = await vector_store.fetch_chunks_by_keys(
-        keys,
-        user_id=user_id,
-        project_id=project_id,
-        document_id=document_id,
-    )
-    if not raw:
-        return 0
+    try:
+        rows = await vector_store.fetch_chunks_by_keys(
+            keys,
+            user_id=user_id,
+            project_id=project_id,
+            document_id=document_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("neighbor_expand_failed", error=str(exc))
+        return
 
-    # Convert to SearchResult and append. Mark with score=0.0 so they don't
-    # disturb top-score / sort-based assessments.
-    added = 0
-    for r in raw:
-        triple = (r.get("doc_name"), r.get("page_num"), r.get("chunk_index"))
-        if triple in existing:
-            continue
-        existing.add(triple)
-        bundle.chunks.append(SearchResult(
-            text=r.get("text", ""),
-            score=0.0,
-            user_id=r.get("user_id"),
-            project_id=r.get("project_id"),
-            document_id=r.get("document_id"),
-            doc_name=r.get("doc_name"),
-            filename=r.get("filename"),
-            job_id=r.get("job_id"),
-            page_num=r.get("page_num"),
-            chunk_index=r.get("chunk_index"),
-            kind=r.get("kind"),
-            table_id=r.get("table_id"),
-            table_markdown=r.get("table_markdown"),
-            bbox=r.get("bbox"),
+    # Score each neighbor just below its seed so ordering stays stable.
+    seed_score = {
+        (s.doc_name, s.page_num): s.score for s in seeds
+    }
+    for row in rows:
+        seed_key = (row.get("doc_name"), row.get("page_num"))
+        score = max(0.0, seed_score.get(seed_key, 0.3) - 0.05)
+        results.append(SearchResult(
+            text=row.get("text", ""),
+            score=score,
+            user_id=row.get("user_id"),
+            project_id=row.get("project_id"),
+            document_id=row.get("document_id"),
+            doc_name=row.get("doc_name"),
+            filename=row.get("filename"),
+            job_id=row.get("job_id"),
+            page_num=row.get("page_num"),
+            chunk_index=row.get("chunk_index"),
+            kind=row.get("kind"),
+            table_id=row.get("table_id"),
+            table_markdown=row.get("table_markdown"),
+            bbox=row.get("bbox"),
             collection="wellsynthai_documents",
         ))
-        added += 1
-
-    if added:
-        logger.info("retrieve_neighbors_added", count=added,
-                    base_top_k=min(top_k, len(bundle.chunks) - added))
-    return added
-
-
-def assessment_to_dict(a: RetrievalAssessment) -> dict[str, Any]:
-    return {
-        "sufficient": a.sufficient,
-        "top_score": round(a.top_score, 4),
-        "covered_facets": a.covered_facets,
-        "missing_facets": a.missing_facets,
-        "reason": a.reason,
-    }
+    # Re-sort so the model sees descending scores after the merge.
+    results.sort(key=lambda h: h.score, reverse=True)
+    logger.info("neighbor_expanded", added=len(rows), seeds=len(seeds))

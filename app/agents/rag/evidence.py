@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.agents.rag.types import Bundle
 from app.agents.rag_tools import SearchResult
 
 
@@ -37,19 +36,11 @@ def source_dict(r: SearchResult, source_id: str) -> dict[str, Any]:
     }
 
 
-def build_sources(bundle: Bundle) -> list[dict[str, Any]]:
+def build_sources(results: list[SearchResult]) -> list[dict[str, Any]]:
     """Build the source list with stable Sn ids the synthesizer can cite."""
     sources: list[dict[str, Any]] = []
-    idx = 1
-    for r in bundle.chunks:
+    for idx, r in enumerate(results, start=1):
         sources.append(source_dict(r, f"S{idx}"))
-        idx += 1
-    for r in bundle.entities:
-        sources.append(source_dict(r, f"S{idx}"))
-        idx += 1
-    for r in bundle.images:
-        sources.append(source_dict(r, f"S{idx}"))
-        idx += 1
     return sources
 
 

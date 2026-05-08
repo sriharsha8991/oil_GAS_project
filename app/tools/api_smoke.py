@@ -376,6 +376,55 @@ def main() -> int:
 
         t_chat()
 
+        @step("POST /chat 'hi' -> guard reply, no RAG")
+        def t_chat_chitchat():
+            r = http.post(
+                "/chat",
+                json={"message": "hi"},
+                headers=h(),
+                timeout=30.0,
+            )
+            assert r.status_code == 200, f"{r.status_code} {r.text[:300]}"
+            body = r.json()
+            meta = body.get("meta") or {}
+            assert meta.get("rag_invoked") is False, meta
+            assert meta.get("path") in ("prefilter", "guard_reply"), meta
+            assert body.get("answer"), body
+
+        t_chat_chitchat()
+
+        @step("POST /chat 'what is my role?' -> guard reply, no RAG")
+        def t_chat_account():
+            r = http.post(
+                "/chat",
+                json={"message": "what is my role?"},
+                headers=h(),
+                timeout=60.0,
+            )
+            assert r.status_code == 200, f"{r.status_code} {r.text[:300]}"
+            body = r.json()
+            meta = body.get("meta") or {}
+            assert meta.get("rag_invoked") is False, meta
+            assert meta.get("path") == "guard_reply", meta
+
+        t_chat_account()
+
+        @step("POST /chat 'list my projects' -> guard reply, no RAG")
+        def t_chat_catalog():
+            r = http.post(
+                "/chat",
+                json={"message": "list my projects"},
+                headers=h(),
+                timeout=60.0,
+            )
+            assert r.status_code == 200, f"{r.status_code} {r.text[:300]}"
+            body = r.json()
+            meta = body.get("meta") or {}
+            assert meta.get("rag_invoked") is False, meta
+            assert meta.get("path") == "guard_reply", meta
+
+        t_chat_catalog()
+
         # ---------------- 8. Cleanup project ----------------
         if project_id["v"]:
 

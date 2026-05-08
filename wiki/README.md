@@ -18,6 +18,8 @@ the page that owns it — do not duplicate facts across pages.
 | 08 | [Deployment & Ops](08-deployment-and-ops.md) | Docker stack, env, scaling knobs, log channels |
 | 09 | [Testing](09-testing.md) | Unit, e2e, smoke; how to add a new test |
 | 10 | [Runbooks](10-runbooks.md) | Bootstrap super_admin, recover lost password, reset Qdrant, replay an ingest |
+| 11 | [Memory + ChatGPT-feel Roadmap](11-memory-and-chatgpt-roadmap.md) | Backend plan: STM/LTM, streaming, additional synth tools, verifier |
+| 12 | [Frontend Implementation Plan](12-frontend-implementation-plan.md) | FE plan companion to #11: streaming UI, memory drawer, chips, slash commands |
 
 ## How this wiki is maintained
 

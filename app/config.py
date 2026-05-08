@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     escalation_model: str = "models/gemini-3.1-pro-preview"           # iter 3 (FINAL)
 
     # --- Chat models (cheap, fast — context already curated by retrieval) ---
+    chat_triage_model: str = "models/gemini-3-flash-preview"    # LLM 0: route + meta-answer
     chat_planner_model: str = "models/gemini-3-flash-preview"   # LLM 1: query plan
     chat_synth_model: str = "models/gemini-3-flash-preview"          # LLM 2: grounded answer
 
@@ -72,6 +73,9 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     resend_from_email: str = "no-reply@rax-resume.xyz"
     resend_from_name: str = "Wellsynth"
+    # Optional sign-in URL embedded as a CTA button in invite/reset emails.
+    # Leave blank to render the email without a button.
+    sign_in_url: str = ""
 
     # --- CORS ---
     cors_allow_origins: str = "http://localhost:3000"  # comma-separated
