@@ -22,7 +22,11 @@ from typing import Any, AsyncIterator
 from google import genai
 
 from app.agents.rag.guard import guard, prefilter
-from app.agents.rag.sessions import get_session_async, save_session_async
+from app.agents.rag.sessions import (
+    TEMP_TTL_SECONDS,
+    get_session_async,
+    save_session_async,
+)
 from app.agents.rag.stm import (
     maybe_compress_history,
     render_history_block,
@@ -49,6 +53,7 @@ async def _post_turn_stm(
     settings: Settings,
     client: genai.Client,
     update_subject: bool,
+    temp: bool = False,
 ) -> None:
     """Best-effort post-turn STM maintenance: subject + rolling summary + save."""
     try:
@@ -64,7 +69,47 @@ async def _post_turn_stm(
             session=session, settings=settings, client=client,
         )
     finally:
-        await save_session_async(session_id, session)
+        await save_session_async(
+            session_id, session,
+            ttl=TEMP_TTL_SECONDS if temp else None,
+        )
+
+
+def _dispatch_memory_capture(
+    *, user_id: str, session_id: str,
+    user_message: str, assistant_message: str, status: str,
+    project_id: str | None = None,
+    temp: bool = False,
+) -> None:
+    """Fire-and-forget Celery dispatch for long-term memory extraction.
+
+    Skipped entirely in temp/incognito mode — no LTM persistence.
+    """
+    if temp:
+        return
+    if status != "answered" or not assistant_message:
+        return
+    try:
+        from app.workers.tasks.memory import extract_user_memory
+
+        extract_user_memory.delay(
+            user_id=user_id,
+            user_msg=user_message,
+            assistant_msg=assistant_message,
+            session_id=session_id,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("memory_capture_dispatch_failed",
+                       error=str(exc), session_id=session_id)
+
+
+async def _save(session_id: str, session, *, temp: bool) -> None:
+    """Save with the right TTL for normal vs temp/incognito sessions."""
+    await save_session_async(
+        session_id, session,
+        ttl=TEMP_TTL_SECONDS if temp else None,
+    )
 
 
 async def run_agent(
@@ -78,6 +123,7 @@ async def run_agent(
     card: dict | None = None,
     project_id: str | None = None,
     document_id: str | None = None,
+    temp: bool = False,
 ) -> AgentResponse:
     session = await get_session_async(session_id)
     history_text = render_history_block(session)
@@ -91,7 +137,7 @@ async def run_agent(
         logger.info("agent_prefilter_hit", session_id=session_id)
         session.add("user", user_message)
         session.add("assistant", pre.reply)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         return AgentResponse(
             status="answered",
             answer=pre.reply,
@@ -125,7 +171,7 @@ async def run_agent(
     if decision.action == "reply":
         session.add("user", user_message)
         session.add("assistant", decision.reply)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         return AgentResponse(
             status="answered",
             answer=decision.reply,
@@ -141,7 +187,7 @@ async def run_agent(
     if decision.action == "clarify":
         session.add("user", user_message)
         session.add("assistant", decision.clarification)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         return AgentResponse(
             status="clarification_requested",
             answer=decision.clarification,
@@ -191,7 +237,18 @@ async def run_agent(
         assistant_message=response.answer or "",
         settings=settings, client=client,
         update_subject=response.status == "answered",
+        temp=temp,
     ))
+
+    # Long-term memory capture — Celery task, no await.
+    _dispatch_memory_capture(
+        user_id=user_id, session_id=session_id,
+        user_message=user_message,
+        assistant_message=response.answer or "",
+        status=response.status,
+        project_id=project_id,
+        temp=temp,
+    )
 
     logger.info(
         "agent_done",
@@ -214,6 +271,7 @@ async def run_agent_stream(
     card: dict | None = None,
     project_id: str | None = None,
     document_id: str | None = None,
+    temp: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Streaming counterpart of ``run_agent``.
 
@@ -234,7 +292,7 @@ async def run_agent_stream(
         logger.info("agent_stream_prefilter_hit", session_id=session_id)
         session.add("user", user_message)
         session.add("assistant", pre.reply)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         yield {"event": "token", "text": pre.reply}
         yield {
             "event": "done",
@@ -274,7 +332,7 @@ async def run_agent_stream(
     if decision.action == "reply":
         session.add("user", user_message)
         session.add("assistant", decision.reply)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         yield {"event": "token", "text": decision.reply}
         yield {
             "event": "done",
@@ -295,7 +353,7 @@ async def run_agent_stream(
     if decision.action == "clarify":
         session.add("user", user_message)
         session.add("assistant", decision.clarification)
-        await save_session_async(session_id, session)
+        await _save(session_id, session, temp=temp)
         yield {"event": "token", "text": decision.clarification}
         yield {
             "event": "done",
@@ -360,7 +418,18 @@ async def run_agent_stream(
         assistant_message=final_answer,
         settings=settings, client=client,
         update_subject=(final_done.get("status") == "answered"),
+        temp=temp,
     ))
+
+    # Long-term memory capture — Celery task, no await.
+    _dispatch_memory_capture(
+        user_id=user_id, session_id=session_id,
+        user_message=user_message,
+        assistant_message=final_answer,
+        status=str(final_done.get("status") or ""),
+        project_id=project_id,
+        temp=temp,
+    )
 
     final_done["tool_calls_made"] = (final_done.get("tool_calls_made") or 0) + 1
     final_done["meta"] = {

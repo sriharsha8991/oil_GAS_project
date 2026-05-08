@@ -11,10 +11,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.agents.rag import AgentResponse, run_agent, run_agent_stream
+from app.agents.rag.slash import handle as handle_slash
+from app.agents.rag.title import generate_title
 from app.auth.deps import AuthUser, current_user
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.db.engine import get_session_factory
 from app.db.models import Document, Project
+from app.db.queries.chat_sessions import ensure_session, set_title
+from app.db.queries.chat_messages import append_turn
 from app.db.queries.context_card import build_context_card, is_corpus_empty
 from app.utils.logging import get_logger
 from app.utils.sse import sse_pack
@@ -38,6 +42,14 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(None, description="Session ID for conversation continuity")
     project_id: str | None = Field(None, description="Scope search to a specific project")
     document_id: str | None = Field(None, description="Scope search to a specific document")
+    temp: bool = Field(
+        False,
+        description=(
+            "Temp / incognito chat. Skips long-term memory capture and "
+            "uses a 1-hour Redis session TTL so the conversation evaporates "
+            "shortly after the user closes the tab."
+        ),
+    )
 
 
 class SourceInfo(BaseModel):
@@ -91,7 +103,8 @@ class ChatResponse(BaseModel):
     answer: str | None
     claims: list[ClaimItem] = []
     unanswered: list[UnansweredItem] = []
-    followup: str | None = None
+    followup: str | None = None  # deprecated; prefer ``followups``
+    followups: list[str] = []
     sources: list[SourceInfo] = []
     evidence: list[EvidenceItem] = []
     attached_pages: list[dict] = []
@@ -99,6 +112,69 @@ class ChatResponse(BaseModel):
     plan: dict | None = None
     assessment: dict | None = None
     meta: dict | None = None
+
+
+# ---------------------------------------------------------------------------
+# Sidebar persistence — index the conversation in chat_sessions so the
+# user can list / rename / delete it later. Skipped entirely for temp chats.
+# ---------------------------------------------------------------------------
+
+async def _persist_session_index(
+    *,
+    session_id: str,
+    user_id: str,
+    project_id: str | None,
+    user_message: str,
+    assistant_message: str | None,
+    settings: Settings,
+    sources: list[dict] | None = None,
+    meta: dict | None = None,
+) -> None:
+    """Best-effort: insert/touch the chat_sessions row + auto-title on turn 1
+    + write the user/assistant transcript rows.
+
+    Never raises into the request — title generation runs inline (cheap
+    Flash call, ~24 output tokens) on the first turn only.
+    """
+    Session = get_session_factory()
+    try:
+        async with Session() as sess:
+            row = await ensure_session(
+                sess,
+                session_id=session_id,
+                user_id=user_id,
+                project_id=project_id,
+            )
+            # First answered turn (message_count just went 0 -> 2). The
+            # ``title_pending`` flag also gates against re-titling on
+            # later turns even if the first was a clarify-only.
+            first_turn = row.message_count <= 2 and row.title_pending
+        # Write the transcript rows.
+        async with Session() as sess:
+            await append_turn(
+                sess,
+                session_id=session_id,
+                user_id=user_id,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                sources=sources,
+                meta=meta,
+            )
+        if first_turn and assistant_message:
+            title = await generate_title(
+                user_message=user_message,
+                assistant_message=assistant_message,
+                settings=settings,
+            )
+            async with Session() as sess:
+                await set_title(
+                    sess, session_id=session_id, user_id=user_id, title=title,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "chat_session_persist_failed",
+            session_id=session_id, error=str(exc),
+        )
 
 
 @router.post("", summary="Chat with documents using RAG agent", response_model=ChatResponse)
@@ -135,6 +211,18 @@ async def chat(
                     raise HTTPException(status_code=404, detail="document not found")
 
     session_id = req.session_id or str(uuid.uuid4())
+
+    # Slash commands short-circuit the agent entirely.
+    slash = await handle_slash(
+        message=req.message, user_id=user.id, session_id=session_id,
+    )
+    if slash is not None:
+        return ChatResponse(
+            session_id=session_id,
+            status=slash.status,
+            answer=slash.reply,
+            meta=slash.meta,
+        )
 
     # ------------------------------------------------------------------
     # Build context card (used by the guard + empty-corpus check).
@@ -179,6 +267,7 @@ async def chat(
             card=card,
             project_id=req.project_id,
             document_id=req.document_id,
+            temp=req.temp,
         )
     except Exception as exc:
         import traceback as _tb
@@ -231,11 +320,25 @@ async def chat(
 
     evidence = [EvidenceItem(**e) for e in result.evidence]
 
+    # Index the conversation for the sidebar (skipped for temp chats).
+    if not req.temp and result.status in ("answered", "clarification_requested"):
+        await _persist_session_index(
+            session_id=session_id,
+            user_id=user.id,
+            project_id=req.project_id,
+            user_message=req.message,
+            assistant_message=result.answer,
+            settings=settings,
+            sources=[s.model_dump() for s in unique_sources],
+            meta=result.meta,
+        )
+
     return ChatResponse(
         session_id=session_id,
         status=result.status,
         answer=result.answer,
-        followup=result.followup,
+        followup=result.followup or (result.followups[0] if result.followups else None),
+        followups=list(result.followups or []),
         sources=unique_sources,
         evidence=evidence,
         attached_pages=result.attached_pages,
@@ -302,6 +405,30 @@ async def chat_stream(
 
     session_id = req.session_id or str(uuid.uuid4())
 
+    # Slash commands short-circuit the agent entirely. We still emit a
+    # token + done frame so the FE renders the reply through the same UI
+    # path it uses for streamed answers.
+    slash = await handle_slash(
+        message=req.message, user_id=user.id, session_id=session_id,
+    )
+    if slash is not None:
+        async def _slash_stream():
+            yield sse_pack({"event": "token", "text": slash.reply})
+            yield sse_pack({
+                "event": "done",
+                "session_id": session_id,
+                "status": slash.status,
+                "answer": slash.reply,
+                "sources": [],
+                "attached_pages": [],
+                "tool_calls_made": 0,
+                "meta": slash.meta,
+            })
+
+        return StreamingResponse(
+            _slash_stream(), media_type="text/event-stream",
+        )
+
     try:
         card = await build_context_card(
             user_id=user.id,
@@ -342,6 +469,7 @@ async def chat_stream(
             yield sse_pack(empty_softland)
             return
 
+        last_done: dict | None = None
         try:
             async for ev in run_agent_stream(
                 req.message,
@@ -353,9 +481,11 @@ async def chat_stream(
                 card=card,
                 project_id=req.project_id,
                 document_id=req.document_id,
+                temp=req.temp,
             ):
                 if ev.get("event") == "done":
                     ev = {**ev, "session_id": session_id}
+                    last_done = ev
                 yield sse_pack(ev)
         except asyncio.CancelledError:
             logger.info("chat_stream_client_disconnect", session_id=session_id)
@@ -378,6 +508,30 @@ async def chat_stream(
                 "tool_calls_made": 0,
                 "meta": {"path": "error", "error": "agent_failed"},
             })
+            return
+
+        # After the stream closes — index for the sidebar (non-temp only).
+        if (
+            not req.temp
+            and last_done is not None
+            and last_done.get("status") in ("answered", "clarification_requested")
+        ):
+            try:
+                await _persist_session_index(
+                    session_id=session_id,
+                    user_id=user.id,
+                    project_id=req.project_id,
+                    user_message=req.message,
+                    assistant_message=last_done.get("answer") or "",
+                    settings=settings,
+                    sources=last_done.get("sources") or [],
+                    meta=last_done.get("meta") or {},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "chat_stream_session_persist_failed",
+                    session_id=session_id, error=str(exc),
+                )
 
     return StreamingResponse(
         event_source(),

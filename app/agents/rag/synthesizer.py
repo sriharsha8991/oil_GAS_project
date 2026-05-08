@@ -21,6 +21,7 @@ from google.genai import types
 from app.agents.rag.evidence import build_sources
 from app.agents.rag.retriever import rag_search, wants_images
 from app.agents.rag.types import AgentResponse
+from app.agents.rag.verifier import verify_answer
 from app.agents.rag_tools import SearchResult
 from app.config import Settings
 from app.storage.supabase_storage import SupabaseStorage
@@ -66,7 +67,75 @@ _RAG_TOOL = types.Tool(
                 },
                 required=["query"],
             ),
-        )
+        ),
+        types.FunctionDeclaration(
+            name="fetch_document_outline",
+            description=(
+                "Get the high-level shape of a single ingested document — "
+                "filename, page count, headings (with page numbers), table "
+                "count, image count, and ingestion timestamp. Use this for "
+                "questions about a document's STRUCTURE: 'tell me about "
+                "this document', 'what is in document X', 'how long is "
+                "this', 'what sections does it have'. Do NOT use for "
+                "content-detail questions (use rag_search for those). "
+                "Counts against the same 3-call budget as rag_search."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "document_id": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "The UUID of the document to outline. If the "
+                            "user is currently scoped to a single document, "
+                            "use that one; otherwise use the most relevant "
+                            "document_id from prior search results."
+                        ),
+                    ),
+                },
+                required=["document_id"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="fetch_table",
+            description=(
+                "Return the FULL markdown of a specific table from an "
+                "ingested document. rag_search truncates table cells to "
+                "~800 chars per result; use this tool when the user asks "
+                "to 'show the full table', 'expand that table', 'list "
+                "every row', or when you've identified a specific table "
+                "(by table_id or page) in prior search results and need "
+                "the complete content. Counts against the same 3-call "
+                "budget as rag_search."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "document_id": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "UUID of the document containing the table."
+                        ),
+                    ),
+                    "table_id": types.Schema(
+                        type=types.Type.STRING,
+                        description=(
+                            "The table_id from a prior search result "
+                            "(preferred). Omit if unknown and use page_num."
+                        ),
+                    ),
+                    "page_num": types.Schema(
+                        type=types.Type.INTEGER,
+                        description=(
+                            "0-indexed page number containing the table. "
+                            "Used only when table_id is unknown; returns "
+                            "all tables on that page."
+                        ),
+                    ),
+                },
+                required=["document_id"],
+            ),
+        ),
     ]
 )
 
@@ -82,15 +151,24 @@ this turn to you because it requires evidence from ingested documents.
 Workflow on every turn:
 
 1. Read the resolved query and the conversation history.
-2. Decide whether to decompose the question:
-   • Single-topic question (e.g. "What was NPT for Sajaa 6?") → ONE rag_search call.
-   • Multi-topic / comparison question (e.g. "Compare NPT and casing depth")
-     → up to 3 rag_search calls, one per sub-topic.
+2. Decide which tool(s) to call. You have a HARD budget of 3 tool calls
+   total (any combination of rag_search, fetch_document_outline, and
+   fetch_table).
+   • Document-shape question ("tell me about this document", "what's in
+     it", "how long is this", "what sections does it have") →
+     fetch_document_outline FIRST. One call is usually enough; you may
+     follow it with one rag_search for narrative if the user wants more.
+   • Full-table request ("show me the full NPT table", "every row",
+     "expand that table") AFTER you've identified a table_id from a prior
+     rag_search result → fetch_table(document_id, table_id).
+   • Single-topic content question ("What was NPT for Sajaa 6?") → ONE
+     rag_search call.
+   • Multi-topic / comparison content question ("Compare NPT and casing
+     depth") → up to 3 rag_search calls, one per sub-topic.
    • If your first call already returned strong, on-topic evidence, do NOT
      call again — answer.
-3. After at most 3 rag_search calls (a hard limit), produce the final answer.
-   You will not be allowed any more searches; do not pretend you can call
-   the tool again after that.
+3. After 3 tool calls (a hard limit) you will not be allowed any more
+   searches; do not pretend you can call a tool again after that.
 
 Final-answer rules (CRITICAL):
 
@@ -268,6 +346,234 @@ async def _load_page_pngs(
 
 
 # ---------------------------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------------------------
+
+async def _dispatch_tool_call(
+    *,
+    fc: Any,
+    calls_made: int,
+    embedder: GeminiEmbedder,
+    vector_store: QdrantVectorStore,
+    storage: SupabaseStorage | None,
+    user_id: str,
+    project_id: str | None,
+    document_id: str | None,
+    include_images: bool,
+) -> tuple[types.Part, list[SearchResult], bool, str | None]:
+    """Run a single function call. Returns (response_part, hits, counted, status_event_query).
+
+    ``counted`` is True iff this call should consume one of the 3 budget slots.
+    ``status_event_query`` is set for rag_search so streaming surfaces it.
+    """
+    name = fc.name or "rag_search"
+    args = dict(fc.args or {})
+
+    if name == "fetch_document_outline":
+        from app.db.queries.document_outline import fetch_outline
+
+        doc_id = (args.get("document_id") or document_id or "").strip()
+        if not doc_id:
+            return (
+                types.Part.from_function_response(
+                    name=name, response={"error": "document_id required"},
+                ),
+                [], False, None,
+            )
+        try:
+            outline = await fetch_outline(
+                document_id=doc_id, user_id=user_id,
+                storage=storage, vector_store=vector_store,
+            ) if storage is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("synth_outline_failed",
+                           document_id=doc_id, error=str(exc))
+            outline = None
+        if outline is None:
+            return (
+                types.Part.from_function_response(
+                    name=name,
+                    response={"error": f"document {doc_id} not found or "
+                                       "not owned by caller"},
+                ),
+                [], True, None,
+            )
+        logger.info("synth_outline_called", document_id=doc_id,
+                    pages=outline.get("page_count"))
+        return (
+            types.Part.from_function_response(
+                name=name,
+                response={
+                    "calls_remaining": max(0, MAX_RAG_CALLS - calls_made - 1),
+                    "outline": outline,
+                },
+            ),
+            [], True, None,
+        )
+
+    if name == "fetch_table":
+        doc_id = (args.get("document_id") or document_id or "").strip()
+        if not doc_id:
+            return (
+                types.Part.from_function_response(
+                    name=name, response={"error": "document_id required"},
+                ),
+                [], False, None,
+            )
+        table_id_arg = (args.get("table_id") or "").strip() or None
+        page_arg = args.get("page_num")
+        try:
+            page_num_arg = int(page_arg) if page_arg is not None else None
+        except (TypeError, ValueError):
+            page_num_arg = None
+        if table_id_arg is None and page_num_arg is None:
+            return (
+                types.Part.from_function_response(
+                    name=name,
+                    response={"error": "either table_id or page_num required"},
+                ),
+                [], False, None,
+            )
+        try:
+            tables = await vector_store.fetch_table_chunks(
+                user_id=user_id,
+                document_id=doc_id,
+                table_id=table_id_arg,
+                page_num=page_num_arg,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("synth_fetch_table_failed",
+                           document_id=doc_id, table_id=table_id_arg,
+                           page_num=page_num_arg, error=str(exc))
+            tables = []
+        # Display pages as 1-indexed for the model (matches user-facing).
+        for t in tables:
+            pn = t.get("page_num")
+            t["page"] = (pn + 1) if isinstance(pn, int) else None
+        logger.info("synth_fetch_table_called", document_id=doc_id,
+                    table_id=table_id_arg, page_num=page_num_arg,
+                    found=len(tables))
+        return (
+            types.Part.from_function_response(
+                name=name,
+                response={
+                    "calls_remaining": max(0, MAX_RAG_CALLS - calls_made - 1),
+                    "tables": tables,
+                },
+            ),
+            [], True, None,
+        )
+
+    # Default: rag_search
+    sub_query = (args.get("query") or "").strip()
+    if not sub_query:
+        return (
+            types.Part.from_function_response(
+                name=name, response={"error": "empty query"},
+            ),
+            [], False, None,
+        )
+    hits = await rag_search(
+        sub_query,
+        embedder=embedder, vector_store=vector_store,
+        user_id=user_id, project_id=project_id, document_id=document_id,
+        include_images=include_images,
+    )
+    return (
+        types.Part.from_function_response(
+            name=name,
+            response={
+                "calls_remaining": max(0, MAX_RAG_CALLS - calls_made - 1),
+                "results": _serialize_for_model(hits),
+            },
+        ),
+        hits, True, sub_query,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Follow-up suggestion chips
+# ---------------------------------------------------------------------------
+
+MAX_FOLLOWUPS = 3
+
+_FOLLOWUPS_SYSTEM = (
+    "You generate at most 3 short follow-up question suggestions a user "
+    "might naturally ask next, given the question they just asked and the "
+    "answer they just received. Constraints:\n"
+    "- Each suggestion is a complete question, max 12 words, no trailing period.\n"
+    "- Suggestions must be ANSWERABLE from the same set of ingested "
+    "well-operations documents (don't invent topics not implied by the "
+    "answer).\n"
+    "- Diverse: don't repeat the same topic three times.\n"
+    "- If the answer was 'no evidence', suggest reformulations or related "
+    "shapes the user could try.\n"
+    "Return ONLY a JSON object: {\"followups\": [\"...\", \"...\"]} — no "
+    "other keys, no commentary."
+)
+
+
+async def generate_followups(
+    *,
+    client: genai.Client,
+    settings: Settings,
+    user_message: str,
+    answer: str,
+    has_sources: bool,
+) -> list[str]:
+    """Best-effort follow-up suggestions. Returns ``[]`` on any failure."""
+    if not (answer or "").strip():
+        return []
+    user_block = (
+        f"User question:\n{user_message}\n\n"
+        f"Assistant answer:\n{answer}\n\n"
+        f"Answer was grounded in {'one or more' if has_sources else 'NO'} "
+        f"retrieved sources."
+    )
+    try:
+        resp = await client.aio.models.generate_content(
+            model=settings.chat_synth_model,
+            contents=[types.Content(role="user",
+                                    parts=[types.Part.from_text(text=user_block)])],
+            config=types.GenerateContentConfig(
+                system_instruction=_FOLLOWUPS_SYSTEM,
+                temperature=0.4,
+                max_output_tokens=256,
+                response_mime_type="application/json",
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synth_followups_error", error=str(exc),
+                       error_type=type(exc).__name__)
+        return []
+
+    raw = (getattr(resp, "text", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("synth_followups_bad_json", preview=raw[:120])
+        return []
+    items = data.get("followups") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip().rstrip(".?!")
+        if not text:
+            continue
+        if text in out:
+            continue
+        out.append(text)
+        if len(out) >= MAX_FOLLOWUPS:
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Synthesize
 # ---------------------------------------------------------------------------
 
@@ -360,33 +666,21 @@ async def synthesize(
                 logger.info("synth_rag_cap_reached", calls=calls_made)
                 response_parts.append(types.Part.from_function_response(
                     name=fc.name or "rag_search",
-                    response={"error": "search budget exhausted; produce the "
+                    response={"error": "tool budget exhausted; produce the "
                                        "final answer from prior results"},
                 ))
                 continue
-            args = dict(fc.args or {})
-            sub_query = (args.get("query") or "").strip()
-            if not sub_query:
-                response_parts.append(types.Part.from_function_response(
-                    name=fc.name or "rag_search",
-                    response={"error": "empty query"},
-                ))
-                continue
-            hits = await rag_search(
-                sub_query,
-                embedder=embedder, vector_store=vector_store,
+            part, hits, counted, _ = await _dispatch_tool_call(
+                fc=fc, calls_made=calls_made,
+                embedder=embedder, vector_store=vector_store, storage=storage,
                 user_id=user_id, project_id=project_id, document_id=document_id,
                 include_images=include_images,
             )
-            calls_made += 1
-            all_hits = _dedupe_merge(all_hits, hits)
-            response_parts.append(types.Part.from_function_response(
-                name=fc.name or "rag_search",
-                response={
-                    "calls_remaining": max(0, MAX_RAG_CALLS - calls_made),
-                    "results": _serialize_for_model(hits),
-                },
-            ))
+            if counted:
+                calls_made += 1
+            if hits:
+                all_hits = _dedupe_merge(all_hits, hits)
+            response_parts.append(part)
 
         contents.append(types.Content(role="user", parts=response_parts))
 
@@ -462,9 +756,26 @@ async def synthesize(
     else:
         status = "answered" if all_hits else "no_evidence"
 
+    followups = await generate_followups(
+        client=client, settings=settings,
+        user_message=user_message, answer=final_text,
+        has_sources=bool(all_hits),
+    )
+
+    # Source verifier — strip unsupported / hallucinated citations.
+    if status == "answered":
+        final_text, report = await verify_answer(
+            client=client, settings=settings,
+            answer=final_text, sources=sources,
+        )
+        verification_meta = report.to_dict()
+    else:
+        verification_meta = {"skipped": True}
+
     return AgentResponse(
         status=status,
         answer=final_text,
+        followups=followups,
         sources=sources,
         evidence=[],  # evidence cards retired; UI uses sources directly
         attached_pages=attached_pages,
@@ -473,6 +784,7 @@ async def synthesize(
             "rag_calls": calls_made,
             "include_images": include_images,
             "total_hits": len(all_hits),
+            "verification": verification_meta,
         },
     )
 
@@ -571,34 +883,35 @@ async def synthesize_stream(
                 logger.info("synth_stream_rag_cap_reached", calls=calls_made)
                 response_parts.append(types.Part.from_function_response(
                     name=fc.name or "rag_search",
-                    response={"error": "search budget exhausted; produce the "
+                    response={"error": "tool budget exhausted; produce the "
                                        "final answer from prior results"},
                 ))
                 continue
-            args = dict(fc.args or {})
-            sub_query = (args.get("query") or "").strip()
-            if not sub_query:
-                response_parts.append(types.Part.from_function_response(
-                    name=fc.name or "rag_search",
-                    response={"error": "empty query"},
-                ))
-                continue
-            yield {"event": "status", "phase": "rag_search", "query": sub_query}
-            hits = await rag_search(
-                sub_query,
-                embedder=embedder, vector_store=vector_store,
+            # Surface a status frame before the call so the FE can show
+            # "Searching documents…" / "Reading outline…".
+            tool_name = fc.name or "rag_search"
+            args_preview = dict(fc.args or {})
+            if tool_name == "rag_search":
+                preview = (args_preview.get("query") or "").strip()
+                if preview:
+                    yield {"event": "status", "phase": "rag_search",
+                           "query": preview}
+            elif tool_name == "fetch_document_outline":
+                yield {"event": "status", "phase": "fetch_document_outline"}
+            elif tool_name == "fetch_table":
+                yield {"event": "status", "phase": "fetch_table"}
+
+            part, hits, counted, _ = await _dispatch_tool_call(
+                fc=fc, calls_made=calls_made,
+                embedder=embedder, vector_store=vector_store, storage=storage,
                 user_id=user_id, project_id=project_id, document_id=document_id,
                 include_images=include_images,
             )
-            calls_made += 1
-            all_hits = _dedupe_merge(all_hits, hits)
-            response_parts.append(types.Part.from_function_response(
-                name=fc.name or "rag_search",
-                response={
-                    "calls_remaining": max(0, MAX_RAG_CALLS - calls_made),
-                    "results": _serialize_for_model(hits),
-                },
-            ))
+            if counted:
+                calls_made += 1
+            if hits:
+                all_hits = _dedupe_merge(all_hits, hits)
+            response_parts.append(part)
 
         contents.append(types.Content(role="user", parts=response_parts))
 
@@ -680,10 +993,26 @@ async def synthesize_stream(
     else:
         status = "answered" if all_hits else "no_evidence"
 
+    followups = await generate_followups(
+        client=client, settings=settings,
+        user_message=user_message, answer=final_text,
+        has_sources=bool(all_hits),
+    )
+
+    if status == "answered":
+        final_text, report = await verify_answer(
+            client=client, settings=settings,
+            answer=final_text, sources=sources,
+        )
+        verification_meta = report.to_dict()
+    else:
+        verification_meta = {"skipped": True}
+
     yield {
         "event": "done",
         "status": status,
         "answer": final_text,
+        "followups": followups,
         "sources": sources,
         "attached_pages": attached_pages,
         "tool_calls_made": calls_made,
@@ -691,5 +1020,6 @@ async def synthesize_stream(
             "rag_calls": calls_made,
             "include_images": include_images,
             "total_hits": len(all_hits),
+            "verification": verification_meta,
         },
     }

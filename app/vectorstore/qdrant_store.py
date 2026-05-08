@@ -393,5 +393,114 @@ class QdrantVectorStore:
         await self._delete_by_field("user_id", user_id)
         logger.info("qdrant_deleted_user", user_id=user_id)
 
+    # ------------------------------------------------------------------
+    # Counting helpers (used by document outline tool)
+    # ------------------------------------------------------------------
+
+    async def count_points(
+        self,
+        *,
+        collection: str,
+        user_id: str,
+        document_id: str,
+        kind: str | None = None,
+    ) -> int:
+        """Return the exact point count matching the scope filter."""
+        extras: list[models.Condition] = []
+        if kind is not None:
+            extras.append(
+                models.FieldCondition(
+                    key="kind", match=models.MatchValue(value=kind)
+                )
+            )
+        try:
+            res = await self._client.count(
+                collection_name=collection,
+                count_filter=self._scope_filter(
+                    user_id=user_id,
+                    document_id=document_id,
+                    extra=extras,
+                ),
+                exact=True,
+            )
+            return int(getattr(res, "count", 0) or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("qdrant_count_failed",
+                           collection=collection, error=str(exc))
+            return 0
+
+    # ------------------------------------------------------------------
+    # Table fetch (used by fetch_table tool)
+    # ------------------------------------------------------------------
+
+    async def fetch_table_chunks(
+        self,
+        *,
+        user_id: str,
+        document_id: str,
+        table_id: str | None = None,
+        page_num: int | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Return table chunks (kind=table) matching scope, with full markdown.
+
+        Owner-scoped via ``_scope_filter``. Filters further by ``table_id``
+        (preferred) or ``page_num`` (fallback when the model doesn't know
+        the table_id). Returns a list of {table_id, page_num, doc_name,
+        table_markdown, bbox, continues_on_next_page} dicts.
+        """
+        extras: list[models.Condition] = [
+            models.FieldCondition(
+                key="kind", match=models.MatchValue(value="table")
+            ),
+        ]
+        if table_id:
+            extras.append(
+                models.FieldCondition(
+                    key="table_id", match=models.MatchValue(value=table_id)
+                )
+            )
+        if page_num is not None:
+            extras.append(
+                models.FieldCondition(
+                    key="page_num", match=models.MatchValue(value=page_num)
+                )
+            )
+        try:
+            scrolled, _ = await self._client.scroll(
+                collection_name=CHUNKS_COLLECTION_DEFAULT,
+                scroll_filter=self._scope_filter(
+                    user_id=user_id,
+                    document_id=document_id,
+                    extra=extras,
+                ),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("qdrant_fetch_table_failed",
+                           document_id=document_id, table_id=table_id,
+                           error=str(exc))
+            return []
+
+        out: list[dict[str, Any]] = []
+        for p in scrolled:
+            payload = p.payload or {}
+            md = payload.get("table_markdown") or ""
+            if not md:
+                continue
+            out.append({
+                "table_id": payload.get("table_id"),
+                "page_num": payload.get("page_num"),
+                "doc_name": payload.get("doc_name"),
+                "table_markdown": md,
+                "bbox": payload.get("bbox"),
+                "continues_on_next_page": bool(
+                    (payload.get("extra") or {}).get("continues_on_next_page")
+                ),
+            })
+        return out
+
     async def close(self) -> None:
         await self._client.close()

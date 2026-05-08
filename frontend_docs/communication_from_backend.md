@@ -4,9 +4,9 @@
 >
 > **How to read:** §0.0 is the **current auth contract** and supersedes any earlier statement about Supabase JS, public signup, or "no /auth/login on backend." §0 is the PR-7 identity/storage contract. §1+ is historical commentary; treat it as background.
 >
-> **Last updated:** 2026-05-07 — **v2.5**. **Auth pivoted to invite-only.** Frontend no longer imports `@supabase/supabase-js`. Backend owns the entire credential surface (`/auth/login`, `/auth/refresh`, `/auth/change-password`, `/auth/me`, `/auth/me/profile`). Public signup is **gone**. New tier 'admin' between super_admin and end users; admins are org-scoped and quota-limited. See §0.0.
+> **Last updated:** 2026-05-08 — **v2.7**. Shipped on top of v2.6: **§13 OpenAPI snapshot + tightened CORS, slash commands (`/help` `/clear` `/forget` `/scope` `/temp`), grounded-answer source verifier, persistent chat transcript (Postgres) with `GET /chat/sessions/{id}/messages`, archive/unarchive endpoints**, plus the `tests/test_agents.py` cleanup (no more `--ignore`, 111/111 pass). v2.6 (2026-05-08) added §12; v2.5 (2026-05-07) flipped auth to invite-only — see §0.0.
 > **Owner:** Backend team.
-> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | **§0.0 Invite-only auth ✅** (new). §2.9 still Open.
+> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | §0.0 Invite-only auth ✅ | **§12 Memory + Chat Sessions ✅** (new). §2.9 still Open.
 
 ---
 
@@ -237,9 +237,9 @@ This is the versioned to-do for the backend team. Each item has an ID, a target 
 
 | ID | Item | Acceptance | Status |
 |---|---|---|---|
-| **C-01** | Generate + commit `openapi.json` to repo root | `npx openapi-typescript ../Wellsynthai/openapi.json` produces clean `lib/types.ts` | Open |
+| **C-01** | Generate + commit `openapi.json` to repo root | `npx openapi-typescript ../Wellsynthai/openapi.json` produces clean `lib/types.ts` | ✅ Done — `frontend_docs/openapi.json`, regenerate via `python -m app.tools.dump_openapi` |
 | **C-02** | Commit sanitized real `JobManifest` JSON to `docs/fixtures/job_manifest.json` | Frontend Zod schema validates the file | Open |
-| **C-03** | Tighten CORS to env-driven allow-list (`CORS_ALLOW_ORIGINS`, default `http://localhost:3000`) | Browser preflight from `localhost:3000` succeeds with `credentials: 'include'` | Open |
+| **C-03** | Tighten CORS to env-driven allow-list (`CORS_ALLOW_ORIGINS`, default `http://localhost:3000`) | Browser preflight from `localhost:3000` succeeds with `credentials: 'include'` | ✅ Done |
 | **C-04** | Add `Cache-Control: public, max-age=86400, immutable` to `/documents/{id}/pages/{n}/image` and `/crop` (replaces legacy `/ingest/{job_id}/...` paths) | DevTools network panel shows the header on second load (304 / from disk cache) | Open |
 | **C-05** | Document `Authorization: Bearer` pass-through in OpenAPI description | Description on every route mentions header is accepted-but-ignored in v1 | Open |
 
@@ -925,4 +925,259 @@ Both scripts admin-create throwaway users, exercise the full path, and clean up.
 
 ---
 
-*End of Backend → Frontend Communication v2.3 — 2026-05-06 (PR-5 + PR-5.1 + PR-6 shipped; ingestion artifacts now in Supabase Storage; auth required on `/ingest*`; page-image route 302's to signed URLs).*
+## 12. Memory + Chat Session Persistence (shipped 2026-05-08)
+
+Four user-facing capabilities were added in one push. All endpoints are auth-gated (Supabase JWT bearer, same as the rest of the API). Migration `0006_memory_toggle_and_project_scope.sql` and `0007_chat_sessions.sql` are applied; app/worker restarted clean.
+
+### 12.1 What's new at a glance
+
+| Capability | Surface | Storage |
+|---|---|---|
+| Cross-session memory toggle (per-user, default ON) | `GET/PATCH /memories/settings` | `users_profile.memory_enabled` (Postgres) |
+| Temp / incognito chat (no LTM, 1h Redis TTL) | `temp: true` flag on `/chat` + `/chat/stream` | Redis db2 with shorter TTL; never written to LTM or sidebar |
+| Project-scoped long-term memory (strict isolation) | Existing `project_id` on `/chat` + new query params on `/memories` | `user_memories.project_id` (Postgres, RLS-tightened) |
+| ChatGPT-style chat sidebar (list / rename / delete + auto-titles) | `GET/PATCH/DELETE /chat/sessions` | `public.chat_sessions` (Postgres) + Redis db2 STM unchanged |
+
+### 12.2 Memory toggle
+
+Per-user switch that controls **both** capture and recall of long-term memory. When off, `extract_user_memory` short-circuits and `fetch_top_memories` returns `[]`. Existing rows are preserved (audit trail) but never surfaced.
+
+| Method | Path | Body / Returns |
+|---|---|---|
+| `GET` | `/memories/settings` | `{ "memory_enabled": true }` |
+| `PATCH` | `/memories/settings` | `{ "memory_enabled": false }` → returns updated value |
+
+**FE:** one switch in user settings, default ON. Suggested copy: *"When off, the assistant won't save new long-term memories or use existing ones. Saved memories are kept but hidden until you turn this back on."*
+
+### 12.3 Temp / incognito chat
+
+A per-request flag on `/chat` and `/chat/stream`. Server-owned semantics:
+
+- **STM:** still works for multi-turn — the rolling messages, summary, and sticky subject are written to Redis under the same `chat:session:{id}` key — but with a **1-hour TTL** instead of 24h.
+- **LTM:** the Celery memory-extract task is never dispatched. Nothing reaches `user_memories`.
+- **Sidebar:** the conversation is not indexed in `chat_sessions` (see §12.5). It will not appear in the user's history list.
+
+```jsonc
+// POST /chat   (or /chat/stream)
+{
+  "message": "...",
+  "session_id": "<uuid or omit>",
+  "project_id": "<uuid or omit>",
+  "temp": true
+}
+```
+
+**FE:** ChatGPT-style ghost-icon toggle in the composer, **per-conversation, not global**. When on:
+
+- Send `temp: true` on every request in that conversation.
+- Visually distinguish (muted bg / "Temporary" badge in header).
+- Drop `session_id` from local state on page refresh so the conversation truly vanishes from the user's view; the Redis blob expires within an hour regardless.
+- Don't write the conversation to any "Recent chats" list.
+
+### 12.4 Project-scoped long-term memory (strict isolation)
+
+`user_memories` now carries a nullable `project_id` (FK → `projects.id`, `ON DELETE CASCADE`). RLS enforces that a user can only tag memories with projects they own. Recall is **strict**:
+
+- Chatting **inside** a project → server only surfaces memories with `project_id = X`.
+- Chatting **outside** any project → server only surfaces memories with `project_id IS NULL`.
+- **No mixing.** Global memories never leak into project chat; project memories never leak into global chat or another project. By design.
+
+Capture follows the same rule: the `project_id` sent on `/chat` is forwarded into the Celery task and stamped on every captured memory.
+
+**Management endpoints (existing `/memories` surface, gained query params):**
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/memories?project_id=<id>&project_scope=current` | List memories tagged to that project |
+| `GET` | `/memories?project_scope=all` | List **everything** the user owns (global + every project) — for the privacy panel |
+| `GET` | `/memories` | Default: list global/personal only |
+| `DELETE` | `/memories/{scope}/{key}?project_id=<id>` | Forget one memory (project or global if omitted) |
+| `POST` | `/memories/forget-all?project_id=<id>` | Wipe one project's memories |
+| `POST` | `/memories/forget-all?project_scope=all` | Wipe everything |
+
+Each memory row in the response now includes `project_id: string | null`.
+
+**Errors:** `404 project_not_found` when the user passes a `project_id` they don't own.
+
+**FE:** Privacy panel / "Manage memories" with tabs or filter for `Global | Project: <name> | All`. Group by `scope` (`identity`, `preference`, `project`). Per-row "Forget" + bulk "Forget all in this view". Optional small chip in project header: "N memories saved for this project".
+
+### 12.5 ChatGPT-style chat sidebar (sessions)
+
+A new `public.chat_sessions` table backs the sidebar. The full conversation STM (rolling messages, summary, sticky subject) still lives in Redis db2 with its TTL — `chat_sessions` is the **durable index** the user sees and manipulates. Temp / incognito chats are **never** indexed here.
+
+**Auto-title:** on the first answered turn, a tiny Flash call (≤ 24 output tokens, Title Case, 3-8 words) generates the title. On failure or "New chat" output, falls back to a truncation of the first user message. The row carries `title_pending: true` until the auto-titler completes.
+
+**Lifecycle:** `ensure_session` upserts on every answered turn — bumps `message_count` (+2 per turn = user + assistant) and refreshes `last_message_at`. Default sort is most recently active first.
+
+**Endpoints:**
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/chat/sessions?project_id=&project_scope=all\|current&include_archived=&limit=` | Sidebar list. `project_scope` defaults to `all` — every session the user owns. Pass `project_scope=current&project_id=<id>` to scope to one project. `include_archived` defaults to false. |
+| `PATCH` | `/chat/sessions/{id}` | Body `{ "title": string }` (1-120 chars). Clears `title_pending`. |
+| `DELETE` | `/chat/sessions/{id}` | Drops the row **and** the Redis STM blob — conversation truly resets. |
+
+**Response shape:**
+
+```jsonc
+{
+  "items": [
+    {
+      "id": "uuid",
+      "title": "Sajaa 6 EOWR — Kicks and NPT",
+      "title_pending": false,
+      "project_id": "uuid | null",
+      "message_count": 8,
+      "created_at": "2026-05-08T...",
+      "updated_at": "2026-05-08T...",
+      "last_message_at": "2026-05-08T...",
+      "archived_at": null
+    }
+  ]
+}
+```
+
+**Errors:** `404 session_not_found` on PATCH / DELETE for sessions the caller doesn't own (or that don't exist — same shape so we don't leak existence).
+
+**FE wiring:**
+
+1. **Sidebar:** call `GET /chat/sessions` on app load. Group by recency from `last_message_at` ("Today", "Yesterday", "Previous 7 days"). Show `title`. Three-dot menu → Rename (PATCH) / Delete (DELETE).
+2. **New Chat:** generate a UUIDv4 client-side, pass it as `session_id` on the first `/chat` call. The row is created server-side on the first answered turn; you don't need a "create session" endpoint.
+3. **Refresh after first turn:** when the SSE `done` event arrives (or the POST returns), refetch the sidebar so the auto-generated title appears. Alternatively, refetch only the affected row by polling `GET /chat/sessions` once a couple of seconds later — `title_pending` will flip to false.
+4. **Project view:** call with `project_scope=current&project_id=<id>` to show only that project's chats. Outside any project: call with no params (or `project_scope=current` with `project_id` omitted) for personal/global chats only.
+5. **Temp chats:** never appear here — that's the contract. The "Temporary" composer toggle replaces "save to history".
+
+### 12.6 STM lifetime — what to tell users
+
+Conversation memory (STM) lives in Redis with a sliding TTL (24h normal, 1h temp). Each new turn refreshes the TTL. After a long absence past the TTL, the conversation transcript itself is gone — the agent will not recall the literal back-and-forth. **Long-term memory in `user_memories` survives**, so the agent still recalls *who the user is and what they care about* (scoped to the right project), even when STM has expired. The `chat_sessions` row also survives indefinitely so the sidebar entry never disappears on its own — the user explicitly deletes it.
+
+If the user opens an old sidebar entry whose Redis STM has expired, the conversation appears to "start fresh" inside that same session_id. We're not persisting the message log to Postgres in v1; flag if you want it added.
+
+### 12.7 Migration + tooling
+
+```bash
+# Apply both new migrations
+.venv\Scripts\python.exe -m app.tools.apply_migrations
+# → apply 0006_memory_toggle_and_project_scope.sql
+# → apply 0007_chat_sessions.sql
+# → migrations done
+```
+
+74/74 backend tests pass (63 prior + 11 new for sessions + title gen). Live smoke: `GET/PATCH/DELETE /chat/sessions`, `GET/PATCH /memories/settings`, and the `/memories` list/delete variants all return 401 unauthenticated and 200/204 with a valid bearer.
+
+### 12.8 Removed FE-side code (cleanup)
+
+None of these new surfaces require Supabase JS — they're plain authenticated HTTP. The §0.0 invite-only auth model still applies; bearer the access token from `/auth/login` on every call.
+
+---
+
+## 13. Slash commands, source verifier, persistent transcript + archive (shipped 2026-05-08)
+
+This batch closes out the Sprint 5 backlog and the C-01 / C-03 hardening items in §2.1. Migration `0008_chat_messages.sql` is applied; `frontend_docs/openapi.json` has been regenerated; **111/111 tests pass with no `--ignore` flags.**
+
+### 13.1 At-a-glance
+
+| Item | Surface | What changed |
+|---|---|---|
+| C-01 OpenAPI snapshot | `frontend_docs/openapi.json` | New canonical snapshot. Regenerate with `python -m app.tools.dump_openapi`. |
+| C-03 CORS allow-list | `CORS_ALLOW_ORIGINS` env | Default `http://localhost:3000`. Comma-separated; `regex:<pattern>` entries become a regex alternation. `*` keeps the wide-open posture for local dev. |
+| Slash commands | `POST /chat` and `POST /chat/stream` | Messages starting with `/` short-circuit the agent and return immediately. |
+| Source verifier | `meta.verification` on every answered chat response | Strips citations the model hallucinated or that aren't supported by the cited snippet. |
+| Chat transcript | `chat_messages` table | One row per role-turn. `GET /chat/sessions/{id}/messages` hydrates the log. |
+| Archive / unarchive | `chat_sessions.archived_at` | `POST /chat/sessions/{id}/archive` + `…/unarchive`. Archived sessions disappear from the default sidebar. |
+
+### 13.2 CORS — new env var
+
+Set `CORS_ALLOW_ORIGINS` to a comma-separated list of exact origins. Examples:
+
+```
+CORS_ALLOW_ORIGINS=http://localhost:3000
+CORS_ALLOW_ORIGINS=http://localhost:3000,https://app.wellsynth.ai
+CORS_ALLOW_ORIGINS=http://localhost:3000,regex:https://.*\.vercel\.app
+```
+
+`*` (the default for local experiments) falls back to the prior wide-open `allow_origin_regex=".*"` posture. **In every other case credentials still flow** (the middleware echoes the request `Origin` against the allow-list).
+
+### 13.3 Slash commands
+
+Any chat message whose first non-whitespace character is `/` is intercepted before the RAG agent runs and returned as a normal `ChatResponse` (or SSE `token` + `done` for `/chat/stream`). The wire shape is unchanged — only `meta.path = "slash"` distinguishes it.
+
+| Command | Action |
+|---|---|
+| `/help` | Returns the command cheat-sheet. |
+| `/clear` | Drops the Redis STM blob for `session_id`. The next turn starts fresh. The sidebar row is **kept**. |
+| `/forget <key>` | Removes the matching long-term memory across `identity / preference / project` scopes. |
+| `/forget all` | Wipes every long-term memory the user owns. |
+| `/scope project=<uuid>` | Acknowledged hint. The FE must still set `project_id` on subsequent requests — this command does not retroactively re-scope past turns. |
+| `/scope clear` | Mirror of the above. |
+| `/temp on` / `/temp off` | Acknowledged hint. The FE must still send `temp: true|false` on subsequent requests. |
+
+Unknown commands return a polite "type /help" reply (still `status: "answered"`, no error).
+
+### 13.4 Source verifier
+
+Every answered, non-empty turn now goes through one extra Flash call after synthesis. The verifier:
+
+1. Parses `[Sn]` markers from the answer.
+2. Strips citations that point to a `source_id` we never returned (these are model hallucinations).
+3. Asks Flash whether each citation's claim sentence is actually supported by the cited snippet. Strips the marker when it isn't.
+
+The result is reported on `meta.verification`:
+
+```jsonc
+{
+  "verification": {
+    "cited_ids":      ["S1","S2","S3"],
+    "unknown_ids":    ["S9"],          // never returned — stripped
+    "unsupported_ids":["S2"],          // returned but off-topic — stripped
+    "checked":        2,
+    "skipped":        false,
+    "error":          null
+  }
+}
+```
+
+`skipped: true` means the answer had no citations to verify (chitchat / clarify replies). `error` is the Python exception class name when the Flash call failed; in that case the answer is returned unchanged. **The FE doesn't need to do anything to consume this** — the answer text already has bad citations removed before it lands. Surfacing a small "verified" badge from `verification.checked > 0 && unsupported_ids.length == 0` is optional polish.
+
+### 13.5 Persistent chat transcript
+
+Every answered turn now also writes both the user message and the assistant message to `public.chat_messages` (skipped for `temp: true`). One row per role-turn; assistants carry the serialized `sources[]` and `meta` so the FE can re-hydrate the same evidence cards from history.
+
+**Endpoint:**
+
+```
+GET /chat/sessions/{session_id}/messages?limit=200
+→ 200 { items: [{ id, role, content, sources, meta, created_at }, …] }
+→ 404 session_not_found
+```
+
+Order is chronological. Use this when the user opens an old sidebar entry whose Redis STM has expired — the conversation is no longer "fresh start"; the FE pre-fills the message log from this endpoint. STM still drives multi-turn reasoning; this transcript is a passive read.
+
+### 13.6 Archive / unarchive
+
+```
+POST /chat/sessions/{session_id}/archive       → 200 { archived: true }
+POST /chat/sessions/{session_id}/unarchive     → 200 { archived: false }
+```
+
+Both 404 with `session_not_found` if the caller doesn't own the session. Sets / clears `archived_at` on the row. The default sidebar list omits archived rows; pass `?include_archived=true` on `GET /chat/sessions` to show them.
+
+### 13.7 Migration + tooling
+
+```bash
+.venv\Scripts\python.exe -m app.tools.apply_migrations
+# → applies 0008_chat_messages.sql
+
+.venv\Scripts\python.exe -m app.tools.dump_openapi
+# → writes frontend_docs/openapi.json (35 paths)
+
+.venv\Scripts\python.exe -m pytest -q
+# → 111 passed
+```
+
+`tests/test_agents.py` is now in sync with the current 2-stage pipeline — there is no `--ignore` flag on the test command anymore.
+
+---
+
+*End of Backend → Frontend Communication v2.7 — 2026-05-08 (slash commands + source verifier + persistent transcript + archive on top of v2.6).*
+

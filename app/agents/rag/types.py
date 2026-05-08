@@ -68,7 +68,8 @@ class AgentResponse:
 
     status: str  # answered | no_evidence | clarification_requested
     answer: str | None = None
-    followup: str | None = None
+    followup: str | None = None  # legacy single-suggestion field; kept for one release
+    followups: list[str] = field(default_factory=list)  # 0..3 suggestion chips
     sources: list[dict[str, Any]] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     attached_pages: list[dict[str, Any]] = field(default_factory=list)

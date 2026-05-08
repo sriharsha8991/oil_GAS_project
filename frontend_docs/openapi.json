@@ -1,0 +1,3494 @@
+{
+  "components": {
+    "schemas": {
+      "ArchiveResponse": {
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "archived"
+        ],
+        "title": "ArchiveResponse",
+        "type": "object"
+      },
+      "Body_ingest_upload_ingest_upload_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "contentMediaType": "application/octet-stream",
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "project_id": {
+            "description": "Project to attach documents to",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "files"
+        ],
+        "title": "Body_ingest_upload_ingest_upload_post",
+        "type": "object"
+      },
+      "ChangePasswordRequest": {
+        "properties": {
+          "current_password": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "maxLength": 200,
+            "minLength": 8,
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "ChangePasswordRequest",
+        "type": "object"
+      },
+      "ChatRequest": {
+        "properties": {
+          "document_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Scope search to a specific document",
+            "title": "Document Id"
+          },
+          "message": {
+            "description": "User message / question",
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Scope search to a specific project",
+            "title": "Project Id"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session ID for conversation continuity",
+            "title": "Session Id"
+          },
+          "temp": {
+            "default": false,
+            "description": "Temp / incognito chat. Skips long-term memory capture and uses a 1-hour Redis session TTL so the conversation evaporates shortly after the user closes the tab.",
+            "title": "Temp",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "ChatRequest",
+        "type": "object"
+      },
+      "ChatResponse": {
+        "description": "Response from the chat endpoint.",
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "assessment": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assessment"
+          },
+          "attached_pages": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Attached Pages",
+            "type": "array"
+          },
+          "claims": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ClaimItem"
+            },
+            "title": "Claims",
+            "type": "array"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvidenceItem"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "followup": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Followup"
+          },
+          "followups": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Followups",
+            "type": "array"
+          },
+          "meta": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meta"
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SourceInfo"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_calls_made": {
+            "default": 0,
+            "title": "Tool Calls Made",
+            "type": "integer"
+          },
+          "unanswered": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/UnansweredItem"
+            },
+            "title": "Unanswered",
+            "type": "array"
+          }
+        },
+        "required": [
+          "session_id",
+          "status",
+          "answer"
+        ],
+        "title": "ChatResponse",
+        "type": "object"
+      },
+      "ClaimItem": {
+        "properties": {
+          "confidence": {
+            "default": "medium",
+            "title": "Confidence",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "source_id"
+        ],
+        "title": "ClaimItem",
+        "type": "object"
+      },
+      "DeleteResponse": {
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "DeleteResponse",
+        "type": "object"
+      },
+      "EvidenceItem": {
+        "description": "A single evidence card the UI can render alongside the answer.",
+        "properties": {
+          "bbox": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bbox"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "doc_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Name"
+          },
+          "image_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Type"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "page_num": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Num"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "table_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Id"
+          },
+          "table_markdown": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Markdown"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "EvidenceItem",
+        "type": "object"
+      },
+      "ForgetResponse": {
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "ForgetResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "IngestRequest": {
+        "properties": {
+          "file_paths": {
+            "description": "Absolute or relative server-side paths to PDF files.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "File Paths",
+            "type": "array"
+          },
+          "project_id": {
+            "description": "Project to attach documents to",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "file_paths"
+        ],
+        "title": "IngestRequest",
+        "type": "object"
+      },
+      "InviteRequest": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "organization": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Org for the invitee. Ignored for admin callers (auto = caller.org).",
+            "title": "Organization"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial role. Defaults to 'drilling_engineer'. Admins may pick any non-admin user role; super_admin may pick any.",
+            "title": "Role"
+          },
+          "user_quota": {
+            "anyOf": [
+              {
+                "maximum": 10000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only meaningful when inviting an 'admin'. Super_admin only.",
+            "title": "User Quota"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "InviteRequest",
+        "type": "object"
+      },
+      "InviteResponse": {
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "invited_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invited By"
+          },
+          "message": {
+            "default": "Invite email sent with a temporary password.",
+            "title": "Message",
+            "type": "string"
+          },
+          "organization": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "user_quota": {
+            "title": "User Quota",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "display_name",
+          "organization",
+          "user_quota",
+          "invited_by",
+          "created_at"
+        ],
+        "title": "InviteResponse",
+        "type": "object"
+      },
+      "LoginRequest": {
+        "properties": {
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          },
+          "password": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "LoginRequest",
+        "type": "object"
+      },
+      "MemoryItem": {
+        "properties": {
+          "confidence": {
+            "title": "Confidence",
+            "type": "number"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "scope": {
+            "title": "Scope",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "scope",
+          "key",
+          "value",
+          "confidence"
+        ],
+        "title": "MemoryItem",
+        "type": "object"
+      },
+      "MemoryListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "MemoryListResponse",
+        "type": "object"
+      },
+      "MemorySettings": {
+        "properties": {
+          "memory_enabled": {
+            "title": "Memory Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "memory_enabled"
+        ],
+        "title": "MemorySettings",
+        "type": "object"
+      },
+      "MemorySettingsUpdate": {
+        "properties": {
+          "memory_enabled": {
+            "title": "Memory Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "memory_enabled"
+        ],
+        "title": "MemorySettingsUpdate",
+        "type": "object"
+      },
+      "MessageItem": {
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "meta": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meta"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "sources": {
+            "anyOf": [
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sources"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "content"
+        ],
+        "title": "MessageItem",
+        "type": "object"
+      },
+      "MessageListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MessageItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "MessageListResponse",
+        "type": "object"
+      },
+      "ProfileUpdate": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "organization": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization"
+          }
+        },
+        "title": "ProfileUpdate",
+        "type": "object"
+      },
+      "ProjectCreate": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ProjectCreate",
+        "type": "object"
+      },
+      "ProjectOut": {
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ProjectOut",
+        "type": "object"
+      },
+      "ProjectUpdate": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "ProjectUpdate",
+        "type": "object"
+      },
+      "QuotaUpdate": {
+        "properties": {
+          "user_quota": {
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "User Quota",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "user_quota"
+        ],
+        "title": "QuotaUpdate",
+        "type": "object"
+      },
+      "RefreshRequest": {
+        "properties": {
+          "refresh_token": {
+            "minLength": 1,
+            "title": "Refresh Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "refresh_token"
+        ],
+        "title": "RefreshRequest",
+        "type": "object"
+      },
+      "RenameRequest": {
+        "properties": {
+          "title": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "RenameRequest",
+        "type": "object"
+      },
+      "RoleUpdate": {
+        "properties": {
+          "role": {
+            "description": "One of the locked role enum values",
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "RoleUpdate",
+        "type": "object"
+      },
+      "SessionItem": {
+        "properties": {
+          "archived_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_message_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Message At"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "title_pending": {
+            "title": "Title Pending",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "title_pending",
+          "message_count"
+        ],
+        "title": "SessionItem",
+        "type": "object"
+      },
+      "SessionListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SessionItem"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "SessionListResponse",
+        "type": "object"
+      },
+      "SourceInfo": {
+        "properties": {
+          "canonical_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonical Value"
+          },
+          "chunk_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chunk Index"
+          },
+          "collection": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "doc_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Name"
+          },
+          "entity_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entity Type"
+          },
+          "image_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Type"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "page_num": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Num"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "table_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Table Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "text",
+          "score"
+        ],
+        "title": "SourceInfo",
+        "type": "object"
+      },
+      "TokenBundle": {
+        "properties": {
+          "access_token": {
+            "title": "Access Token",
+            "type": "string"
+          },
+          "expires_in": {
+            "title": "Expires In",
+            "type": "integer"
+          },
+          "refresh_token": {
+            "title": "Refresh Token",
+            "type": "string"
+          },
+          "token_type": {
+            "default": "bearer",
+            "title": "Token Type",
+            "type": "string"
+          },
+          "user": {
+            "additionalProperties": true,
+            "title": "User",
+            "type": "object"
+          }
+        },
+        "required": [
+          "access_token",
+          "refresh_token",
+          "expires_in",
+          "user"
+        ],
+        "title": "TokenBundle",
+        "type": "object"
+      },
+      "UnansweredItem": {
+        "properties": {
+          "facet": {
+            "title": "Facet",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "facet",
+          "reason"
+        ],
+        "title": "UnansweredItem",
+        "type": "object"
+      },
+      "UserList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/UserRow"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "offset": {
+            "title": "Offset",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "UserList",
+        "type": "object"
+      },
+      "UserRow": {
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "invited_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invited By"
+          },
+          "organization": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Organization"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "user_quota": {
+            "title": "User Quota",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "display_name",
+          "organization",
+          "user_quota",
+          "invited_by",
+          "created_at"
+        ],
+        "title": "UserRow",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "bearerFormat": "JWT",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Well Operations Intelligence — Document Intelligence layer (L1). Per-page rasterized extraction with Gemini 3 Flash Preview self-validation + Gemini 3.1 Pro Preview escalation on flagged gaps, with bbox grounding for every table, image, and entity.",
+    "title": "WellSynth AI",
+    "version": "0.6.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Root  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Service root + capability summary",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/admin/users": {
+      "get": {
+        "operationId": "list_users_admin_users_get",
+        "parameters": [
+          {
+            "description": "Substring on email or display_name",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Substring on email or display_name",
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Role"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List users",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/invite": {
+      "post": {
+        "operationId": "invite_user_admin_users_invite_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Invite a user by email (admin or super_admin)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{user_id}": {
+      "delete": {
+        "operationId": "delete_user_admin_users__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete a user (admin: own org & non-admins only; super_admin: anyone)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{user_id}/quota": {
+      "patch": {
+        "operationId": "update_quota_admin_users__user_id__quota_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRow"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set how many users an admin may invite (super_admin only)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{user_id}/resend-invite": {
+      "post": {
+        "description": "Re-issue an invite.\n\n- Generates a fresh random password and updates auth.users.\n- Emails the new password via Resend.\n- Does NOT change role/org/quota.\n\nPermissions:\n- super_admin: may resend for anyone except themselves.\n- admin:      may resend only for non-admin users in their own org.",
+        "operationId": "resend_invite_admin_users__user_id__resend_invite_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InviteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate a new temporary password and email it to the user",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{user_id}/role": {
+      "patch": {
+        "operationId": "update_role_admin_users__user_id__role_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRow"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change a user's role (super_admin only)",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/auth/change-password": {
+      "post": {
+        "operationId": "change_password_auth_change_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change own password (requires current password)",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "operationId": "login_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenBundle"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sign in with email + password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "operationId": "me_auth_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Me Auth Me Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Current user profile",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/me/profile": {
+      "patch": {
+        "operationId": "update_my_profile_auth_me_profile_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update My Profile Auth Me Profile Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update own profile (display_name, organization)",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "operationId": "refresh_auth_refresh_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenBundle"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate access token using refresh token",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/chat": {
+      "post": {
+        "description": "Send a question and get an AI-synthesized answer grounded in documents.",
+        "operationId": "chat_chat_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat with documents using RAG agent",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/sessions": {
+      "get": {
+        "operationId": "list_chat_sessions_chat_sessions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "project_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|current)$",
+              "title": "Project Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List chat sessions",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/sessions/{session_id}": {
+      "delete": {
+        "operationId": "delete_chat_session_chat_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete a chat session",
+        "tags": [
+          "chat"
+        ]
+      },
+      "patch": {
+        "operationId": "rename_chat_session_chat_sessions__session_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionItem"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename a chat session",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/sessions/{session_id}/archive": {
+      "post": {
+        "operationId": "archive_chat_session_chat_sessions__session_id__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive a chat session (hides it from the default sidebar)",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/sessions/{session_id}/messages": {
+      "get": {
+        "operationId": "list_chat_session_messages_chat_sessions__session_id__messages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Hydrate the persisted message log for one session",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/sessions/{session_id}/unarchive": {
+      "post": {
+        "operationId": "unarchive_chat_session_chat_sessions__session_id__unarchive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchiveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore an archived chat session",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/chat/stream": {
+      "post": {
+        "description": "Streaming counterpart of ``POST /chat``.\n\nReturns ``text/event-stream`` with a sequence of JSON-encoded SSE frames:\n\n- ``{\"event\": \"status\", \"phase\": \"guard\"|\"rag_search\"|\"synthesizing\", ...}``\n- ``{\"event\": \"token\",  \"text\": \"...\"}``\n- ``{\"event\": \"done\",   \"session_id\", \"status\", \"answer\", \"sources\",\n                        \"attached_pages\", \"tool_calls_made\", \"meta\"}``\n\nThe non-streaming ``POST /chat`` remains the canonical path; this\nendpoint is additive.",
+        "operationId": "chat_stream_chat_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Chat with documents using RAG agent (SSE stream)",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/documents": {
+      "get": {
+        "operationId": "list_documents_documents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "'mine' (default) returns the caller's documents. 'all' returns every document and requires super_admin.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "mine",
+              "description": "'mine' (default) returns the caller's documents. 'all' returns every document and requires super_admin.",
+              "pattern": "^(mine|all)$",
+              "title": "Scope",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Documents Documents Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List documents (inlines latest_job per row)",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/documents/{document_id}": {
+      "delete": {
+        "operationId": "delete_document_documents__document_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Document Documents  Document Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete document + cascade",
+        "tags": [
+          "documents"
+        ]
+      },
+      "get": {
+        "operationId": "get_document_documents__document_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Document Documents  Document Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Document detail",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/documents/{document_id}/full": {
+      "get": {
+        "operationId": "get_full_document_documents__document_id__full_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Combined full-document markdown",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/documents/{document_id}/pages/{page_num}/image": {
+      "get": {
+        "operationId": "get_page_image_documents__document_id__pages__page_num__image_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "page_num",
+            "required": true,
+            "schema": {
+              "title": "Page Num",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rendered page PNG (302 to a short-TTL signed URL)",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/documents/{document_id}/pages/{page_num}/image/crop": {
+      "get": {
+        "operationId": "get_page_crop_documents__document_id__pages__page_num__image_crop_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "page_num",
+            "required": true,
+            "schema": {
+              "title": "Page Num",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ymin",
+            "required": true,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 0,
+              "title": "Ymin",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "xmin",
+            "required": true,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 0,
+              "title": "Xmin",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ymax",
+            "required": true,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 0,
+              "title": "Ymax",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "xmax",
+            "required": true,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 0,
+              "title": "Xmax",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Crop a bbox region from the rendered page PNG",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Health Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Liveness check",
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/ingest": {
+      "get": {
+        "operationId": "list_jobs_ingest_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Jobs Ingest Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List the calling user's ingestion jobs",
+        "tags": [
+          "ingest"
+        ]
+      },
+      "post": {
+        "operationId": "ingest_ingest_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ingest Ingest Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest one or more PDFs by path (async)",
+        "tags": [
+          "ingest"
+        ]
+      }
+    },
+    "/ingest/upload": {
+      "post": {
+        "operationId": "ingest_upload_ingest_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_ingest_upload_ingest_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ingest Upload Ingest Upload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload PDFs and ingest them",
+        "tags": [
+          "ingest"
+        ]
+      }
+    },
+    "/ingest/{job_id}": {
+      "get": {
+        "operationId": "get_job_status_ingest__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Job Status Ingest  Job Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Job status + summary",
+        "tags": [
+          "ingest"
+        ]
+      }
+    },
+    "/memories": {
+      "get": {
+        "operationId": "list_my_memories_memories_get",
+        "parameters": [
+          {
+            "description": "Optional scope filter. One of: preference, fact, project_pin, style.",
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional scope filter. One of: preference, fact, project_pin, style.",
+              "title": "Scope"
+            }
+          },
+          {
+            "description": "Filter to a single project. Pair with project_scope=current (default) for strict isolation. Omit to see global memories (project_scope=current) or use project_scope=all to see every memory across all projects.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to a single project. Pair with project_scope=current (default) for strict isolation. Omit to see global memories (project_scope=current) or use project_scope=all to see every memory across all projects.",
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "'current' (default): only the project scope identified by project_id (or global when project_id is omitted). 'all': every memory the user owns across all projects.",
+            "in": "query",
+            "name": "project_scope",
+            "required": false,
+            "schema": {
+              "default": "current",
+              "description": "'current' (default): only the project scope identified by project_id (or global when project_id is omitted). 'all': every memory the user owns across all projects.",
+              "pattern": "^(current|all)$",
+              "title": "Project Scope",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the caller's stored memories",
+        "tags": [
+          "memories"
+        ]
+      }
+    },
+    "/memories/forget-all": {
+      "post": {
+        "operationId": "forget_everything_memories_forget_all_post",
+        "parameters": [
+          {
+            "description": "If set, only forget memories in this project's scope. If omitted with project_scope=current, only forget the global tier. Use project_scope=all to nuke every memory across every project.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "If set, only forget memories in this project's scope. If omitted with project_scope=current, only forget the global tier. Use project_scope=all to nuke every memory across every project.",
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "'current' (default): only delete in the resolved scope. 'all': delete every memory the user owns.",
+            "in": "query",
+            "name": "project_scope",
+            "required": false,
+            "schema": {
+              "default": "current",
+              "description": "'current' (default): only delete in the resolved scope. 'all': delete every memory the user owns.",
+              "pattern": "^(current|all)$",
+              "title": "Project Scope",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgetResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forget every memory for the caller",
+        "tags": [
+          "memories"
+        ]
+      }
+    },
+    "/memories/settings": {
+      "get": {
+        "operationId": "get_settings_memories_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get the caller's memory toggle",
+        "tags": [
+          "memories"
+        ]
+      },
+      "patch": {
+        "operationId": "update_settings_memories_settings_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorySettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySettings"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Toggle cross-session memory on/off",
+        "tags": [
+          "memories"
+        ]
+      }
+    },
+    "/memories/{scope}/{key}": {
+      "delete": {
+        "operationId": "forget_one_memories__scope___key__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          },
+          {
+            "description": "If set, forget the memory in this project's scope; otherwise forget the global (personal) one. Project memories are isolated.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "If set, forget the memory in this project's scope; otherwise forget the global (personal) one. Project memories are isolated.",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgetResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forget a single memory",
+        "tags": [
+          "memories"
+        ]
+      }
+    },
+    "/projects": {
+      "get": {
+        "operationId": "list_projects_projects_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Projects Projects Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List the calling user's projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "create_project_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create a project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/projects/{project_id}": {
+      "delete": {
+        "description": "Delete project, all its documents/jobs (DB cascade), Storage objects,\nand Qdrant points.",
+        "operationId": "delete_project_projects__project_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Project Projects  Project Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete project + cascade",
+        "tags": [
+          "projects"
+        ]
+      },
+      "get": {
+        "operationId": "get_project_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "operationId": "update_project_projects__project_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/search": {
+      "get": {
+        "description": "Embed the query and search Qdrant for similar document chunks.",
+        "operationId": "search_search_get",
+        "parameters": [
+          {
+            "description": "Search query",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "description": "Search query",
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max results",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "description": "Max results",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by project",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by project",
+              "title": "Project Id"
+            }
+          },
+          {
+            "description": "Filter by document",
+            "in": "query",
+            "name": "document_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by document",
+              "title": "Document Id"
+            }
+          },
+          {
+            "description": "Filter by page number",
+            "in": "query",
+            "name": "page_num",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by page number",
+              "title": "Page Num"
+            }
+          },
+          {
+            "description": "Min similarity score",
+            "in": "query",
+            "name": "score_threshold",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 1.0,
+                  "minimum": 0.0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Min similarity score",
+              "title": "Score Threshold"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Search Search Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic search across ingested documents",
+        "tags": [
+          "search"
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "description": "Document Intelligence pipeline (L1). Upload PDFs, run the streaming per-page extraction graph, and serve grounded evidence (page PNGs, bbox crops, tables, entities, traces).",
+      "name": "ingest"
+    },
+    {
+      "description": "Semantic search over ingested document chunks. Embed a query with Gemini text-embedding-004 and retrieve the most relevant passages from Qdrant.",
+      "name": "search"
+    },
+    {
+      "description": "RAG agent chat — ask questions about ingested documents. The agent searches, reasons, and synthesizes grounded answers with source citations.",
+      "name": "chat"
+    },
+    {
+      "description": "Health, root, and service metadata.",
+      "name": "system"
+    }
+  ]
+}

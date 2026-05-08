@@ -15,8 +15,10 @@ from app.config import get_settings
 from app.db.engine import dispose_engine
 from app.routes.admin_users import router as admin_users_router
 from app.routes.chat import router as chat_router
+from app.routes.chat_sessions import router as chat_sessions_router
 from app.routes.documents import router as documents_router
 from app.routes.ingest import router as ingest_router
+from app.routes.memories import router as memories_router
 from app.routes.projects import router as projects_router
 from app.routes.search import router as search_router
 from app.utils.gemini_client import GeminiClient
@@ -141,16 +143,38 @@ def _custom_openapi() -> dict:
 app.openapi = _custom_openapi  # type: ignore[assignment]
 
 
-# CORS — wide-open for now (any origin). We use allow_origin_regex=".*" instead
-# of allow_origins=["*"] so it composes with allow_credentials=True (the spec
-# forbids "*" + credentials, but echoing the request Origin is fine).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=".*",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — env-driven allow-list (C-03). `CORS_ALLOW_ORIGINS` is a
+# comma-separated list of exact origins. A bare "*" entry falls back to
+# wide-open (regex .*) for local experimentation; the default is
+# http://localhost:3000 only.
+def _build_cors_kwargs() -> dict:
+    raw = (get_settings().cors_allow_origins or "").strip()
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    if not entries or entries == ["*"]:
+        return {
+            "allow_origin_regex": ".*",
+            "allow_credentials": True,
+            "allow_methods": ["*"],
+            "allow_headers": ["*"],
+            "expose_headers": ["Content-Disposition"],
+        }
+    # Optional Vercel-preview pattern: any entry starting with "regex:" is
+    # treated as a regex; collected ones become a single alternation.
+    plain = [e for e in entries if not e.startswith("regex:")]
+    regexes = [e[len("regex:"):] for e in entries if e.startswith("regex:")]
+    kwargs: dict = {
+        "allow_origins": plain,
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+        "expose_headers": ["Content-Disposition"],
+    }
+    if regexes:
+        kwargs["allow_origin_regex"] = "|".join(f"({r})" for r in regexes)
+    return kwargs
+
+
+app.add_middleware(CORSMiddleware, **_build_cors_kwargs())
 
 # Auth — verifies Supabase JWT on every non-anonymous route.
 app.add_middleware(SupabaseAuthMiddleware)
@@ -163,6 +187,8 @@ app.include_router(documents_router)
 app.include_router(ingest_router)
 app.include_router(search_router)
 app.include_router(chat_router)
+app.include_router(chat_sessions_router)
+app.include_router(memories_router)
 
 
 # ---------------------------------------------------------------------------

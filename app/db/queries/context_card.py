@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.engine import get_session_factory
 from app.db.models import Document, Job, Project, UserProfile
+from app.db.queries.memories import fetch_top_memories, get_memory_enabled
 
 MAX_PROJECTS = 10
 MAX_DOCUMENTS = 10
@@ -217,6 +218,16 @@ async def build_context_card(
         recent_documents = await _recent_documents(sess, user_id)
         in_progress_jobs = await _in_progress(sess, user_id)
         quota_remaining = await _quota_remaining(sess, user_id, role, user_quota)
+        # Memory toggle gates BOTH global and project-scoped recall.
+        memory_enabled = await get_memory_enabled(sess, user_id=user_id)
+        if memory_enabled:
+            # Strict isolation: project scope sees only project memories,
+            # global scope sees only global memories.
+            memories = await fetch_top_memories(
+                sess, user_id=user_id, project_id=project_id,
+            )
+        else:
+            memories = []
 
     project_count = len(projects)
     doc_count = sum(p["doc_count"] for p in projects)
@@ -241,6 +252,7 @@ async def build_context_card(
             "can_change_roles": role == "super_admin",
             "user_quota_remaining": quota_remaining,
         },
+        "memories": memories,
     }
 
 

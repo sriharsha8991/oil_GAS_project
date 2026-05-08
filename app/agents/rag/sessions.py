@@ -27,6 +27,10 @@ logger = get_logger(__name__)
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/2")
 _KEY_PREFIX = "chat:session:"
 _TTL_SECONDS = 24 * 3600
+# Temp/incognito chats use a much shorter Redis TTL. The session is still
+# usable for multi-turn STM during the conversation but evaporates fast
+# (matches the "vanishes on refresh" UX — FE drops session_id on reload).
+TEMP_TTL_SECONDS = 60 * 60
 
 _client_singleton: aioredis.Redis | None = None
 
@@ -73,14 +77,17 @@ async def get_session_async(session_id: str) -> ChatSession:
     return ChatSession()
 
 
-async def save_session_async(session_id: str, session: ChatSession) -> None:
-    """Persist a session to Redis with a sliding 24h TTL."""
+async def save_session_async(
+    session_id: str, session: ChatSession, *, ttl: int | None = None,
+) -> None:
+    """Persist a session to Redis. ``ttl`` overrides the default 24h."""
+    expiry = ttl if ttl is not None else _TTL_SECONDS
     try:
         r = _client()
         await r.set(
             f"{_KEY_PREFIX}{session_id}",
             _serialize(session),
-            ex=_TTL_SECONDS,
+            ex=expiry,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("session_redis_set_failed", error=str(exc), session_id=session_id)

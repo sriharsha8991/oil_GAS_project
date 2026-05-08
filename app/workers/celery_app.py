@@ -24,7 +24,7 @@ celery_app = Celery(
     "wellsynthai",
     broker=broker_url,
     backend=result_backend,
-    include=["app.workers.tasks.ingest"],
+    include=["app.workers.tasks.ingest", "app.workers.tasks.memory"],
 )
 
 celery_app.conf.update(
