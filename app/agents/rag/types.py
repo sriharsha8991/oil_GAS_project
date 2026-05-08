@@ -20,7 +20,7 @@ MAX_HISTORY_TURNS = 10
 
 
 # ---------------------------------------------------------------------------
-# Conversation memory (in-process — single-worker only)
+# Conversation memory (Redis-backed; see app/agents/rag/sessions.py)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -32,9 +32,13 @@ class ChatMessage:
 @dataclass
 class ChatSession:
     messages: list[ChatMessage] = field(default_factory=list)
-    # Top-K hits surfaced in the most recent answered turn. Lets the next
-    # turn's guard/synth resolve coreferent follow-ups without re-searching.
+    # Top-K hits surfaced in the most recent answered turn. In-memory only;
+    # not persisted to Redis (kept for transient cross-call use).
     last_sources: list[SearchResult] = field(default_factory=list)
+    # Rolling summary of older turns once history exceeds MAX_HISTORY_TURNS.
+    summary: str = ""
+    # Sticky subject carried across follow-ups: well, document, formation, etc.
+    current_subject: dict[str, str] = field(default_factory=dict)
 
     def add(self, role: str, content: str) -> None:
         self.messages.append(ChatMessage(role=role, content=content))
@@ -43,10 +47,14 @@ class ChatSession:
             self.messages = self.messages[-cap:]
 
 
+# In-process fallback cache. The canonical store is Redis (see
+# ``app.agents.rag.sessions``). This dict is only used when Redis is
+# unreachable so chat keeps working in degraded mode.
 _sessions: dict[str, ChatSession] = defaultdict(ChatSession)
 
 
 def get_session(session_id: str) -> ChatSession:
+    """In-process fallback (sync). Prefer ``get_session_async``."""
     return _sessions[session_id]
 
 

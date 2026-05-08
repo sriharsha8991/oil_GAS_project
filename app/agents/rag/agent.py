@@ -16,13 +16,21 @@ ladder, no claim validator, no MMR/neighbor expansion.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterator
 
 from google import genai
 
 from app.agents.rag.guard import guard, prefilter
+from app.agents.rag.sessions import get_session_async, save_session_async
+from app.agents.rag.stm import (
+    maybe_compress_history,
+    render_history_block,
+    render_subject_line,
+    update_current_subject,
+)
 from app.agents.rag.synthesizer import synthesize, synthesize_stream
-from app.agents.rag.types import AgentResponse, get_session
+from app.agents.rag.types import AgentResponse
 from app.config import Settings
 from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
@@ -30,6 +38,33 @@ from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.qdrant_store import QdrantVectorStore
 
 logger = get_logger(__name__)
+
+
+async def _post_turn_stm(
+    *,
+    session_id: str,
+    session,
+    user_message: str,
+    assistant_message: str,
+    settings: Settings,
+    client: genai.Client,
+    update_subject: bool,
+) -> None:
+    """Best-effort post-turn STM maintenance: subject + rolling summary + save."""
+    try:
+        if update_subject and assistant_message:
+            await update_current_subject(
+                session=session,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                settings=settings,
+                client=client,
+            )
+        await maybe_compress_history(
+            session=session, settings=settings, client=client,
+        )
+    finally:
+        await save_session_async(session_id, session)
 
 
 async def run_agent(
@@ -44,10 +79,9 @@ async def run_agent(
     project_id: str | None = None,
     document_id: str | None = None,
 ) -> AgentResponse:
-    session = get_session(session_id)
-    history_text = "\n".join(
-        f"{m.role}: {m.content}" for m in session.messages[-6:]
-    )
+    session = await get_session_async(session_id)
+    history_text = render_history_block(session)
+    subject_line = render_subject_line(session.current_subject)
 
     # ------------------------------------------------------------------
     # Layer 0 — free pre-filter.
@@ -57,6 +91,7 @@ async def run_agent(
         logger.info("agent_prefilter_hit", session_id=session_id)
         session.add("user", user_message)
         session.add("assistant", pre.reply)
+        await save_session_async(session_id, session)
         return AgentResponse(
             status="answered",
             answer=pre.reply,
@@ -77,6 +112,7 @@ async def run_agent(
     decision = await guard(
         message=user_message, history_text=history_text,
         card=card or {}, settings=settings, client=client,
+        current_subject=subject_line,
     )
     logger.info(
         "agent_guard",
@@ -89,6 +125,7 @@ async def run_agent(
     if decision.action == "reply":
         session.add("user", user_message)
         session.add("assistant", decision.reply)
+        await save_session_async(session_id, session)
         return AgentResponse(
             status="answered",
             answer=decision.reply,
@@ -104,6 +141,7 @@ async def run_agent(
     if decision.action == "clarify":
         session.add("user", user_message)
         session.add("assistant", decision.clarification)
+        await save_session_async(session_id, session)
         return AgentResponse(
             status="clarification_requested",
             answer=decision.clarification,
@@ -145,6 +183,16 @@ async def run_agent(
         session.add("user", user_message)
         session.add("assistant", response.answer)
 
+    # Best-effort post-turn STM upkeep — fire-and-forget so it doesn't
+    # delay the user response. The task will write the session itself.
+    asyncio.create_task(_post_turn_stm(
+        session_id=session_id, session=session,
+        user_message=user_message,
+        assistant_message=response.answer or "",
+        settings=settings, client=client,
+        update_subject=response.status == "answered",
+    ))
+
     logger.info(
         "agent_done",
         session_id=session_id,
@@ -174,10 +222,9 @@ async def run_agent_stream(
       ``{"event": "token",  "text": ...}``
       ``{"event": "done",   "status": ..., "answer": ..., "sources": [...], ...}``
     """
-    session = get_session(session_id)
-    history_text = "\n".join(
-        f"{m.role}: {m.content}" for m in session.messages[-6:]
-    )
+    session = await get_session_async(session_id)
+    history_text = render_history_block(session)
+    subject_line = render_subject_line(session.current_subject)
 
     # ------------------------------------------------------------------
     # Layer 0 — free pre-filter.
@@ -187,6 +234,7 @@ async def run_agent_stream(
         logger.info("agent_stream_prefilter_hit", session_id=session_id)
         session.add("user", user_message)
         session.add("assistant", pre.reply)
+        await save_session_async(session_id, session)
         yield {"event": "token", "text": pre.reply}
         yield {
             "event": "done",
@@ -213,6 +261,7 @@ async def run_agent_stream(
     decision = await guard(
         message=user_message, history_text=history_text,
         card=card or {}, settings=settings, client=client,
+        current_subject=subject_line,
     )
     logger.info(
         "agent_stream_guard",
@@ -225,6 +274,7 @@ async def run_agent_stream(
     if decision.action == "reply":
         session.add("user", user_message)
         session.add("assistant", decision.reply)
+        await save_session_async(session_id, session)
         yield {"event": "token", "text": decision.reply}
         yield {
             "event": "done",
@@ -245,6 +295,7 @@ async def run_agent_stream(
     if decision.action == "clarify":
         session.add("user", user_message)
         session.add("assistant", decision.clarification)
+        await save_session_async(session_id, session)
         yield {"event": "token", "text": decision.clarification}
         yield {
             "event": "done",
@@ -300,6 +351,16 @@ async def run_agent_stream(
     if final_answer:
         session.add("user", user_message)
         session.add("assistant", final_answer)
+
+    # Best-effort post-turn STM upkeep — fire-and-forget so it doesn't
+    # delay the user response. The task will write the session itself.
+    asyncio.create_task(_post_turn_stm(
+        session_id=session_id, session=session,
+        user_message=user_message,
+        assistant_message=final_answer,
+        settings=settings, client=client,
+        update_subject=(final_done.get("status") == "answered"),
+    ))
 
     final_done["tool_calls_made"] = (final_done.get("tool_calls_made") or 0) + 1
     final_done["meta"] = {

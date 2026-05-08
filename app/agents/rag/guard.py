@@ -169,6 +169,7 @@ async def guard(
     card: dict[str, Any],
     settings: Settings,
     client: genai.Client | None = None,
+    current_subject: str = "",
 ) -> GuardDecision:
     """Run the guard LLM and return a structured decision.
 
@@ -181,9 +182,16 @@ async def guard(
         or settings.chat_planner_model
     )
 
+    subject_block = (
+        f"\n\nCurrent subject (carry over to follow-ups unless the user "
+        f"changes it): {current_subject}"
+        if current_subject else ""
+    )
+
     user_block = (
         "CONTEXT CARD:\n"
         + json.dumps(card, ensure_ascii=False, default=str)
+        + subject_block
         + "\n\nConversation history:\n"
         + (history_text or "(none)")
         + "\n\nUser message:\n"
