@@ -1,12 +1,17 @@
 """Tier-weighted reranker — adjusts semantic similarity by document priority.
 
-Per PLAN.md §3.3, different artifact classes carry different trustworthiness
-weights. The reranker multiplies the raw semantic score by:
-  tier_weight × recency_boost × scope_proximity
+Per PLAN.md §3.3, each artifact class carries an evidence-tier weight.
+Each search result's adjusted score is:
 
-Phase 1: Only tier_weight is implemented (artifact class → weight).
-Recency and scope proximity are deferred to Phase 2 when L3/L4 metadata
-is available.
+    adjusted_score = raw_score * tier_weight(artifact_class)
+
+The reranker reads ``artifact_class`` from each result dict (attached
+upstream by the rag tool from a Postgres lookup, see
+``app.db.queries.document_meta``). Results without an attached class
+fall back to ``_DEFAULT_WEIGHT``.
+
+Recency boost and scope proximity factors are deferred to Phase 2 when
+L3 (hierarchy) and L4 (revisions/timestamps) metadata is enforced.
 """
 
 from __future__ import annotations
@@ -20,22 +25,23 @@ _TIER_WEIGHTS: dict[str, float] = {
     # Tier 1 — highest
     "master": 1.0,
     "program": 1.0,
+    "learning": 1.0,
     # Tier 2
     "ddr": 0.85,
     "handover": 0.85,
     "risk": 0.85,
     # Tier 3
     "service": 0.75,
+    "offset": 0.75,
     # Tier 4
-    "offset": 0.5,
-    "learning": 0.5,
     "action": 0.5,
     # Tier 5
     "media": 0.3,
+    "other": 0.5,
 }
 
-# Default weight for unknown artifact classes
-_DEFAULT_WEIGHT = 0.7
+# Default weight for unknown / unattached artifact classes.
+_DEFAULT_WEIGHT = 0.5
 
 
 @dataclass
@@ -45,6 +51,8 @@ class RankedResult:
     raw_score: float
     adjusted_score: float
     tier_weight: float
+    artifact_class: str = ""
+    confidentiality: str = "internal"
     # Tenant scope (echoed from payload)
     user_id: str = ""
     project_id: str = ""
@@ -84,26 +92,19 @@ def get_tier_weight(artifact_class: str | None) -> float:
 def rerank(
     results: list[dict[str, Any]],
     *,
-    artifact_class: str | None = None,
     collection: str = "",
 ) -> list[RankedResult]:
-    """Rerank a list of search results by applying tier weights.
+    """Apply per-result tier weights and sort by adjusted score.
 
-    Args:
-        results: Raw search results from Qdrant (list of dicts with
-            'text', 'score', and metadata fields).
-        artifact_class: If known, the artifact class to use for all
-            results in this batch. If None, uses default weight.
-        collection: Source collection name (for provenance).
-
-    Returns:
-        Sorted list of RankedResult (highest adjusted_score first).
+    Each ``result`` dict may carry an ``artifact_class`` (attached by the
+    caller from a Postgres lookup) and ``confidentiality`` field. Missing
+    fields fall back to the default tier weight and ``"internal"``.
     """
-    tier_weight = get_tier_weight(artifact_class)
-
     ranked: list[RankedResult] = []
     for r in results:
         raw_score = float(r.get("score", 0.0))
+        artifact_class = (r.get("artifact_class") or "").strip().lower()
+        tier_weight = get_tier_weight(artifact_class)
         adjusted = raw_score * tier_weight
 
         ranked.append(RankedResult(
@@ -111,6 +112,8 @@ def rerank(
             raw_score=raw_score,
             adjusted_score=round(adjusted, 4),
             tier_weight=tier_weight,
+            artifact_class=artifact_class,
+            confidentiality=(r.get("confidentiality") or "internal"),
             user_id=r.get("user_id", "") or "",
             project_id=r.get("project_id", "") or "",
             document_id=r.get("document_id", "") or "",
@@ -142,11 +145,7 @@ def merge_and_rerank(
     *result_lists: list[RankedResult],
     limit: int = 10,
 ) -> list[RankedResult]:
-    """Merge multiple ranked result lists and return top-K by adjusted score.
-
-    Used by the hybrid pipeline to combine results from multiple
-    collections (chunks, entities, images) into a single ranked list.
-    """
+    """Merge multiple ranked result lists and return top-K by adjusted score."""
     all_results: list[RankedResult] = []
     for results in result_lists:
         all_results.extend(results)

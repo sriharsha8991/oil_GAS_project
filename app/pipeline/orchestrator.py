@@ -21,8 +21,12 @@ from typing import Any
 
 from app.agents.graph import build_graph, page_image_to_state
 from app.config import Settings
+from app.db.engine import get_session_factory
+from app.db.models import Document
+from app.db.queries.document_outline import _parse_headings
 from app.models.schemas import JobStatus, PageBaseline
 from app.models.state import PageState
+from app.pipeline.artifact_classifier import classify_artifact
 from app.pipeline.page_streamer import PageDeque, rasterize_pages
 from app.pipeline.postprocessor import PostProcessor, _build_page_map
 from app.pipeline.preprocessing import Preprocessor
@@ -35,6 +39,8 @@ from app.vectorstore.embedder import GeminiEmbedder
 from app.vectorstore.entity_indexer import build_entity_points, upsert_entity_points
 from app.vectorstore.image_indexer import build_image_points, upsert_image_points
 from app.vectorstore.qdrant_store import QdrantVectorStore
+
+from sqlalchemy import select, update
 
 logger = get_logger(__name__)
 
@@ -509,6 +515,14 @@ class PipelineOrchestrator:
 
                 job.persist()
 
+            # ── Phase 5: Auto-classify artifact_class (only if user left default) ──
+            await self._auto_classify_if_default(
+                document_id=document_id,
+                user_id=user_id,
+                project_id=project_id,
+                filename=filename,
+            )
+
             job.status = JobStatus.COMPLETED
             job.current_phase = "done"
             job.finished_at = time.time()
@@ -541,6 +555,84 @@ class PipelineOrchestrator:
 
         _evict_old_jobs()
         return job
+
+    async def _auto_classify_if_default(
+        self,
+        *,
+        document_id: str,
+        user_id: str,
+        project_id: str,
+        filename: str,
+    ) -> None:
+        """Run the LLM artifact-class classifier when the user accepted the default.
+
+        Only mutates ``documents.artifact_class`` when the row currently
+        holds the literal default ``"other"``. A user-supplied class is
+        always respected. Best-effort — never raises into the pipeline.
+        """
+        if self._gemini is None:
+            return  # no LLM configured (test / dry-run)
+
+        try:
+            Session = get_session_factory()
+            async with Session() as sess:
+                row = (await sess.execute(
+                    select(Document.artifact_class)
+                    .where(Document.id == document_id)
+                )).first()
+            if row is None or (row.artifact_class or "").lower() != "other":
+                return
+
+            full_md = await self._storage.read_full_document(
+                user_id, project_id, document_id,
+            ) or ""
+            headings, page_count = _parse_headings(full_md)
+            content_sample = full_md[:600] if full_md else ""
+
+            cls, confidence = await classify_artifact(
+                filename=filename,
+                headings=headings,
+                page_count=page_count or None,
+                table_count=0,        # outline counts not needed for classification
+                image_count=0,
+                content_sample=content_sample,
+                settings=self._settings,
+            )
+
+            if cls == "other":
+                # Classifier was unsure — leave default in place so
+                # ?confidence is observable and the user can still
+                # PATCH it manually.
+                logger.info(
+                    "auto_classify_kept_default",
+                    document_id=document_id,
+                    confidence=confidence,
+                )
+                return
+
+            async with Session() as sess:
+                await sess.execute(
+                    update(Document)
+                    .where(
+                        Document.id == document_id,
+                        Document.artifact_class == "other",
+                    )
+                    .values(artifact_class=cls)
+                )
+                await sess.commit()
+
+            logger.info(
+                "auto_classify_applied",
+                document_id=document_id,
+                artifact_class=cls,
+                confidence=confidence,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "auto_classify_failed",
+                document_id=document_id,
+                error=str(exc),
+            )
 
 
 async def _worker(

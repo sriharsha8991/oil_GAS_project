@@ -4,9 +4,9 @@
 >
 > **How to read:** §0.0 is the **current auth contract** and supersedes any earlier statement about Supabase JS, public signup, or "no /auth/login on backend." §0 is the PR-7 identity/storage contract. §1+ is historical commentary; treat it as background.
 >
-> **Last updated:** 2026-05-08 — **v2.7**. Shipped on top of v2.6: **§13 OpenAPI snapshot + tightened CORS, slash commands (`/help` `/clear` `/forget` `/scope` `/temp`), grounded-answer source verifier, persistent chat transcript (Postgres) with `GET /chat/sessions/{id}/messages`, archive/unarchive endpoints**, plus the `tests/test_agents.py` cleanup (no more `--ignore`, 111/111 pass). v2.6 (2026-05-08) added §12; v2.5 (2026-05-07) flipped auth to invite-only — see §0.0.
+> **Last updated:** 2026-05-08 — **v2.8**. Shipped on top of v2.7: **§0.5 governance metadata + tier-weighted reranker** (`artifact_class`, `confidentiality`, `superseded_by` on every document; reranker uses PRD §10 evidence hierarchy; superseded docs filtered out of retrieval), **`PATCH /documents/{id}`** for editing governance fields, **`POST /documents/{id}/auto-classify`** + **automatic LLM classification at the end of ingest** (only when the user accepts the default `other`; user-supplied classes are always respected), and the L1 hardening pieces from earlier in the day (entity normalizer + numeric guardrail wired into the extractor). **174/174 tests pass; OpenAPI snapshot is 36 paths.** v2.7 (2026-05-08) added §13 (slash commands, verifier, persistent transcript, archive); v2.6 added §12; v2.5 (2026-05-07) flipped auth to invite-only — see §0.0.
 > **Owner:** Backend team.
-> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | §0.0 Invite-only auth ✅ | **§12 Memory + Chat Sessions ✅** (new). §2.9 still Open.
+> **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | §0.0 Invite-only auth ✅ | §12 Memory + Chat Sessions ✅ | **§0.5 Governance + auto-classify ✅** (new). §2.9 still Open.
 
 ---
 
@@ -169,8 +169,8 @@ Effective 2026-05-06. The previous demo-shaped contract (`owner_id`, `doc_id`, `
 
 ### 0.4 Changed contracts
 
-- **`POST /ingest`** body: now requires `project_id: uuid`. Shape: `{ project_id, file_paths: string[] }`. Each item in the response includes `{ job_id, document_id, filename, status }`.
-- **`POST /ingest/upload`** multipart: now requires a `project_id` form field alongside `files`. Response same as `/ingest`.
+- **`POST /ingest`** body: now requires `project_id: uuid`. Shape: `{ project_id, file_paths: string[], artifact_class?, confidentiality? }`. Each item in the response includes `{ job_id, document_id, filename, status }`. `artifact_class` and `confidentiality` are optional; both default to `other` / `internal` and are validated against the closed enums in §0.5.
+- **`POST /ingest/upload`** multipart: now requires a `project_id` form field alongside `files`. Optional form fields `artifact_class` and `confidentiality` follow the same rules as `/ingest`. Response same as `/ingest`.
 - **`GET /ingest`** — now scoped to the calling user; sources from Postgres `jobs` table (not Redis). Each row: `{ job_id, document_id, filename, status, current_phase, pages_total, pages_done, error, created_at, started_at, ended_at }`.
 - **`GET /ingest/{job_id}`** — sources from Postgres; same row shape as above. 404 if not yours (super_admin sees all).
 - **Chat sources / evidence** — every `source` and `evidence` item now carries `document_id`. Image-evidence URLs are now `/documents/{id}/pages/{n}/image[?crop...]`. The `job_id` field on sources is still echoed but **must not be used for links**; treat it as opaque debug info.
@@ -179,16 +179,118 @@ Effective 2026-05-06. The previous demo-shaped contract (`owner_id`, `doc_id`, `
 - **`PATCH /auth/me/profile`** — body accepts `{ display_name?, organization? }`; only fields supplied are updated.
 - **`GET /admin/users`** — each row now includes `organization: string | null`.
 
-### 0.5 Realtime + polling
+### 0.5 Governance metadata + auto-classification (2026-05-08)
+
+The retrieval reranker now scores results by **artifact tier** (PRD §10 evidence hierarchy). Every document carries a governance triple — `artifact_class`, `confidentiality`, `superseded_by` — that feeds ranking and filtering. The ingest pipeline auto-classifies documents whose class is left at the default; users can also re-trigger classification or set the class manually.
+
+#### 0.5.1 New / changed document fields
+
+`GET /documents` and `GET /documents/{id}` now return:
+
+```jsonc
+{
+  "id": "uuid",
+  "filename": "ALP-12_DDR_2026-05-08.pdf",
+  "artifact_class": "ddr",         // new — controlled vocab, see below
+  "revision": 1,                   // new — int
+  "superseded_by": null,           // new — uuid | null (points to newer version)
+  "confidentiality": "internal",   // new — controlled vocab, see below
+  "created_at": "2026-05-08T10:32:13Z",
+  ...
+}
+```
+
+**`artifact_class`** (closed enum, lower-case):
+`master | program | offset | ddr | handover | service | risk | action | learning | media | other`
+
+| value | meaning | tier weight in reranker |
+|---|---|---|
+| `master`   | Approved drilling program / AFE / master plan | **1.00** |
+| `program`  | Well program / engineering design / EOWR / WCR / final well report | **1.00** |
+| `learning` | Lessons learned, post-mortem, knowledge capture | **1.00** |
+| `ddr`      | Daily Drilling Report (one operational day) | 0.85 |
+| `handover` | Shift / tour / section handover note | 0.85 |
+| `risk`     | Risk register, HAZOP, hazard / assurance memo, bowtie | 0.85 |
+| `service`  | Service-company report (mud, MWD, LWD, DD, cement, wireline) | 0.75 |
+| `offset`   | Offset-well report / analog-well study | 0.75 |
+| `action`   | Action items / punch list / decision log | 0.50 |
+| `other`    | Default; anything outside the taxonomy | 0.50 |
+| `media`    | Standalone photos, screenshots, image-only attachments | 0.30 |
+
+**`confidentiality`** (closed enum, lower-case):
+`public | internal | restricted | confidential | secret`
+
+**Supersession**: when `superseded_by` is non-null, the document is filtered out of all retrieval results (no rank, no surface). It remains visible in the documents list so the user can see its history.
+
+#### 0.5.2 New endpoints
+
+| Method | Path | Body / Query | Purpose |
+|---|---|---|---|
+| `PATCH` | `/documents/{id}` | `{ artifact_class?, confidentiality?, superseded_by? }` | Edit governance metadata. Partial update; only supplied fields change. Returns refreshed document. |
+| `POST`  | `/documents/{id}/auto-classify?force=false` | _(no body)_ | Re-run the LLM artifact-class classifier. By default no-ops if `artifact_class != 'other'`; pass `?force=true` to overwrite a non-default class. |
+
+**`PATCH /documents/{id}`** validation rules:
+
+- `artifact_class` must be one of the enum values above; otherwise 422.
+- `confidentiality` must be one of the enum values above; otherwise 422.
+- `superseded_by` must reference a document **owned by the same user**; self-reference is rejected. Set to `null` to clear supersession.
+- Any field omitted from the body is left untouched.
+
+Response is the full refreshed document object (same shape as `GET /documents/{id}`).
+
+**`POST /documents/{id}/auto-classify`** response:
+
+```jsonc
+// applied
+{
+  "document_id": "uuid",
+  "artifact_class": "ddr",
+  "previous_class": "other",
+  "confidence": 0.91,
+  "applied": true
+}
+// classifier was unsure (returned "other") — current value left in place
+{
+  "document_id": "uuid",
+  "artifact_class": "other",
+  "suggested": "other",
+  "confidence": 0.0,
+  "applied": false,
+  "reason": "classifier was unsure; left current class in place"
+}
+// no-op because user already set a non-default class
+{
+  "document_id": "uuid",
+  "artifact_class": "ddr",
+  "skipped": true,
+  "reason": "artifact_class already set; pass force=true to overwrite"
+}
+// 409 if ingest hasn't finished writing full_document.md yet
+{ "detail": "full_document.md not available; ingest may still be running" }
+```
+
+#### 0.5.3 Auto-classification behaviour during ingest
+
+When a document is uploaded with the default `artifact_class = 'other'`, the orchestrator automatically runs the LLM classifier as the **last** ingest phase, after Qdrant indexing. If the classifier produces a high-confidence non-`other` value, the row is updated in place; if the classifier returns `'other'` (genuinely unsure), the default is left alone so the user can decide. **A user-supplied class is always respected** — the auto-classifier never overwrites a non-default value.
+
+The frontend should:
+
+1. Allow users to set `artifact_class` + `confidentiality` at upload time (optional fields on `POST /ingest` / `POST /ingest/upload` — both default to `other` / `internal`).
+2. Show the resulting `artifact_class` in the documents list with an "auto" indicator when it was set by the classifier (we don't currently expose source provenance — for now, treat any class on a doc the user didn't explicitly set as auto-derived).
+3. Offer an inline edit affordance using `PATCH /documents/{id}` so users can correct misclassifications.
+4. Offer a "Re-classify" button calling `POST /documents/{id}/auto-classify` (and `?force=true` when re-running on a non-default class).
+5. Treat `'other'` as a legitimate user choice — many documents are genuinely outside the well-ops taxonomy. Do not nag the user to fix it.
+
+### 0.6 Realtime + polling
 
 - **Use Supabase Realtime** on the `jobs` table to drive ingest progress. Filter by `user_id = auth.uid()` (RLS already enforces this). The `jobs` row is the source of truth — `status ∈ {queued, running, succeeded, failed}`, plus `current_phase`, `pages_total`, `pages_done`, `error`.
 - The Redis-backed polling endpoint (`GET /ingest/{job_id}` returning a manifest) is **still available** as a fallback, but it now reads from Postgres and is sufficient if you don't want to subscribe.
 
-### 0.6 Tenant payload (informational)
+### 0.7 Tenant payload (informational)
 
 Every Qdrant point now carries `{ user_id, role, organization, project_id, document_id }` plus the existing artifact metadata. This is enforced server-side; frontend never sees raw Qdrant payloads, but knowing it exists explains why cross-user leakage is impossible — every search goes through a mandatory `user_id` filter.
 
-### 0.7 Migration checklist for the FE
+### 0.8 Migration checklist for the FE
 
 1. Replace every `job_id` used in citation links / image URLs with `document_id` from the new `sources[i].document_id` field.
 2. Update any "ingest a file" form to require/select a `project_id` first; show an empty-state CTA "Create your first project" when the user has none.
@@ -196,6 +298,8 @@ Every Qdrant point now carries `{ user_id, role, organization, project_id, docum
 4. Replace the `refetchInterval` polling on ingest progress with a Supabase Realtime subscription on `jobs` (still polling-acceptable as a fallback).
 5. Surface `organization` on the profile screen + admin user-management screen.
 6. Drop any code that ever sent `owner_id`, `doc_id`, `doc_name`, or `job_id` in a request body.
+7. Render `artifact_class` + `confidentiality` on the document list/detail (badges; tier weight from §0.5.1 table is fine for sort hints). Wire an inline `PATCH /documents/{id}` edit affordance and a "Re-classify" button calling `POST /documents/{id}/auto-classify`.
+8. Optionally surface `artifact_class` + `confidentiality` as fields on the upload form (both safe to omit — defaults are sensible).
 
 ---
 
@@ -1166,18 +1270,18 @@ Both 404 with `session_not_found` if the caller doesn't own the session. Sets / 
 
 ```bash
 .venv\Scripts\python.exe -m app.tools.apply_migrations
-# → applies 0008_chat_messages.sql
+# → applies migrations through 0009_documents_artifact_class.sql
 
 .venv\Scripts\python.exe -m app.tools.dump_openapi
-# → writes frontend_docs/openapi.json (35 paths)
+# → writes frontend_docs/openapi.json (36 paths)
 
 .venv\Scripts\python.exe -m pytest -q
-# → 111 passed
+# → 174 passed
 ```
 
 `tests/test_agents.py` is now in sync with the current 2-stage pipeline — there is no `--ignore` flag on the test command anymore.
 
 ---
 
-*End of Backend → Frontend Communication v2.7 — 2026-05-08 (slash commands + source verifier + persistent transcript + archive on top of v2.6).*
+*End of Backend → Frontend Communication v2.8 — 2026-05-08 (governance metadata, tier-weighted reranker, LLM auto-classifier on top of v2.7).*
 

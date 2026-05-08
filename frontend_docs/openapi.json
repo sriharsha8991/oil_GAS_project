@@ -16,6 +16,30 @@
       },
       "Body_ingest_upload_ingest_upload_post": {
         "properties": {
+          "artifact_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "L4 artifact class; defaults to 'other'.",
+            "title": "Artifact Class"
+          },
+          "confidentiality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Confidentiality class; defaults to 'internal'.",
+            "title": "Confidentiality"
+          },
           "files": {
             "items": {
               "contentMediaType": "application/octet-stream",
@@ -284,6 +308,46 @@
         "title": "DeleteResponse",
         "type": "object"
       },
+      "DocumentPatch": {
+        "properties": {
+          "artifact_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Class"
+          },
+          "confidentiality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidentiality"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Document id of the newer revision that supersedes this one. Pass null to clear. The superseding document must belong to the same user.",
+            "title": "Superseded By"
+          }
+        },
+        "title": "DocumentPatch",
+        "type": "object"
+      },
       "EvidenceItem": {
         "description": "A single evidence card the UI can render alongside the answer.",
         "properties": {
@@ -428,6 +492,30 @@
       },
       "IngestRequest": {
         "properties": {
+          "artifact_class": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "L4 artifact class (one of: master, program, offset, ddr, handover, service, risk, action, learning, media, other). Defaults to 'other'.",
+            "title": "Artifact Class"
+          },
+          "confidentiality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Confidentiality class (one of: public, internal, restricted, third_party). Defaults to 'internal'.",
+            "title": "Confidentiality"
+          },
           "file_paths": {
             "description": "Absolute or relative server-side paths to PDF files.",
             "items": {
@@ -2493,6 +2581,114 @@
           }
         },
         "summary": "Document detail",
+        "tags": [
+          "documents"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_document_documents__document_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Patch Document Documents  Document Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update governance metadata (artifact_class, confidentiality, supersession)",
+        "tags": [
+          "documents"
+        ]
+      }
+    },
+    "/documents/{document_id}/auto-classify": {
+      "post": {
+        "operationId": "auto_classify_documents__document_id__auto_classify_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "document_id",
+            "required": true,
+            "schema": {
+              "title": "Document Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "When false (default), only re-classifies if the current class is 'other'. Set true to overwrite a non-default class.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "When false (default), only re-classifies if the current class is 'other'. Set true to overwrite a non-default class.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Auto Classify Documents  Document Id  Auto Classify Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Re-run the LLM artifact-class classifier on this document",
         "tags": [
           "documents"
         ]

@@ -18,12 +18,14 @@ from typing import Any
 import fitz  # PyMuPDF
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse, Response
-from sqlalchemy import delete, desc, select
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, desc, select, update
 
 from app.auth.deps import AuthUser, current_user
 from app.config import get_settings
 from app.db.engine import get_session_factory
 from app.db.models import Document, Job
+from app.domain.well_taxonomy import ARTIFACT_CLASSES, CONFIDENTIALITY_CLASSES
 from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
 from app.vectorstore.qdrant_store import QdrantVectorStore
@@ -51,6 +53,10 @@ def _doc_to_dict(d: Document, latest_job: Job | None = None) -> dict[str, Any]:
         "user_id": str(d.user_id),
         "project_id": str(d.project_id),
         "filename": d.filename,
+        "artifact_class": d.artifact_class,
+        "revision": d.revision,
+        "superseded_by": str(d.superseded_by) if d.superseded_by else None,
+        "confidentiality": d.confidentiality,
         "created_at": d.created_at.isoformat() if d.created_at else None,
     }
     if latest_job is not None:
@@ -156,6 +162,184 @@ async def delete_document(
 
     logger.info("document_deleted", user_id=user.id, document_id=document_id)
     return {"deleted": document_id}
+
+
+# ---------------------------------------------------------------------------
+# PATCH /documents/{id} — governance metadata (artifact_class, etc.)
+# ---------------------------------------------------------------------------
+
+
+class DocumentPatch(BaseModel):
+    artifact_class: str | None = Field(default=None)
+    confidentiality: str | None = Field(default=None)
+    superseded_by: str | None = Field(
+        default=None,
+        description=(
+            "Document id of the newer revision that supersedes this one. "
+            "Pass null to clear. The superseding document must belong to "
+            "the same user."
+        ),
+    )
+
+
+@router.patch(
+    "/{document_id}",
+    summary="Update governance metadata (artifact_class, confidentiality, supersession)",
+)
+async def patch_document(
+    document_id: str,
+    patch: DocumentPatch,
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    d = await _resolve_doc(document_id, user)
+
+    updates: dict[str, Any] = {}
+    if patch.artifact_class is not None:
+        norm = patch.artifact_class.strip().lower()
+        if norm and norm not in ARTIFACT_CLASSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid artifact_class; allowed: {sorted(ARTIFACT_CLASSES)}",
+            )
+        updates["artifact_class"] = norm or "other"
+
+    if patch.confidentiality is not None:
+        norm = patch.confidentiality.strip().lower()
+        if norm and norm not in CONFIDENTIALITY_CLASSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "invalid confidentiality; allowed: "
+                    f"{sorted(CONFIDENTIALITY_CLASSES)}"
+                ),
+            )
+        updates["confidentiality"] = norm or "internal"
+
+    if "superseded_by" in patch.model_fields_set:
+        if patch.superseded_by in (None, ""):
+            updates["superseded_by"] = None
+        else:
+            if patch.superseded_by == document_id:
+                raise HTTPException(
+                    status_code=400, detail="document cannot supersede itself"
+                )
+            target = await _resolve_doc(patch.superseded_by, user)
+            updates["superseded_by"] = target.id
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="no fields to update")
+
+    Session = get_session_factory()
+    async with Session() as sess:
+        await sess.execute(
+            update(Document).where(Document.id == document_id).values(**updates)
+        )
+        await sess.commit()
+
+        refreshed = (await sess.execute(
+            select(Document).where(Document.id == document_id)
+        )).scalar_one()
+
+    logger.info(
+        "document_patched",
+        user_id=user.id,
+        document_id=document_id,
+        fields=list(updates.keys()),
+    )
+    return _doc_to_dict(refreshed)
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/{id}/auto-classify — re-trigger LLM classifier
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{document_id}/auto-classify",
+    summary="Re-run the LLM artifact-class classifier on this document",
+)
+async def auto_classify(
+    document_id: str,
+    force: bool = Query(
+        False,
+        description=(
+            "When false (default), only re-classifies if the current class is 'other'. "
+            "Set true to overwrite a non-default class."
+        ),
+    ),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    from sqlalchemy import update as _update
+
+    from app.db.queries.document_outline import _parse_headings
+    from app.pipeline.artifact_classifier import classify_artifact
+
+    d = await _resolve_doc(document_id, user)
+
+    if not force and (d.artifact_class or "").lower() != "other":
+        return {
+            "document_id": document_id,
+            "artifact_class": d.artifact_class,
+            "skipped": True,
+            "reason": "artifact_class already set; pass force=true to overwrite",
+        }
+
+    settings = get_settings()
+    storage = SupabaseStorage(settings)
+
+    full_md = await storage.read_full_document(
+        str(d.user_id), str(d.project_id), str(d.id)
+    ) or ""
+    if not full_md:
+        raise HTTPException(
+            status_code=409, detail="full_document.md not available; ingest may still be running"
+        )
+
+    headings, page_count = _parse_headings(full_md)
+    cls, confidence = await classify_artifact(
+        filename=d.filename,
+        headings=headings,
+        page_count=page_count or None,
+        table_count=0,
+        image_count=0,
+        content_sample=full_md[:600],
+        settings=settings,
+    )
+
+    if cls == "other":
+        return {
+            "document_id": document_id,
+            "artifact_class": d.artifact_class,
+            "suggested": "other",
+            "confidence": confidence,
+            "applied": False,
+            "reason": "classifier was unsure; left current class in place",
+        }
+
+    Session = get_session_factory()
+    async with Session() as sess:
+        await sess.execute(
+            _update(Document)
+            .where(Document.id == document_id)
+            .values(artifact_class=cls)
+        )
+        await sess.commit()
+
+    logger.info(
+        "document_auto_classified",
+        user_id=user.id,
+        document_id=document_id,
+        artifact_class=cls,
+        confidence=confidence,
+        forced=force,
+    )
+    return {
+        "document_id": document_id,
+        "artifact_class": cls,
+        "previous_class": d.artifact_class,
+        "confidence": confidence,
+        "applied": True,
+    }
 
 
 @router.get(

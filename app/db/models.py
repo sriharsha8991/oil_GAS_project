@@ -97,6 +97,20 @@ class Document(Base):
         UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
     )
     filename: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_class: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="other"
+    )
+    revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1"
+    )
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    confidentiality: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="internal"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

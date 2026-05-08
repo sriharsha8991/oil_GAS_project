@@ -149,6 +149,15 @@ ARTIFACT_CLASSES: set[str] = {
     "action",       # Action items / punch list
     "learning",     # Lessons learned
     "media",        # Photos, videos, screenshots
+    "other",        # Unclassified — default for uploads with no class hint
+}
+
+
+CONFIDENTIALITY_CLASSES: set[str] = {
+    "public",
+    "internal",
+    "restricted",
+    "third_party",
 }
 
 

@@ -26,6 +26,7 @@ from app.auth.deps import AuthUser, current_user
 from app.config import Settings, get_settings
 from app.db.engine import get_session_factory
 from app.db.models import Document, Job, Project
+from app.domain.well_taxonomy import ARTIFACT_CLASSES, CONFIDENTIALITY_CLASSES
 from app.storage.supabase_storage import SupabaseStorage
 from app.utils.logging import get_logger
 
@@ -78,8 +79,43 @@ async def _validate_project(project_id: str, user_id: str) -> None:
             raise HTTPException(status_code=404, detail="project not found")
 
 
+def _validate_artifact_class(value: str | None) -> str:
+    if value is None or not str(value).strip():
+        return "other"
+    norm = str(value).strip().lower()
+    if norm not in ARTIFACT_CLASSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid artifact_class {value!r}; allowed: "
+                f"{sorted(ARTIFACT_CLASSES)}"
+            ),
+        )
+    return norm
+
+
+def _validate_confidentiality(value: str | None) -> str:
+    if value is None or not str(value).strip():
+        return "internal"
+    norm = str(value).strip().lower()
+    if norm not in CONFIDENTIALITY_CLASSES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid confidentiality {value!r}; allowed: "
+                f"{sorted(CONFIDENTIALITY_CLASSES)}"
+            ),
+        )
+    return norm
+
+
 async def _create_document_and_job(
-    *, user_id: str, project_id: str, filename: str
+    *,
+    user_id: str,
+    project_id: str,
+    filename: str,
+    artifact_class: str = "other",
+    confidentiality: str = "internal",
 ) -> tuple[str, str]:
     """Insert documents + jobs rows and return (document_id, job_id)."""
     document_id = str(uuid.uuid4())
@@ -91,6 +127,8 @@ async def _create_document_and_job(
             user_id=user_id,
             project_id=project_id,
             filename=filename,
+            artifact_class=artifact_class,
+            confidentiality=confidentiality,
         ))
         sess.add(Job(
             id=job_id,
@@ -155,6 +193,21 @@ class IngestRequest(BaseModel):
         max_length=_MAX_BATCH_FILES,
         description="Absolute or relative server-side paths to PDF files.",
     )
+    artifact_class: str | None = Field(
+        default=None,
+        description=(
+            "L4 artifact class (one of: master, program, offset, ddr, "
+            "handover, service, risk, action, learning, media, other). "
+            "Defaults to 'other'."
+        ),
+    )
+    confidentiality: str | None = Field(
+        default=None,
+        description=(
+            "Confidentiality class (one of: public, internal, restricted, "
+            "third_party). Defaults to 'internal'."
+        ),
+    )
 
 
 @router.post("", summary="Ingest one or more PDFs by path (async)")
@@ -163,6 +216,8 @@ async def ingest(
 ) -> dict[str, Any]:
     settings = get_settings()
     await _validate_project(req.project_id, user.id)
+    artifact_class = _validate_artifact_class(req.artifact_class)
+    confidentiality = _validate_confidentiality(req.confidentiality)
 
     dispatched: list[dict[str, str]] = []
     for raw_path in req.file_paths:
@@ -175,7 +230,11 @@ async def ingest(
                 status_code=400, detail=f"Cannot read file: {raw_path} ({exc})"
             )
         document_id, job_id = await _create_document_and_job(
-            user_id=user.id, project_id=req.project_id, filename=filename
+            user_id=user.id,
+            project_id=req.project_id,
+            filename=filename,
+            artifact_class=artifact_class,
+            confidentiality=confidentiality,
         )
         await _dispatch(
             user=user,
@@ -204,6 +263,14 @@ async def ingest(
 async def ingest_upload(
     project_id: str = Form(..., description="Project to attach documents to"),
     files: list[UploadFile] = File(...),
+    artifact_class: str | None = Form(
+        default=None,
+        description="L4 artifact class; defaults to 'other'.",
+    ),
+    confidentiality: str | None = Form(
+        default=None,
+        description="Confidentiality class; defaults to 'internal'.",
+    ),
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     if not files:
@@ -216,6 +283,8 @@ async def ingest_upload(
 
     settings = get_settings()
     await _validate_project(project_id, user.id)
+    artifact_class_norm = _validate_artifact_class(artifact_class)
+    confidentiality_norm = _validate_confidentiality(confidentiality)
     max_bytes = settings.max_upload_mb * 1024 * 1024
 
     dispatched: list[dict[str, str]] = []
@@ -247,7 +316,11 @@ async def ingest_upload(
         data = b"".join(chunks)
 
         document_id, job_id = await _create_document_and_job(
-            user_id=user.id, project_id=project_id, filename=original
+            user_id=user.id,
+            project_id=project_id,
+            filename=original,
+            artifact_class=artifact_class_norm,
+            confidentiality=confidentiality_norm,
         )
         await _dispatch(
             user=user,

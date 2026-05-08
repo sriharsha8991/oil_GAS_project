@@ -25,6 +25,9 @@ class PageState(TypedDict, total=False):
     # --- Validator output ---
     validation: dict              # PageValidation-shaped dict
 
+    # --- Numeric guardrail (G-L1.6) ---
+    guardrail_flags: list[dict]   # [{kind, type, value, unit}, ...] or []
+
     # --- Control flow ---
     iteration: int                # 1 = Flash, 2 = Flash + gaps, 3 = Pro (FINAL)
     escalated: bool               # True if iter 3 ran

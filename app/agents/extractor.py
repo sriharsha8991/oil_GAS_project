@@ -12,6 +12,15 @@ import time
 
 from app.agents.prompts import EXTRACTOR_SYSTEM, build_extractor_prompt
 from app.models.state import PageState
+from app.pipeline.entity_normalizer import (
+    normalize_entities,
+    should_force_escalation as normalizer_force_escalate,
+)
+from app.pipeline.numeric_guardrail import (
+    check_entities as guardrail_check,
+    should_force_escalation as guardrail_force_escalate,
+    summarize_flags_for_gap,
+)
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger
 
@@ -48,6 +57,39 @@ async def extractor_node(
 
     extracted, validation = _parse_extraction(raw, page_num, pass_threshold)
 
+    # G-L1.3: coerce entities to controlled vocabulary.
+    normalized_entities, normalizer_warnings = normalize_entities(
+        extracted.get("entities", [])
+    )
+    extracted["entities"] = normalized_entities
+
+    # G-L1.6: numeric guardrail (range + baseline cross-check).
+    guardrail_flags = guardrail_check(
+        normalized_entities,
+        baseline_text=state.get("baseline_text", ""),
+        is_scanned=state.get("is_scanned", False),
+    )
+
+    # Fold both into the validation summary so escalation receives them as gaps.
+    extra_gaps: list[str] = []
+    if normalizer_warnings:
+        extra_gaps.append(
+            "entity vocabulary: " + "; ".join(normalizer_warnings[:8])
+            + ("" if len(normalizer_warnings) <= 8
+               else f" (+{len(normalizer_warnings) - 8} more)")
+        )
+    guardrail_gap = summarize_flags_for_gap(guardrail_flags)
+    if guardrail_gap:
+        extra_gaps.append(guardrail_gap)
+
+    if extra_gaps:
+        validation["gaps"] = list(validation.get("gaps", [])) + extra_gaps
+    if (
+        normalizer_force_escalate(normalizer_warnings)
+        or guardrail_force_escalate(guardrail_flags)
+    ):
+        validation["passed"] = False
+
     logger.info(
         "extractor_done",
         page_num=page_num,
@@ -56,6 +98,8 @@ async def extractor_node(
         self_confidence=validation["confidence"],
         self_gaps=len(validation["gaps"]),
         passed=validation["passed"],
+        normalizer_warnings=len(normalizer_warnings),
+        guardrail_flags=len(guardrail_flags),
         input_tokens=usage["input_tokens"],
         output_tokens=usage["output_tokens"],
     )
@@ -69,6 +113,8 @@ async def extractor_node(
         "output_chars": len(raw),
         "self_confidence": validation["confidence"],
         "passed": validation["passed"],
+        "normalizer_warnings": len(normalizer_warnings),
+        "guardrail_flags": len(guardrail_flags),
         "usage": usage,
     })
 
@@ -76,6 +122,7 @@ async def extractor_node(
         **state,
         "extracted": extracted,
         "validation": validation,
+        "guardrail_flags": guardrail_flags,
         "iteration": 1,
         "trace": trace,
     }

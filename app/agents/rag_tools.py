@@ -16,6 +16,8 @@ from typing import Any
 
 from qdrant_client import models
 
+from app.db.engine import get_session_factory
+from app.db.queries.document_meta import fetch_document_meta
 from app.retrieval.reranker import RankedResult, rerank
 from app.utils.logging import get_logger
 from app.vectorstore.embedder import GeminiEmbedder
@@ -158,6 +160,54 @@ def _to_search_results(ranked: list[RankedResult]) -> list[SearchResult]:
     ]
 
 
+async def _apply_governance(
+    raw: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach ``artifact_class`` + ``confidentiality`` from Postgres and drop
+    results from superseded documents.
+
+    Performed after Qdrant search but before reranking, so per-result tier
+    weights and supersession take effect on every query (no Qdrant
+    backfill required when an artifact class is edited).
+    """
+    if not raw:
+        return raw
+
+    document_ids = {r.get("document_id") for r in raw if r.get("document_id")}
+    if not document_ids:
+        return raw
+
+    Session = get_session_factory()
+    async with Session() as sess:
+        meta_by_id = await fetch_document_meta(sess, document_ids)
+
+    enriched: list[dict[str, Any]] = []
+    dropped_superseded = 0
+    for r in raw:
+        meta = meta_by_id.get(str(r.get("document_id") or ""))
+        if meta is None:
+            # Unknown document (orphaned vector) — keep with default weight
+            enriched.append(r)
+            continue
+        if meta.is_superseded:
+            dropped_superseded += 1
+            continue
+        enriched.append({
+            **r,
+            "artifact_class": meta.artifact_class,
+            "confidentiality": meta.confidentiality,
+            "revision": meta.revision,
+        })
+
+    if dropped_superseded:
+        logger.info(
+            "rag_dropped_superseded",
+            dropped=dropped_superseded,
+            kept=len(enriched),
+        )
+    return enriched
+
+
 # -------------------------------------------------------------------
 # Tool 1: search_chunks  (text chunks from documents)
 # -------------------------------------------------------------------
@@ -196,6 +246,7 @@ async def search_chunks(
         vector_store._client, _CHUNKS_COLLECTION, query_vector,
         limit=limit, query_filter=qf, score_threshold=score_threshold,
     )
+    raw = await _apply_governance(raw)
     ranked = rerank(raw, collection=_CHUNKS_COLLECTION)
     results = _to_search_results(ranked)
 
@@ -248,6 +299,7 @@ async def search_entities(
         vector_store._client, _ENTITY_COLLECTION, query_vector,
         limit=limit, query_filter=qf, score_threshold=score_threshold,
     )
+    raw = await _apply_governance(raw)
     ranked = rerank(raw, collection=_ENTITY_COLLECTION)
     results = _to_search_results(ranked)
 
@@ -298,6 +350,7 @@ async def search_images(
         vector_store._client, _IMAGE_COLLECTION, query_vector,
         limit=limit, query_filter=qf, score_threshold=score_threshold,
     )
+    raw = await _apply_governance(raw)
     ranked = rerank(raw, collection=_IMAGE_COLLECTION)
     results = _to_search_results(ranked)
 
