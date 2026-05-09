@@ -212,6 +212,7 @@ async def guard(
                 temperature=0.1,
                 max_output_tokens=1024,
                 response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
     except Exception as exc:  # noqa: BLE001 — defensive

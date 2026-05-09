@@ -12,7 +12,9 @@ Behavior:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from typing import Any, AsyncIterator
 
 from google import genai
@@ -21,7 +23,6 @@ from google.genai import types
 from app.agents.rag.evidence import build_sources
 from app.agents.rag.retriever import rag_search, wants_images
 from app.agents.rag.types import AgentResponse
-from app.agents.rag.verifier import verify_answer
 from app.agents.rag_tools import SearchResult
 from app.config import Settings
 from app.storage.supabase_storage import SupabaseStorage
@@ -34,7 +35,10 @@ logger = get_logger(__name__)
 MAX_RAG_CALLS = 3
 MAX_SOURCES_RETURNED = 10
 MAX_INLINE_IMAGES = 2
-MIN_IMAGE_ATTACH_SCORE = 0.65
+# Reranker multiplies raw qdrant score by tier_weight (default 0.5 for
+# unknown artifact_class), so post-rerank image scores typically land in
+# the 0.2-0.5 band. A 0.65 floor was effectively unreachable.
+MIN_IMAGE_ATTACH_SCORE = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +184,15 @@ Final-answer rules (CRITICAL):
   • Broad open-ended ("tell me about X") → produce a grounded summary from
     whatever evidence you retrieved. NEVER answer "I cannot answer" if you
     have any related sources — give the user the partial summary.
-- Cite every numeric value, depth, formation, equipment, or named entity
-  with a [Sn] tag matching the source list provided to you.
+- Cite evidence by mentioning the source DOCUMENT FILENAME inline in
+  parentheses, e.g. "NPT was 9.8% of total time (Sajaa_6_EOWR.pdf, p.14)."
+  Do NOT use [S1], [S2] tags. Use the filename string verbatim from the
+  sources block. Page numbers are 1-based.
+- Do NOT call fetch_table speculatively. Only call it when (a) the user
+  explicitly asks for the full table, AND (b) you already have a concrete
+  table_id or page_num from a prior rag_search hit. If you don't have a
+  table_id from search results, do NOT guess one; just answer from the
+  truncated chunk.
 - Use Markdown tables when the answer is naturally tabular.
 - If parts of the question are unanswered by the evidence, acknowledge it
   briefly in the answer text — do not fabricate.
@@ -262,6 +273,47 @@ def _dedupe_merge(
             continue
         seen.add(key)
         out.append(r)
+    return out
+
+
+def _dedupe_documents(hits: list[SearchResult]) -> list[dict[str, Any]]:
+    """Cheap deduped list of source documents from qdrant payloads.
+
+    Replaces the LLM-based citation verifier. One entry per
+    ``document_id`` (or ``filename`` when document_id is missing),
+    carrying the filename + the set of page numbers that contributed
+    hits + the best score seen.
+    """
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for r in hits:
+        key = (r.document_id or r.filename or r.doc_name or "").strip()
+        if not key:
+            continue
+        page = (r.page_num + 1) if isinstance(r.page_num, int) else None
+        existing = by_key.get(key)
+        if existing is None:
+            entry: dict[str, Any] = {
+                "document_id": r.document_id,
+                "filename": r.filename or r.doc_name,
+                "doc_name": r.doc_name,
+                "pages": [page] if page is not None else [],
+                "best_score": float(r.score),
+                "hit_count": 1,
+            }
+            by_key[key] = entry
+            order.append(key)
+        else:
+            if page is not None and page not in existing["pages"]:
+                existing["pages"].append(page)
+            if float(r.score) > existing["best_score"]:
+                existing["best_score"] = float(r.score)
+            existing["hit_count"] += 1
+    out: list[dict[str, Any]] = []
+    for key in order:
+        entry = by_key[key]
+        entry["pages"].sort()
+        out.append(entry)
     return out
 
 
@@ -508,8 +560,10 @@ _FOLLOWUPS_SYSTEM = (
     "- Diverse: don't repeat the same topic three times.\n"
     "- If the answer was 'no evidence', suggest reformulations or related "
     "shapes the user could try.\n"
-    "Return ONLY a JSON object: {\"followups\": [\"...\", \"...\"]} — no "
-    "other keys, no commentary."
+    "OUTPUT RULES (STRICT): Respond with raw JSON only. The first character "
+    "of your response MUST be '{'. No prose, no preamble like 'Here is the "
+    "JSON', no markdown code fences (no ```), no trailing commentary. "
+    "Schema: {\"followups\": [\"...\", \"...\"]}."
 )
 
 
@@ -538,8 +592,16 @@ async def generate_followups(
             config=types.GenerateContentConfig(
                 system_instruction=_FOLLOWUPS_SYSTEM,
                 temperature=0.4,
-                max_output_tokens=256,
+                max_output_tokens=1024,
                 response_mime_type="application/json",
+                # NOTE: do NOT set thinking_budget=0 here. Gemini 3 Flash
+                # combined with response_mime_type=application/json plus a
+                # zero thinking budget intermittently returns an empty
+                # body (no plan -> no JSON), which manifests as "missing
+                # followups" on the FE. Letting the model think briefly
+                # (default budget) restores reliability. This call runs
+                # in the async post-`done` window so the extra ~1-2 s is
+                # invisible to the user.
             ),
         )
     except Exception as exc:  # noqa: BLE001
@@ -548,12 +610,35 @@ async def generate_followups(
         return []
 
     raw = (getattr(resp, "text", "") or "").strip()
-    if not raw:
-        return []
+    finish_reason = None
     try:
-        data = json.loads(raw)
+        finish_reason = str(resp.candidates[0].finish_reason)
+    except (AttributeError, IndexError, TypeError):
+        pass
+    if not raw:
+        logger.debug("synth_followups_empty", finish_reason=finish_reason)
+        return []
+    # Models occasionally ignore response_mime_type=json and prefix with prose
+    # ("Here is the JSON requested:") or wrap in ```json fences. Find the
+    # first { or [ and use raw_decode so trailing fences / extra data don't
+    # blow up the parse. Also strip trailing commas before } or ].
+    cleaned = raw
+    start = min(
+        (i for i in (cleaned.find("{"), cleaned.find("[")) if i >= 0),
+        default=-1,
+    )
+    if start < 0:
+        logger.debug("synth_followups_bad_json",
+                     preview=raw[:200], length=len(raw),
+                     finish_reason=finish_reason)
+        return []
+    candidate = re.sub(r",(\s*[\]}])", r"\1", cleaned[start:])
+    try:
+        data, _ = json.JSONDecoder().raw_decode(candidate)
     except json.JSONDecodeError:
-        logger.warning("synth_followups_bad_json", preview=raw[:120])
+        logger.debug("synth_followups_bad_json",
+                     preview=raw[:200], length=len(raw),
+                     finish_reason=finish_reason)
         return []
     items = data.get("followups") if isinstance(data, dict) else None
     if not isinstance(items, list):
@@ -616,7 +701,7 @@ async def synthesize(
     config_with_tools = types.GenerateContentConfig(
         system_instruction=_SYNTH_SYSTEM,
         temperature=0.2,
-        max_output_tokens=2048,
+        max_output_tokens=32000,
         tools=[_RAG_TOOL],
     )
 
@@ -715,7 +800,7 @@ async def synthesize(
                 config=types.GenerateContentConfig(
                     system_instruction=_SYNTH_SYSTEM + empty_tail,
                     temperature=0.2,
-                    max_output_tokens=2048,
+                    max_output_tokens=32000,
                 ),
             )
             final_text = (getattr(resp, "text", "") or "").strip()
@@ -756,21 +841,19 @@ async def synthesize(
     else:
         status = "answered" if all_hits else "no_evidence"
 
-    followups = await generate_followups(
-        client=client, settings=settings,
-        user_message=user_message, answer=final_text,
-        has_sources=bool(all_hits),
-    )
-
-    # Source verifier — strip unsupported / hallucinated citations.
-    if status == "answered":
-        final_text, report = await verify_answer(
+    # Verifier removed — see streaming path. Followups still run.
+    try:
+        followups = await generate_followups(
             client=client, settings=settings,
-            answer=final_text, sources=sources,
+            user_message=user_message, answer=final_text,
+            has_sources=bool(all_hits),
         )
-        verification_meta = report.to_dict()
-    else:
-        verification_meta = {"skipped": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synth_with_tools_followups_error", error=str(exc))
+        followups = []
+    verification_meta = {"skipped": True}
+
+    documents_used = _dedupe_documents(top_hits)
 
     return AgentResponse(
         status=status,
@@ -785,6 +868,7 @@ async def synthesize(
             "include_images": include_images,
             "total_hits": len(all_hits),
             "verification": verification_meta,
+            "documents_used": documents_used,
         },
     )
 
@@ -837,7 +921,7 @@ async def synthesize_stream(
     config_with_tools = types.GenerateContentConfig(
         system_instruction=_SYNTH_SYSTEM,
         temperature=0.2,
-        max_output_tokens=2048,
+        max_output_tokens=32000,
         tools=[_RAG_TOOL],
     )
 
@@ -947,14 +1031,29 @@ async def synthesize_stream(
             config=types.GenerateContentConfig(
                 system_instruction=_SYNTH_SYSTEM + empty_tail,
                 temperature=0.2,
-                max_output_tokens=2048,
+                max_output_tokens=32000,
+                thinking_config=types.ThinkingConfig(include_thoughts=True),
             ),
         )
         async for chunk in stream:
-            piece = getattr(chunk, "text", "") or ""
-            if piece:
-                final_text_parts.append(piece)
-                yield {"event": "token", "text": piece}
+            # Gemini emits thought summaries and answer text as separate
+            # Parts on the same candidate, distinguished by part.thought.
+            # Walk parts manually so we can route them to different SSE
+            # events (`thought` for engagement during the synth wait;
+            # `token` for the actual answer the user reads).
+            try:
+                parts = chunk.candidates[0].content.parts or []
+            except (AttributeError, IndexError, TypeError):
+                parts = []
+            for part in parts:
+                text = getattr(part, "text", "") or ""
+                if not text:
+                    continue
+                if getattr(part, "thought", False):
+                    yield {"event": "thought", "text": text}
+                else:
+                    final_text_parts.append(text)
+                    yield {"event": "token", "text": text}
     except Exception as exc:  # noqa: BLE001
         logger.warning("synth_stream_final_error", error=str(exc))
 
@@ -993,33 +1092,71 @@ async def synthesize_stream(
     else:
         status = "answered" if all_hits else "no_evidence"
 
-    followups = await generate_followups(
-        client=client, settings=settings,
-        user_message=user_message, answer=final_text,
-        has_sources=bool(all_hits),
-    )
-
-    if status == "answered":
-        final_text, report = await verify_answer(
-            client=client, settings=settings,
-            answer=final_text, sources=sources,
+    # Run followups + verifier concurrently — both are independent of each
+    # other (followups needs only the answer text; verifier needs answer +
+    # sources). Sequential wait was a flat ~5-40s tax on every turn.
+    empty_response = not (final_text or "").strip()
+    if empty_response:
+        logger.warning(
+            "synth_stream_empty_answer",
+            status=status, calls=calls_made, hits=len(all_hits),
         )
-        verification_meta = report.to_dict()
-    else:
-        verification_meta = {"skipped": True}
 
-    yield {
-        "event": "done",
+    # Cheap deduped list of source documents straight from the qdrant
+    # payloads — no LLM call. Replaces the LLM-based citation verifier.
+    documents_used = _dedupe_documents(top_hits)
+
+    common_done_fields = {
+        "session_id": None,  # filled in by route layer
         "status": status,
         "answer": final_text,
-        "followups": followups,
         "sources": sources,
+        "documents_used": documents_used,
         "attached_pages": attached_pages,
         "tool_calls_made": calls_made,
+    }
+
+    # ------------------------------------------------------------------
+    # Progressive finalisation. Emit `done` IMMEDIATELY after the last
+    # token. The verifier was removed (was costing ~20s/turn at timeout
+    # for negligible quality gain — the model now cites by document
+    # filename inline and the deduped documents_used list above gives
+    # the FE everything it needs for source attribution). Followups
+    # still run async so they don't block the answer.
+    # ------------------------------------------------------------------
+    yield {
+        "event": "done",
+        **common_done_fields,
+        "answer": final_text,
+        "followups": {"pending": True},
         "meta": {
             "rag_calls": calls_made,
             "include_images": include_images,
             "total_hits": len(all_hits),
-            "verification": verification_meta,
+            "verification": {"skipped": True},
+            "empty_response": empty_response,
         },
+    }
+
+    # Verification is permanently skipped. Emit the frame immediately so
+    # the FE protocol stays uniform (it can still hide the spinner on
+    # this signal).
+    yield {
+        "event": "verification_update",
+        "verification": {"skipped": True},
+    }
+
+    try:
+        followups = await generate_followups(
+            client=client, settings=settings,
+            user_message=user_message, answer=final_text,
+            has_sources=bool(all_hits),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synth_stream_followups_error", error=str(exc))
+        followups = []
+
+    yield {
+        "event": "followups_update",
+        "followups": followups,
     }

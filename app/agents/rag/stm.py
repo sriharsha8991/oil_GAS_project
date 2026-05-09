@@ -70,7 +70,8 @@ async def maybe_compress_history(
             config=types.GenerateContentConfig(
                 system_instruction=_SUMMARY_SYSTEM,
                 temperature=0.1,
-                max_output_tokens=200,
+                max_output_tokens=512,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         new_summary = (getattr(resp, "text", "") or "").strip()
@@ -110,14 +111,26 @@ async def update_current_subject(
             config=types.GenerateContentConfig(
                 system_instruction=_SUBJECT_SYSTEM,
                 temperature=0.0,
-                max_output_tokens=120,
+                max_output_tokens=256,
                 response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         text = (getattr(resp, "text", "") or "").strip()
         if not text:
             return
-        parsed: dict[str, Any] = json.loads(text)
+        # Tolerate code-fenced or otherwise non-JSON responses — the model
+        # occasionally truncates at max_output_tokens or wraps in fences.
+        if text.startswith("```"):
+            nl = text.find("\n")
+            text = text[nl + 1:] if nl != -1 else text
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        try:
+            parsed: dict[str, Any] = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug("stm_subject_non_json", text_head=text[:80])
+            return
     except Exception as exc:  # noqa: BLE001
         logger.warning("stm_subject_failed", error=str(exc))
         return

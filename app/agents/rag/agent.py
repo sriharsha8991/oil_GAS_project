@@ -387,10 +387,21 @@ async def run_agent_stream(
         user_id=user_id, project_id=project_id, document_id=document_id,
         storage=storage,
     ):
-        if ev.get("event") == "done":
+        ev_kind = ev.get("event")
+        if ev_kind == "done":
+            # Enrich the done frame with agent-level meta BEFORE forwarding,
+            # then keep iterating so verification_update / followups_update
+            # reach the route layer.
+            ev["tool_calls_made"] = (ev.get("tool_calls_made") or 0) + 1
+            ev["meta"] = {
+                **(ev.get("meta") or {}),
+                "path": "guard_then_synth",
+                "rag_invoked": True,
+                "guard_input_tokens": decision.input_tokens,
+                "guard_output_tokens": decision.output_tokens,
+            }
             final_done = ev
             final_answer = ev.get("answer") or ""
-            break
         yield ev
 
     if final_done is None:
@@ -402,9 +413,15 @@ async def run_agent_stream(
             "answer": "",
             "sources": [],
             "attached_pages": [],
-            "tool_calls_made": 0,
-            "meta": {"rag_calls": 0, "include_images": False, "total_hits": 0},
+            "tool_calls_made": 1,
+            "meta": {
+                "rag_calls": 0, "include_images": False, "total_hits": 0,
+                "path": "guard_then_synth", "rag_invoked": True,
+                "guard_input_tokens": decision.input_tokens,
+                "guard_output_tokens": decision.output_tokens,
+            },
         }
+        yield final_done
 
     if final_answer:
         session.add("user", user_message)
@@ -431,15 +448,6 @@ async def run_agent_stream(
         temp=temp,
     )
 
-    final_done["tool_calls_made"] = (final_done.get("tool_calls_made") or 0) + 1
-    final_done["meta"] = {
-        **(final_done.get("meta") or {}),
-        "path": "guard_then_synth",
-        "rag_invoked": True,
-        "guard_input_tokens": decision.input_tokens,
-        "guard_output_tokens": decision.output_tokens,
-    }
-
     logger.info(
         "agent_stream_done",
         session_id=session_id,
@@ -447,4 +455,3 @@ async def run_agent_stream(
         sources=len(final_done.get("sources") or []),
         tool_calls=final_done.get("tool_calls_made"),
     )
-    yield final_done

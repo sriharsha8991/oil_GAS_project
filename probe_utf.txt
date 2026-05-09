@@ -1,0 +1,81 @@
+﻿[probe] using doc Sajaa 6 EOWR.pdf (37e2e2a0-2cab-483a-bf0c-c950566ae341)
+[probe] user_id=97b3928d-99db-4c1b-b36d-88e3d918cfb2
+[probe] doc_id=37e2e2a0-2cab-483a-bf0c-c950566ae341 project_id=a43b3a21-4872-4fed-9626-1f29b4d81ea8
+[probe] query = 'Im Sriharsha Drilling Specilist from sanfrasico tell me the NPT details bore details'
+[probe] session_id=743e4e3d-edce-4411-a82c-55a3754113fc
+
+======================================================================
+[+    418ms ╬ö   418ms] STATUS phase=guard 
+2026-05-09 11:16:00 [info     ] agent_stream_guard             action=synthesize session_id=743e4e3d-edce-4411-a82c-55a3754113fc tokens_in=1076 tokens_out=51
+[+   5425ms ╬ö  5007ms] STATUS phase=rag_search {'query': 'NPT details in Sajaa 6 EOWR.pdf'}
+2026-05-09 11:16:02 [info     ] tool_search_chunks             kinds=None limit=8 query='NPT details in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:02 [info     ] tool_search_entities           entity_type=None limit=6 query='NPT details in Sajaa 6 EOWR.pdf' unit=None
+2026-05-09 11:16:03 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:03 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:03 [info     ] tool_search_chunks_done        count=8 query='NPT details in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:03 [info     ] tool_search_entities_done      count=6 query='NPT details in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:03 [info     ] neighbor_expanded              added=3 seeds=3
+2026-05-09 11:16:03 [info     ] rag_search_done                hits=17 include_images=False query='NPT details in Sajaa 6 EOWR.pdf'
+[+   6615ms ╬ö  1190ms] STATUS phase=rag_search {'query': 'bore details hole size casing depth in Sajaa 6 EOWR.pdf'}
+2026-05-09 11:16:03 [info     ] tool_search_chunks             kinds=None limit=8 query='bore details hole size casing depth in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:03 [info     ] tool_search_entities           entity_type=None limit=6 query='bore details hole size casing depth in Sajaa 6 EOWR.pdf' unit=None
+2026-05-09 11:16:04 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:04 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:04 [info     ] tool_search_entities_done      count=6 query='bore details hole size casing depth in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:04 [info     ] tool_search_chunks_done        count=8 query='bore details hole size casing depth in Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:04 [info     ] neighbor_expanded              added=2 seeds=2
+2026-05-09 11:16:04 [info     ] rag_search_done                hits=16 include_images=False query='bore details hole size casing depth in Sajaa 6 EOWR.pdf'
+[+  10604ms ╬ö  3990ms] STATUS phase=rag_search {'query': 'casing program hole size casing depth Sajaa 6 EOWR.pdf'}
+2026-05-09 11:16:07 [info     ] tool_search_chunks             kinds=None limit=8 query='casing program hole size casing depth Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:07 [info     ] tool_search_entities           entity_type=None limit=6 query='casing program hole size casing depth Sajaa 6 EOWR.pdf' unit=None
+2026-05-09 11:16:08 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:08 [debug    ] embed_batch_done               batch_size=1 model=gemini-embedding-001
+2026-05-09 11:16:08 [info     ] tool_search_chunks_done        count=8 query='casing program hole size casing depth Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:08 [info     ] tool_search_entities_done      count=6 query='casing program hole size casing depth Sajaa 6 EOWR.pdf'
+2026-05-09 11:16:08 [info     ] neighbor_expanded              added=3 seeds=3
+2026-05-09 11:16:08 [info     ] rag_search_done                hits=17 include_images=False query='casing program hole size casing depth Sajaa 6 EOWR.pdf'
+[+  11525ms ╬ö   921ms] STATUS phase=synthesizing 
+[+  20707ms ╬ö  9182ms] TOKEN #  1 len=  37 'Non-Productive Time (NPT) for the Saj'
+[+  20708ms ╬ö     1ms] TOKEN #  2 len=  80 'aa 6 well accounted for 9.8% of total time and 7.8% of total cost, with drilling'
+[+  20759ms ╬ö    51ms] TOKEN #  3 len=  81 ' operations including a second leg (Leg C) that reached a depth of 11,241 ft [S3'
+[+  20875ms ╬ö   117ms] TOKEN #  4 len=  73 ' S10].\\n\\n### NPT Summary\\nThe total rig time for the project was 23.0 days,'
+[+  20978ms ╬ö   103ms] TOKEN #  5 len=  72 ' with a total well cost of $3,423,840 [S3]. NPT was primarily attributed'
+[+  21084ms ╬ö   105ms] TOKEN #  6 len=  82 ' to Baker and bp operations.\\n\\n| Category | NPT Hours | NPT Cost | NPT Time % |'
+[+  21175ms ╬ö    92ms] TOKEN #  7 len=  59 ' Cost % |\\n| :--- | :--- | :--- | :--- | :--- |\\n| Baker | 40'
+[+  21312ms ╬ö   137ms] TOKEN #  8 len=  35 '.0 hrs | $201,741 | 7.2% | 5.9% |\\n|'
+[+  21375ms ╬ö    62ms] TOKEN #  9 len=  34 ' bp | 14.4 hrs | $66,103 | 2.6% | '
+[+  21488ms ╬ö   113ms] TOKEN # 10 len=  46 '1.9% |\\n| Others (GSI, SLB, etc.) | 0.0 hrs | $'
+[+  21572ms ╬ö    84ms] TOKEN # 11 len=  37 '0 | 0.0% | 0.0% |\\n| **Total** | **54.'
+[+  21664ms ╬ö    92ms] TOKEN # 12 len=  39 '4 hrs** | **$267,844** | **9.8%** | **7'
+[+  21784ms ╬ö   120ms] TOKEN # 13 len=  64 '.8%** |\\n*Sources: [S1, S3, S4]*\\n\\n### Bore and Drilling Details ('
+[+  21889ms ╬ö   105ms] TOKEN # 14 len= 100 'Leg C)\\nDrilling for the second leg, designated as Leg C, involved the following'
+[+  21969ms ╬ö    80ms] TOKEN # 15 len=  58 '**Interval:** The leg was troughed from 11,010 ft to 11,02'
+[+  22075ms ╬ö   106ms] TOKEN # 16 len=  69 '5 ft, time drilled to 11,033 ft, and continued to a total depth of 11'
+[+  22187ms ╬ö   113ms] TOKEN # 17 len=  87 ',241 ft [S10].\\n*   **Formation:** Drilling progressed into the top Lekhwair for'
+[+  22272ms ╬ö    85ms] TOKEN # 18 len=  63 'S10].\\n*   **Equipment:** BHA #6 utilized a Smith M09 bit and a '
+[+  22375ms ╬ö   103ms] TOKEN # 19 len=  49 '2 7/8" M1 ADM motor with a 0.75-degree AKO [S10].'
+[+  22514ms ╬ö   139ms] TOKEN # 20 len=  91 '\\n*   **Performance:** An initial ROP increase to 100 ft/hr was noted after chan'
+[+  22609ms ╬ö    94ms] TOKEN # 21 len=  93 ' motor from BHA #5 [S10].\\n\\n### Operational Context\\nEvery failure of a Bottom '
+[+  22721ms ╬ö   113ms] TOKEN # 22 len= 117 'HA) was recorded as NPT against Baker per bp standard procedure [S3]. However, b'
+[+  22835ms ╬ö   114ms] TOKEN # 23 len= 123 ' the project consisting of two milling BHAs per window (one for the whipstock an'
+[+  22953ms ╬ö   118ms] TOKEN # 24 len=  98 ' per leg [S3]. Appendix 5 and 6 of the report contain further details on BOT Whi'
+[+  23005ms ╬ö    52ms] TOKEN # 25 len=  28 ' BHA run summaries [S5, S6].'
+[+  23035ms ╬ö    30ms] STATUS phase=verifying 
+2026-05-09 11:16:42 [info     ] agent_stream_done              session_id=743e4e3d-edce-4411-a82c-55a3754113fc sources=10 status=answered tool_calls=4
+[+  45534ms ╬ö 22499ms] DONE status=answered
+======================================================================
+
+[probe] tokens=25  concat_len=1715
+[probe] done.status         = 'answered'
+[probe] done.answer length  = 1676
+[probe] done.answer preview = 'Non-Productive Time (NPT) for the Sajaa 6 well accounted for 9.8% of total time and 7.8% of total cost, with drilling operations including a second leg (Leg C) that reached a depth of 11,241 ft [S3, S'
+[probe] sources count       = 10
+[probe] followups           = ['What specific BHA failures contributed to the Baker NPT', 'How many BHAs were used compared to the technical limit', 'What were the drilling specifications for Leg B']
+[probe] meta.path           = guard_then_synth
+[probe] meta.empty_response = False
+[probe] meta.rag_calls      = 3
+[probe] meta.total_hits     = 31
+[probe] meta.verification   = {'cited_ids': ['S3', 'S10'], 'unknown_ids': [], 'unsupported_ids': ['S3', 'S10'], 'checked': 2, 'skipped': False, 'error': None}
+[probe] answer vs concat    = CONCAT LONGER
+
+[probe] wrote 32 events -> data\probe_runs\probe_20260509T054642Z_743e4e3d.json

@@ -4,13 +4,163 @@
 >
 > **How to read:** Each phase has its own section. The **Open Items** table is the canonical to-do for backend. Resolved items move to the **Resolved** subsection of the relevant phase, with the resolution noted.
 >
+> **Last updated:** 2026-05-07 — **v1.8**. **Auth pivot landed end-to-end on the FE.** Backend `communication_from_backend.md` v2.5 reversed the Supabase-JS-SDK direction: invite-only, backend owns `/auth/login` + `/auth/refresh` + `/auth/change-password` + `/auth/me` + `/auth/me/profile`; public signup is gone; new tier `admin` (org-scoped, quota-limited) sits between `super_admin` and end-user roles. **FE actions completed today:** removed `@supabase/supabase-js` and `@supabase/ssr`; deleted `lib/supabase/`; new `lib/auth/token-store.ts` (in-memory access token + localStorage refresh token); rewrote `lib/api.ts` with single-flight refresh on 401; rewrote `lib/queries/auth.ts` against the new endpoints; replaced login page; signup page now a "Contact your administrator" stub; `useChangePassword` mutation added; `useAdminUsers` shape uses `user_quota` (int, 0 = unlimited) + `invited_by` per backend §0.0; new `useResendInvite` + `useUpdateUserQuota` hooks; `admin` role added to `Role` enum + nav gates + role labels. Build green (12/12 routes). New asks **B-018..B-030** from v1.7 still pending. See [§0.2 v1.8 Auth Pivot Landed](#02-v18-auth-pivot-landed-2026-05-07).
+>
 > **Last updated:** 2026-05-07 — **v1.7**. End-to-end FE audit completed (zero direct Supabase data-layer calls — everything flows through backend HTTP API per the platform constraint). New asks **B-018..B-030** filed: 5 missing endpoints (briefings, lessons, entities/distinct, compare, admin/stats), 1 architectural ask (replace ingest polling with backend-owned SSE — FE must NOT subscribe to Supabase Realtime directly), and 7 contract clarifications. See [§0.1 v1.7 New Asks](#01-v17-new-asks-2026-05-07) below.
 >
 > **Last updated:** 2026-05-06 — v1.6. Backend response **v2.5** received and reconciled. **B-014 (CORS preflight 401) fixed and verified by backend** (`OPTIONS /chat → 204`). FE will keep the `/api/backend` Next.js proxy in place for defense-in-depth; it's now optional rather than load-bearing. Status corrections applied: **B-001 / B-002 / B-005 / B-012 / B-013 are all ✅ Resolved** (FE doc was stale). **B-015 / B-016 / B-017 answered in writing** (see [communication_from_backend.md §0.0.4–§0.0.6](communication_from_backend.md#004-b-015--documentsidfull-content-type-lock-in--confirmed)). **Auth guardrail re-stated:** no `/auth/signup`, no `/auth/login`, no `PATCH /auth/me { role }` — Supabase JS SDK owns auth, backend exposes only `GET /auth/me` + `PATCH /auth/me/profile { display_name?, organization? }`. FE already conforms. Legacy `data/output/<job_id>/manifest.json` filesystem path is **deprecated** — Postgres `jobs` row + Realtime is the source of truth.
 
 ---
 
-## 0.1 v1.7 New Asks (2026-05-07)
+## 0.3 v1.9 Streaming UX Hardening (2026-05-08)
+
+> **Context:** While polishing the chat surface (Phase 1+2 of the post-Sprint-7 UX upgrades), three concrete streaming-protocol gaps surfaced. Two are FE bugs we already fixed; one is a clarification we'd like the BE to confirm. New asks: **B-061** (already filed, now upgraded to ✅ Resolved on the FE side via tail-recovery), **B-063**, **B-064**, **B-065**.
+
+### 0.3.1 What FE shipped today
+
+| Area | Before | After |
+|---|---|---|
+| `ChatStreamPhase` enum | `"guard" \| "rag_search"` only — every other phase string emitted by the BE was silently dropped in `dispatchEvent`. | New union: `"guard" \| "rag_search" \| "fetch_document_outline" \| "fetch_table" \| "synthesizing" \| "verifying"`. Forward-compat: any string is now passed through to the store. |
+| Status line (`StatusLine`) | "Searching documents…" or "Thinking…" only. | Per-phase label + icon: `Reading document outline…`, `Extracting tables…`, `Composing answer…`, `Verifying citations…`, plus the existing two. Honors the `query` field for `rag_search`. |
+| Status line lifecycle | Lingered above the streaming text once tokens started arriving (because `setPhase` was never reset). | Cleared automatically on the first `token` event via `appendToken` in [lib/store/chat.ts](../lib/store/chat.ts) — the placeholder vanishes the instant text begins streaming. |
+| `done` payload `answer` field | Discarded (FE assumed all final tokens always arrive as `token` events). | **Tail-recovery:** if `payload.answer` is strictly longer than the streamed `turn.text`, we swap in the payload as authoritative. Repairs truncated streams without clobbering clean ones. See `finishAssistant` in [lib/store/chat.ts](../lib/store/chat.ts). |
+| Empty-bubble safety | When `done` arrived with no tokens *and* no `payload.answer`, the user saw a blank bubble with a Verified badge. | Bubble now renders `(No response received from the model. Try resending.)` and is flagged `errored`. |
+| `ToolTimeline`, `ReasoningPanel`, code copy/lang label, edit-and-resend, scroll-to-bottom pill, auto-grow textarea, fade-in motion | n/a | Shipped (see [communication_from_backend.md v2.8](communication_from_backend.md) §13 — none required BE changes). |
+
+**Build status:** `npx next build` ✅ green — 12/12 routes, no new TS errors.
+
+### 0.3.2 New asks for backend
+
+| ID | Ask | Priority |
+|---|---|---|
+| **B-061** | **(was open) `done` payload should always include the final `answer` string.** Resolution: BE confirmed in v2.8 that `payload.answer` is populated when present; FE now treats it as tail-recovery. **No further BE action required**, but please keep this contract — the FE relies on it as a safety net for truncated streams. | ✅ Resolved (FE-side fallback in place) |
+| **B-063** | **Why does `done` ever fire with neither tokens nor `payload.answer`?** Observed by user 2026-05-08: a session marked `status: answered`, `tool_calls: 0`, verifier `verified`, but the streamed body was completely empty (no `token` events fired, `payload.answer` not present). The bubble would have rendered blank had the FE not added the placeholder above. Possible causes: upstream model returned an empty completion; provider error swallowed by the BE; race condition where `done` is emitted before the synth tokens are flushed. **Ask:** when this happens, please surface a non-empty `error` event instead of a `done` so the FE can show a real error toast and let the user retry. | 🟡 Important |
+| **B-064** | **Confirm the `verifying` phase exists.** Backend message hinted at adding it "to explain the pause between the last token and `done`". FE has already wired the label + icon; we'd like to enable it. If you ship it, please also continue emitting `verifier_dropped` in `meta` (already documented in v2.8 §13.4). | 🟢 Clarification |
+| **B-065** | **Forward-compat for unknown phases.** FE now accepts any string in `status.phase` and renders a generic spinner for ones it doesn't recognize. If the BE plans to add new phases (e.g. `re_planning`, `tool_call:<name>`), please document them in `communication_from_backend.md` so we can add proper labels. Until then, generic "Working…" is fine. | 🟢 Clarification |
+
+### 0.3.3 What FE explicitly will NOT do
+
+- **Will not** retry a stream automatically on mid-stream error (could replay tokens / spend tokens twice). User must click resend.
+- **Will not** treat `done.answer` shorter than streamed text as a downgrade — once tokens have rendered we keep them. Only strict-longer swaps are honored, so the BE is free to omit `answer` when streaming worked normally.
+- **Will not** subscribe to a new BE channel for "verifying" — please keep it as a `status.phase` event so the existing SSE plumbing handles it.
+
+---
+
+
+
+> **Context:** [communication_from_backend.md v2.5](communication_from_backend.md) reversed earlier guidance. Backend now owns the entire credential surface; FE no longer ships `@supabase/*`. This section documents what shipped on the FE side, what's now blocked or changed, and the residual asks for backend.
+
+### 0.2.1 What FE shipped today
+
+| Area | Before (v1.7) | After (v1.8) |
+|---|---|---|
+| Auth deps | `@supabase/supabase-js ^2.105.3` + `@supabase/ssr ^0.10.2` | **Removed** from `package.json`. Zero `supabase` imports in `lib/`, `app/`, `components/` (verified by grep). |
+| Token storage | Supabase SDK cookies + localStorage | New [lib/auth/token-store.ts](../lib/auth/token-store.ts) — access token in memory only; refresh token in `localStorage` under `ws.refresh_token`; small subscriber list for cross-tab sync. |
+| Sign-in | `supabase.auth.signInWithPassword` | `POST /auth/login { email, password }` → `{ access_token, refresh_token, expires_in, user }`. |
+| Sign-out | `supabase.auth.signOut` | Clears the token store + invalidates `["auth", "me"]`. No backend call (per v2.5 §0.0.2 — refresh token invalidation is implicit). |
+| Refresh | Auto via SDK | Single-flight refresh inside [lib/api.ts](../lib/api.ts): on `401`, call `POST /auth/refresh { refresh_token }`, then retry the original request once. |
+| Sign-up | `supabase.auth.signUp` (public) | **Removed.** `app/(auth)/signup/page.tsx` now a "Contact your administrator to request access" stub. |
+| Profile | `PATCH /auth/me/profile { display_name?, organization? }` | Same shape; endpoint unchanged. |
+| Password change | n/a (Supabase email link) | `useChangePassword` → `POST /auth/change-password { current_password, new_password }`. Wired into `/settings`. |
+| `useCurrentUser` | Supabase session as truth + `/auth/me` enrichment | `GET /auth/me` is now the single source of truth. No `null`-fallback; query returns `null` only when the token store is empty or refresh fails. |
+| Admin users list | `{ items, total, limit, offset }` with `id, email, role, display_name, organization, created_at` | Same envelope, **new fields per §0.0:** `user_quota: number \| null` (admin-row only; `0 = unlimited`), `invited_by: uuid \| null`. No `status`, `quota_used`, or `last_seen_at` field — those were FE inventions and have been removed. |
+| Admin invite | `POST /admin/users/invite { email, display_name?, role? }` | Same body **+ `organization?`** (super_admin must supply when role=`admin`) **+ `user_quota?: number`** (super_admin only, only when role=`admin`; 0 = unlimited). Admin caller passing `role: admin\|super_admin` → `403 role_not_assignable_by_admin`. Admin over quota → `403 quota_exceeded { user_quota, current_invitees }`. |
+| Admin actions | role change, delete | **+ `POST /admin/users/{id}/resend-invite`** (rotates temp password, emails new one — super_admin only, returns `{ message }`); **+ `PATCH /admin/users/{id}/quota`** with body `{ user_quota: int }` (super_admin only). |
+| Roles enum | `super_admin \| drilling_engineer \| geologist \| asset_manager \| qa_steward` | **+ `admin`** (org-scoped, quota-limited tier). Nav gates and role labels updated. |
+| `auth-bootstrapper` | `supabase.auth.onAuthStateChange` listener | Now a thin component that calls `useCurrentUser()` on mount and listens to `tokenStore.subscribe(...)` for cross-tab sign-out propagation. |
+
+**Build status:** `npx next build` ✅ green — 12/12 routes, no TS errors. Two pre-existing ESLint warnings (a11y on upload page, useMemo hint on admin-stats) — unchanged.
+
+### 0.2.2 Endpoints FE now calls (auth surface)
+
+```
+POST   /auth/login              { email, password }                  → 200 LoginResponse | 401 invalid_credentials | 403 disabled
+POST   /auth/refresh            { refresh_token }                     → 200 LoginResponse | 401 expired_or_revoked
+POST   /auth/change-password    { current_password, new_password }    → 204 | 400 weak | 401 wrong_current
+GET    /auth/me                                                       → 200 MeResponse | 401
+PATCH  /auth/me/profile         { display_name?, organization? }      → 200 MeResponse | 422
+GET    /admin/users?q=&role=&status=&limit=&offset=                   → 200 AdminUserList | 403 requires_role
+POST   /admin/users/invite      { email, display_name?, role?, organization?, user_quota? }
+                                                                      → 201 UserRow + { message } | 403 role_not_assignable_by_admin | 403 quota_exceeded | 409 email_already_registered | 409 admin_missing_organization | 502 email_send_failed
+POST   /admin/users/{id}/resend-invite                                → 200 { message } | 403 cross_org_forbidden | 404
+PATCH  /admin/users/{id}/role   { role }                              → 200 UserRow | 400 invalid_role
+PATCH  /admin/users/{id}/quota  { user_quota }                        → 200 UserRow (super_admin only)
+DELETE /admin/users/{id}                                              → 204 | 400 cannot_delete_self | 403 cannot_delete_admin_or_super | 403 cross_org_forbidden
+```
+
+`LoginResponse = { access_token, refresh_token, expires_in, token_type: "bearer", user: MeResponse }`.
+`MeResponse = { id, email, role, display_name?, organization? }` per backend §0.0.2 (no `status`/`quota_*` fields).
+
+### 0.2.3 Status updates to v1.7 asks
+
+| ID | v1.7 Status | v1.8 Update |
+|---|---|---|
+| **B-024** (auth/me role default) | Open | ✅ **Resolved by §0.0.4.** `handle_new_user` trigger no longer applies (signup is admin-mediated). Invite body `role` defaults to `drilling_engineer`. `MeResponse.role` always non-null. |
+| **B-027** (admin users limit) | Open | **Restated:** what's the max `?limit=`? FE caps at 50 today. (No `?status=` filter — that field doesn't exist in v2.5.) |
+| **B-023** (SSE for ingest) | Open | **Re-emphasized.** The Supabase Realtime path is now structurally impossible — FE has no Supabase client at all. SSE on backend is the only path forward. |
+| All others (B-018..B-022, B-025, B-026, B-028..B-030) | Open | Unchanged. |
+
+### 0.2.4 New asks introduced by the auth pivot — most ALREADY ANSWERED in §0.0
+
+After re-reading backend §0.0 carefully, the following are already specified — recorded here for traceability so FE doesn't re-ask:
+
+| ID | Ask | Backend answer | Status |
+|---|---|---|---|
+| **B-031** | `POST /auth/refresh` body shape & response | §0.0.2: `{ refresh_token } → same shape as /auth/login`. ✅ FE matches. | ✅ Resolved |
+| **B-032** | Refresh token rotation policy | §0.0.3: "The response always rotates both tokens." ✅ FE assumes rotation. | ✅ Resolved |
+| **B-033** | `/auth/login` error envelope | §0.0.8 lists locked codes: `invalid_credentials`, `unauthorized`, `requires_role`, `quota_exceeded`, `cross_org_forbidden`, `cannot_delete_admin_or_super`, `cannot_delete_self`, `invalid_role`, `email_already_registered`, `admin_missing_organization`, `email_send_failed`. ✅ FE will map these in toasts. | ✅ Resolved |
+| **B-034** | Invite UX — callback URL or temp password? | §0.0.5 + §0.0.6: temp password emailed via Resend (`Wellsynth <no-reply@rax-resume.xyz>`) → user pastes into `/login`. **No callback page needed.** ✅ Matches FE. | ✅ Resolved |
+| **B-035** | `resend-invite` response shape | §0.0.2 / §0.0.7: returns `{ message }`; replaces password with new random value, old password stops working immediately. (Idempotency: every call rotates; backend has no built-in rate limit doc'd — file as B-039 if we hit abuse.) | ✅ Resolved (response shape FE updated to `{ message }`) |
+| **B-036** | Quota-decrement model | §0.0.4: "backend counts existing rows where `users_profile.invited_by = caller.id`." → counter moves **on invite send**, not on accept. ✅ FE displays `current_invitees` from the 403 error if quota hit. | ✅ Resolved |
+| **B-037** | `change-password` token persistence | §0.0.6 step 5: "FE re-uses the existing tokens (Supabase keeps the same session valid)." ✅ FE doesn't refresh. | ✅ Resolved |
+| **B-038** | Forgot-password / reset-password endpoints | §0.0.7: not in v1; recovery is `POST /admin/users/{id}/resend-invite`. ✅ FE has no forgot-password UI. | ✅ Resolved |
+
+### 0.2.4.1 Genuinely new asks (still open after re-reading §0.0)
+
+| ID | Ask | Priority |
+|---|---|---|
+| **B-039** | `POST /admin/users/{id}/resend-invite` rate limit / abuse protection — what is it? FE will surface 429 if it exists; otherwise we'll add a 30s client-side debounce on the button. | 🟢 Clarification |
+| **B-040** | `MeResponse` (the `user` field on `LoginResponse`) — confirm it includes `role` and `organization` (not just `id` + `email`). FE persists the result of `/auth/login` directly into `useAuthStore`; if `role`/`organization` is missing we have to call `/auth/me` immediately after login. Per §0.0.2 the schema is `{ id, email, role, display_name, organization }`. ✅ Assumed; please confirm in the OpenAPI snapshot. | 🟢 Clarification |
+| **B-041** | Confirm the role enum on the wire. FE expects exactly: `super_admin \| admin \| drilling_engineer \| geologist \| asset_manager \| qa_steward`. Backend §0.0.1 lists these but the OpenAPI snapshot needs to lock them. | 🟢 Clarification |
+| **B-042** | Locked `error_code` enum in error envelope. §0.0.8 lists 12 codes — please confirm the JSON shape is `{ detail: { error_code: "<code>", message?: "<human>" } }` (FastAPI default with custom `detail` dict) so FE can switch on `error.detail.error_code`. The current `ApiError.detail` field captures this if so. | 🟡 Important |
+| **B-043** | List-envelope convention. `GET /projects` returns `{count, projects}`, `GET /admin/users` returns `{items, total, limit, offset}`. Pick **one** envelope per resource (or expose `{items, total}` everywhere) and lock it in the OpenAPI snapshot. FE currently normalises both shapes defensively. | 🟢 Clarification |
+| **B-044** | `GET /search`, `GET /auth/me`, `PATCH /auth/me/profile`, `GET /ingest`, `POST /ingest/upload`, `GET /documents`, `GET /documents/{id}`, `GET /ingest/{job_id}` all advertise `additionalProperties: true` in OpenAPI. Lock the response schemas so the FE can drop the defensive normalisers. | 🟡 Important |
+| **B-045** | `DELETE /projects/{id}` and `DELETE /documents/{id}` return `200` with a body, while `/admin/users/{id}` and `/auth/change-password` return `204`. Pick one. FE discards the body either way. | 🟢 Clarification |
+| **B-046** | `POST /admin/users/{id}/resend-invite` returns `InviteResponse` (full row + `message`) per OpenAPI — confirm the temp password is *not* part of the response body (security). FE only renders the `message` toast today. | 🟢 Clarification |
+| **B-047** | Resource-creation status codes: `POST /admin/users/invite` returns 201, `POST /projects` returns 200. Pick one (industry default: 201). FE doesn't branch on status today. | 🟢 Clarification |
+| **B-048** | `GET /documents` should inline `latest_job` per row (`{ status, current_phase, pages_done, pages_total }`). Today FE does an N×M client-side join of `GET /ingest` against `GET /documents` to derive Library status. Either inline or expose `?include=latest_job`. | 🟡 Important |
+| **B-049** | Confirm `GET /documents?project_id=` is honoured for `super_admin` callers (i.e. the filter narrows even when RLS would otherwise return cross-project rows). FE Library page passes the filter and assumes the backend respects it. | 🟢 Clarification |
+| **B-050** | Per-user feature-flag object on `/auth/me` and on the `user` field of `/auth/login`. Sprint cadence in [docs/update.md](update.md) names six rollout flags (`streaming`, `memory`, `followups`, `compareTool`, `verifier`, `slashCommands`). Without server-side flags the FE has to ship hard-coded `NEXT_PUBLIC_FEATURE_FLAGS` env vars and re-deploy to flip them. Suggested shape: `"ff": { "streaming": true, ... }`. | 🟡 Important |
+| **B-051** | `POST /chat/stream` (Sprint 1 of [update.md](update.md)) — confirm: (a) endpoint path; (b) `Content-Type: text/event-stream` response; (c) line protocol of `data: <json>\n\n` frames; (d) `event` field in JSON body is one of `status \| token \| done \| error`; (e) on auth failure the server returns 401 *before* opening the stream (FE doesn't retry mid-stream). | 🔴 Blocker for Sprint 1 |
+| **B-052** | `GET /memories?scope=`, `DELETE /memories/{scope}/{key}`, `POST /memories/forget-all` (Sprint 3) — confirm endpoint paths + response shapes match `{ items: MemoryItem[] }` with `scope ∈ { preference, fact, project_pin, style, dismissed }`. Also confirm `meta.memory_captured: true` on the chat done payload when the post-turn capture task fires. | 🔴 Blocker for Sprint 3 |
+| **B-053** | `ChatResponse.followups: string[]` (Sprint 5) — confirm rename from current singular `followup: string \| null` and that backend may emit either field for one release while clients migrate. FE reads `followups` and falls back to `[followup]` if missing. | 🟡 Important |
+| **B-054** | `meta.tools_used: string[]` (Sprints 4/6/7) and `meta.verifier_dropped: number` (Sprint 7) — confirm these land on the chat done envelope. Tool names FE listens for: `fetch_document_outline`, `fetch_table`, `compare_documents`, `search`. | 🟢 Clarification |
+| **B-055** | Citation marker syntax for verifier (Sprint 7) — confirm `[Sn]` (verified) vs `[Sn?]` (unsupported) in the streamed answer text. FE markdown post-processor will linkify both with different styling. | 🟢 Clarification |
+
+### 0.2.5 What FE explicitly will NOT do (recorded for symmetry)
+
+- ❌ Never re-add `@supabase/*` packages to `package.json`. Build will reject the import.
+- ❌ Never read `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` on the client. Both removed from [.env](../.env).
+- ❌ No browser-side password-reset / magic-link flows. All recovery is admin-mediated via `resend-invite`.
+- ❌ No public `/signup` page. The route now renders a stub directing users to contact their administrator.
+- ❌ No callback / accept-invite page. Invitees use the temp password directly on `/login`.
+
+### 0.2.6 Migration verification
+
+| Check | Result |
+|---|---|
+| `grep -r "supabase" lib/ app/ components/` (live code) | 0 hits (only doc-comment mentions remain in `require-auth.tsx` historical context) |
+| `package.json` deps | `@supabase/*` removed; lockfile re-synced via `npm install` (11 packages removed) |
+| `next build` | ✅ Compiled, all 12 routes |
+| `tsc --noEmit` | ✅ Clean |
+| Token-store unit smoke | Set → get returns same token; subscribe fires on set/clear |
+| Admin row shape matches §0.0 | ✅ `user_quota` (int) + `invited_by` (uuid \| null); no fictional `status`/`quota_used`/`quota_limit`/`last_seen_at` |
+| Resend-invite returns `{ message }` | ✅ `useResendInvite` types match |
+| Quota mutation body is `{ user_quota }` | ✅ `useUpdateUserQuota` matches §0.0.2 |
+
+---
+
+
 
 > **Context:** Full FE → backend retrospection completed 2026-05-07. Platform rule reaffirmed: **frontend MUST NEVER touch Supabase DB / Storage / Realtime directly.** Only `supabase.auth.*` (session + JWT) is permitted in the browser. Everything else — including ingest progress streaming — must go through backend HTTP endpoints. Audit found zero violations of this rule today; this section files the endpoints and clarifications needed to keep it that way as P1b/P2/P3 features land.
 >

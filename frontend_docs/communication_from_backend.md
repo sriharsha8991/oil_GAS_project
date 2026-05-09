@@ -4,7 +4,7 @@
 >
 > **How to read:** §0.0 is the **current auth contract** and supersedes any earlier statement about Supabase JS, public signup, or "no /auth/login on backend." §0 is the PR-7 identity/storage contract. §1+ is historical commentary; treat it as background.
 >
-> **Last updated:** 2026-05-08 — **v2.8**. Shipped on top of v2.7: **§0.5 governance metadata + tier-weighted reranker** (`artifact_class`, `confidentiality`, `superseded_by` on every document; reranker uses PRD §10 evidence hierarchy; superseded docs filtered out of retrieval), **`PATCH /documents/{id}`** for editing governance fields, **`POST /documents/{id}/auto-classify`** + **automatic LLM classification at the end of ingest** (only when the user accepts the default `other`; user-supplied classes are always respected), and the L1 hardening pieces from earlier in the day (entity normalizer + numeric guardrail wired into the extractor). **174/174 tests pass; OpenAPI snapshot is 36 paths.** v2.7 (2026-05-08) added §13 (slash commands, verifier, persistent transcript, archive); v2.6 added §12; v2.5 (2026-05-07) flipped auth to invite-only — see §0.0.
+> **Last updated:** 2026-05-08 — **v2.9**. Shipped on top of v2.8: **§14 streaming UX hardening** in response to `BACKEND_REPORT.md` v1.9 — new `{"event":"status","phase":"verifying"}` frame between the last token and `done` (B-064), additive `meta.empty_response: boolean` on every `done` payload so the FE can authoritatively distinguish a real empty model response from a dropped SSE frame (B-063), formal documentation of the full `status.phase` enum and forward-compat policy (B-065), and confirmation that `done.answer` is and will remain the canonical source of truth for the final answer string (B-061). Two small noise fixes also landed: `chat_title_gen_failed` no longer fires on empty model output, and `stm_subject_failed` now downgrades JSON-decode misses to debug. **174/174 tests pass; OpenAPI snapshot is 36 paths.** v2.8 added §0.5 governance + LLM auto-classifier; v2.7 added §13 (slash commands, verifier, persistent transcript, archive); v2.5 (2026-05-07) flipped auth to invite-only — see §0.0.
 > **Owner:** Backend team.
 > **Status:** §2.7 PR-5 ✅ | §2.7.1 PR-5.1 ✅ | §2.8 PR-6 ✅ | §2.10 PR-7 ✅ | §0.0 Invite-only auth ✅ | §12 Memory + Chat Sessions ✅ | **§0.5 Governance + auto-classify ✅** (new). §2.9 still Open.
 
@@ -1283,5 +1283,61 @@ Both 404 with `session_not_found` if the caller doesn't own the session. Sets / 
 
 ---
 
-*End of Backend → Frontend Communication v2.8 — 2026-05-08 (governance metadata, tier-weighted reranker, LLM auto-classifier on top of v2.7).*
+## 14. Streaming UX hardening — response to BACKEND_REPORT v1.9 (2026-05-08)
+
+The FE shipped §0.3 of `BACKEND_REPORT.md` (forward-compat phase enum, per-phase status labels, `done.answer` tail-recovery, empty-bubble safety). Four new asks: **B-061 ✅** (already resolved), **B-063**, **B-064**, **B-065**. Backend response below.
+
+### 14.1 B-061 — `done.answer` always present → CONFIRMED, contract preserved
+
+The synthesizer guarantees `done.answer` is **non-null** on every code path:
+
+- **prefilter / guard_reply / guard_clarify** — `answer` = the prefilter or guard reply text.
+- **synthesizer answered path** — `answer` = the verifier-corrected final text. If the model returns nothing usable, the synthesizer substitutes a fallback message (`"I retrieved related content but couldn't compose a confident answer…"` or `"I couldn't find evidence in the ingested documents…"`) and emits it as the final `token` *and* sets `done.answer` to the same string.
+- **stream-aborted path** (synthesizer raised before producing a `done`) — `answer = ""` with `status = "no_evidence"` and `meta.error = "agent_failed"`.
+
+So the only way `done.answer` is empty *and* `status = "answered"` is the abort path described above (where `meta.error` is set). The FE's tail-recovery is the right call; we'll keep this contract.
+
+### 14.2 B-063 — empty `done` with no tokens and no `payload.answer`
+
+Three causes worth distinguishing:
+
+1. **SSE proxy dropped the final `token` frame.** Then `done.answer` is still populated and the FE's tail-recovery kicks in correctly. No backend change needed.
+2. **Both `token` and `done.answer` came through empty.** This requires either (a) the model returning a 0-token completion *and* the synthesizer's empty-answer fallback failing, or (b) two separate frames being dropped by the proxy. Neither is something we can fully prevent server-side.
+3. **A real upstream model failure that the synthesizer swallowed.** Possible — `synth_stream_final_error` is logged as a warning and we proceed with whatever partial text we have.
+
+**What backend just shipped to make this debuggable from the FE side:** every `done` now carries `meta.empty_response: boolean`. When `true` the FE knows the answer string is empty *as observed by the backend* (i.e. not just a proxy drop) and can render the "no response from the model" placeholder authoritatively rather than guess. Backend also writes `synth_stream_empty_answer` to the structured log when this fires so we can correlate FE incident reports with server traces.
+
+We considered emitting an `error` event in this case, but that's a heavier breaking change for a corner case. `meta.empty_response` is additive and reliable. Reassess if the FE sees this trigger frequently in the wild.
+
+### 14.3 B-064 — `verifying` phase → SHIPPED
+
+The synthesizer now emits `{"event":"status","phase":"verifying"}` immediately before `verify_answer()` runs, and only when `status == "answered"` (the verifier is skipped on `no_evidence`). So the FE's existing label/icon wiring will light up automatically. The verifier output continues to be reported in `meta.verification` (which the FE knows as `meta.verifier_dropped` per §13.4 — same payload, full report shape per `VerificationReport.to_dict()`).
+
+### 14.4 B-065 — Forward-compat for unknown phases → POLICY DOCUMENTED
+
+Backend will not emit a phase string that isn't in this enumeration without first updating this doc. **The full set of `status.phase` values today:**
+
+| `phase` value | When emitted | Suggested FE label |
+|---|---|---|
+| `guard` | First token of every non-prefilter request, while the agent decides whether to invoke RAG | "Understanding your question…" |
+| `rag_search` | Before each `rag_search` tool call. Optional `query` field carries the model-generated query string. | "Searching the knowledge base…" + dim secondary line for the query |
+| `fetch_document_outline` | Before a `fetch_document_outline` tool call | "Reading document outline…" |
+| `fetch_table` | Before a `fetch_table` tool call | "Pulling a table from the document…" |
+| `synthesizing` | Once all retrieval is done and final-answer streaming begins | "Composing the answer…" |
+| `verifying` | After the answer streams, before the verifier rewrites citations | "Verifying citations…" |
+
+If we add a phase later (e.g. an L6 skill router → `routing` / `summarize_artifact` / `compare_documents`) we'll update this table in the same PR. The FE's "render any unknown phase as 'Working…'" fallback is exactly the right defense; please keep it.
+
+### 14.5 SSE contract reminder
+
+For any future investigation of dropped frames:
+
+- `Content-Type: text/event-stream`
+- Headers we set: `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `Connection: keep-alive`
+- **No `Content-Encoding: gzip`** — backend has zero `GZipMiddleware` registered. Anything compressing the stream is doing so at the proxy in front of us. Curl the backend directly with `-i -N` to verify.
+- `done.answer` is the source of truth for the final string; tokens are advisory. Any divergence → trust `done.answer`.
+
+---
+
+*End of Backend → Frontend Communication v2.9 — 2026-05-08 (streaming UX hardening: `verifying` phase shipped, `meta.empty_response` signal added, phase enum locked).*
 

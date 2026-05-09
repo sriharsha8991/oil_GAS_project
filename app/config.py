@@ -32,9 +32,12 @@ class Settings(BaseSettings):
     escalation_model: str = "models/gemini-3.1-pro-preview"           # iter 3 (FINAL)
 
     # --- Chat models (cheap, fast — context already curated by retrieval) ---
+    # NOTE: A Flash-Lite variant of Gemini 3 Preview is not yet available
+    # via API (returns 404 as of 2026-05). When it ships, override these
+    # via env to drop chat-path TTFT another ~30%.
     chat_triage_model: str = "models/gemini-3-flash-preview"    # LLM 0: route + meta-answer
     chat_planner_model: str = "models/gemini-3-flash-preview"   # LLM 1: query plan
-    chat_synth_model: str = "models/gemini-3-flash-preview"          # LLM 2: grounded answer
+    chat_synth_model: str = "models/gemini-3-flash-preview"     # LLM 2: grounded answer
 
     # --- Pricing (USD per 1M tokens, approximate; override via env) ---
     # Used purely for ingestion cost estimation in job summaries.

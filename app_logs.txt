@@ -1,0 +1,78 @@
+﻿docker : INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to 
+quit)
+At line:1 char:1
++ docker logs --tail 1000 wellsynthai-app 2>&1 | Out-File -Encoding utf ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (INFO:     Uvico...CTRL+C to quit) 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+INFO:     Started parent process [1]
+/app/app/routes/documents.py:81: FastAPIDeprecationWarning: `regex` has been 
+deprecated, please use `pattern` instead
+  scope: str = Query(
+/app/app/routes/documents.py:81: FastAPIDeprecationWarning: `regex` has been 
+deprecated, please use `pattern` instead
+  scope: str = Query(
+INFO:     Started server process [8]
+INFO:     Waiting for application startup.
+INFO:     Started server process [9]
+INFO:     Waiting for application startup.
+{"max_concurrent_pages": 150, "render_dpi": 200, "pass_confidence_threshold": 0.85, "gemini_configured": true, "event": "app_started", "level": "info", "logger": "app.main", "timestamp": "2026-05-09T06:47:48.098023Z"}
+{"max_concurrent_pages": 150, "render_dpi": 200, "pass_confidence_threshold": 0.85, "gemini_configured": true, "event": "app_started", "level": "info", "logger": "app.main", "timestamp": "2026-05-09T06:47:48.100361Z"}
+{"collection": "wellsynthai_documents", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.209482Z"}
+{"collection": "wellsynthai_documents", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.210226Z"}
+{"collection": "wellsynthai_entities", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.212855Z"}
+{"collection": "wellsynthai_entities", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.213582Z"}
+{"collection": "wellsynthai_images", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.215901Z"}
+INFO:     Application startup complete.
+INFO:     Application startup complete.
+{"collection": "wellsynthai_images", "event": "qdrant_collection_exists", "level": "info", "logger": "app.vectorstore.qdrant_store", "timestamp": "2026-05-09T06:47:48.216199Z"}
+{"collection": "wellsynthai_documents", "event": "qdrant_ready", "level": "info", "logger": "app.main", "timestamp": "2026-05-09T06:47:48.216419Z"}
+{"collection": "wellsynthai_documents", "event": "qdrant_ready", "level": "info", "logger": "app.main", "timestamp": "2026-05-09T06:47:48.216579Z"}
+INFO:     127.0.0.1:36206 - "GET /health HTTP/1.1" 200 OK
+INFO:     172.24.0.1:58578 - "POST /chat/stream HTTP/1.1" 200 OK
+{"event": "AFC is enabled with max remote calls: 10."}
+{"session_id": "e40a02d7-db79-4633-9953-b5d5b2e69c5e", "action": "synthesize", "tokens_in": 1377, "tokens_out": 44, "event": "agent_stream_guard", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.agent", "timestamp": "2026-05-09T06:48:05.338729Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "limit": 8, "kinds": null, "event": "tool_search_chunks", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:06.952083Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "entity_type": null, "unit": null, "limit": 6, "event": "tool_search_entities", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:06.952417Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "limit": 4, "image_types": null, "event": "tool_search_images", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:06.952881Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "count": 4, "event": "tool_search_images_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:07.927524Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "count": 6, "event": "tool_search_entities_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:08.078040Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "count": 8, "event": "tool_search_chunks_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:08.096717Z"}
+{"added": 2, "seeds": 1, "event": "neighbor_expanded", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.retriever", "timestamp": "2026-05-09T06:48:08.101888Z"}
+{"query": "SAJJA 6 well report details and well diagram info", "hits": 20, "include_images": true, "event": "rag_search_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.retriever", "timestamp": "2026-05-09T06:48:08.102033Z"}
+{"document_id": "Sajaa 6 EOWR", "table_id": null, "page_num": 14, "found": 0, "event": "synth_fetch_table_called", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.synthesizer", "timestamp": "2026-05-09T06:48:10.664317Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "limit": 8, "kinds": null, "event": "tool_search_chunks", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:12.184017Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "entity_type": null, "unit": null, "limit": 6, "event": "tool_search_entities", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:12.184524Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "limit": 4, "image_types": null, "event": "tool_search_images", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:12.184950Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "count": 4, "event": "tool_search_images_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:12.911850Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "count": 6, "event": "tool_search_entities_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:12.990403Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "count": 8, "event": "tool_search_chunks_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag_tools", "timestamp": "2026-05-09T06:48:13.086410Z"}
+{"added": 1, "seeds": 1, "event": "neighbor_expanded", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.retriever", "timestamp": "2026-05-09T06:48:13.091158Z"}
+{"query": "SAJJA 6 Time Distribution Summary table or Casing Program table", "hits": 19, "include_images": true, "event": "rag_search_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.retriever", "timestamp": "2026-05-09T06:48:13.091348Z"}
+{"event": "AFC is enabled with max remote calls: 10."}
+INFO:     127.0.0.1:52958 - "GET /health HTTP/1.1" 200 OK
+{"event": "AFC is enabled with max remote calls: 10."}
+{"event": "AFC is enabled with max remote calls: 10."}
+INFO:     127.0.0.1:55704 - "GET /health HTTP/1.1" 200 OK
+{"event": "synth_stream_verifier_timeout", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "warning", "logger": "app.agents.rag.synthesizer", "timestamp": "2026-05-09T06:48:40.756515Z"}
+{"session_id": "e40a02d7-db79-4633-9953-b5d5b2e69c5e", "status": "answered", "sources": 10, "tool_calls": 4, "event": "agent_stream_done", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.agent", "timestamp": "2026-05-09T06:48:40.871250Z"}
+{"event": "AFC is enabled with max remote calls: 10."}
+{"event": "AFC is enabled with max remote calls: 10."}
+INFO:     172.24.0.1:56462 - "GET /chat/sessions?project_scope=all&include_archived=false HTTP/1.1" 200 OK
+{"keys": ["document", "formation", "run", "well"], "event": "stm_subject_updated", "request_id": "16985fe5-56bc-43f7-8d52-8fffd3d3fb0e", "level": "info", "logger": "app.agents.rag.stm", "timestamp": "2026-05-09T06:48:46.595657Z"}
+INFO:     172.24.0.1:56470 - "GET /chat/sessions?project_scope=all&include_archived=false HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44976 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38358 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34458 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:44976 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60936 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55424 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:41886 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:34476 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45366 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40386 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57222 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36428 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51052 - "GET /health HTTP/1.1" 200 OK

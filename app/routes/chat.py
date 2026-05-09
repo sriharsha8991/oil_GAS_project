@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -186,6 +188,8 @@ async def chat(
     """Send a question and get an AI-synthesized answer grounded in documents."""
     embedder, vector_store = _get_clients(request)
     settings = get_settings()
+    request_id = str(uuid.uuid4())
+    structlog.contextvars.bind_contextvars(request_id=request_id)
 
     # Validate scope ownership before hitting Qdrant.
     if req.project_id or req.document_id:
@@ -221,7 +225,7 @@ async def chat(
             session_id=session_id,
             status=slash.status,
             answer=slash.reply,
-            meta=slash.meta,
+            meta={**(slash.meta or {}), "request_id": request_id},
         )
 
     # ------------------------------------------------------------------
@@ -253,7 +257,11 @@ async def chat(
                 "I don't have any documents indexed for you yet. "
                 "Upload a PDF and I'll be able to answer questions grounded in it."
             ),
-            meta={"path": "empty_corpus_softland", "rag_invoked": False},
+            meta={
+                "path": "empty_corpus_softland",
+                "rag_invoked": False,
+                "request_id": request_id,
+            },
         )
 
     try:
@@ -322,6 +330,17 @@ async def chat(
 
     # Index the conversation for the sidebar (skipped for temp chats).
     if not req.temp and result.status in ("answered", "clarification_requested"):
+        # Stash grounding visuals on `meta` so GET /chat/sessions/{id}/messages
+        # returns them on hard refresh. ``meta`` is jsonb (additionalProperties:
+        # true on the wire) so this needs no schema change. The FE already
+        # probes meta.attached_pages / meta.documents_used / meta.followups
+        # when rebuilding history.
+        persisted_meta = {
+            **(result.meta or {}),
+            "attached_pages": result.attached_pages or [],
+            "documents_used": (result.meta or {}).get("documents_used") or [],
+            "followups": list(result.followups or []),
+        }
         await _persist_session_index(
             session_id=session_id,
             user_id=user.id,
@@ -330,7 +349,7 @@ async def chat(
             assistant_message=result.answer,
             settings=settings,
             sources=[s.model_dump() for s in unique_sources],
-            meta=result.meta,
+            meta=persisted_meta,
         )
 
     return ChatResponse(
@@ -343,7 +362,7 @@ async def chat(
         evidence=evidence,
         attached_pages=result.attached_pages,
         tool_calls_made=result.tool_calls_made,
-        meta=result.meta,
+        meta={**(result.meta or {}), "request_id": request_id},
     )
 
 
@@ -398,6 +417,8 @@ async def chat_stream(
     """
     embedder, vector_store = _get_clients(request)
     settings = get_settings()
+    request_id = str(uuid.uuid4())
+    structlog.contextvars.bind_contextvars(request_id=request_id)
 
     await _validate_chat_scope(
         user=user, project_id=req.project_id, document_id=req.document_id,
@@ -422,7 +443,13 @@ async def chat_stream(
                 "sources": [],
                 "attached_pages": [],
                 "tool_calls_made": 0,
-                "meta": slash.meta,
+                "meta": {**(slash.meta or {}), "request_id": request_id},
+            })
+            yield sse_pack({
+                "event": "complete",
+                "request_id": request_id,
+                "session_id": session_id,
+                "meta": {"path": "slash"},
             })
 
         return StreamingResponse(
@@ -457,19 +484,48 @@ async def chat_stream(
             "sources": [],
             "attached_pages": [],
             "tool_calls_made": 0,
-            "meta": {"path": "empty_corpus_softland", "rag_invoked": False},
+            "meta": {
+                "path": "empty_corpus_softland",
+                "rag_invoked": False,
+                "request_id": request_id,
+            },
         }
 
     async def event_source():
+        # Immediate "received" frame — flushes the response headers and a
+        # first byte so the FE has visible activity from t≈0 instead of
+        # waiting on the first LLM call (~500ms+) for the guard status.
+        t0_ms = int(time.time() * 1000)
+        wall_ms_done: int | None = None
+        yield sse_pack({
+            "event": "status",
+            "phase": "received",
+            "session_id": session_id,
+            "request_id": request_id,
+        })
+
         if empty_softland is not None:
             yield sse_pack({
                 "event": "token",
                 "text": empty_softland["answer"],
             })
             yield sse_pack(empty_softland)
+            wall_ms_done = int(time.time() * 1000) - t0_ms
+            yield sse_pack({
+                "event": "complete",
+                "request_id": request_id,
+                "session_id": session_id,
+                "meta": {
+                    "wall_ms_done": wall_ms_done,
+                    "wall_ms_complete": wall_ms_done,
+                    "path": "empty_corpus_softland",
+                },
+            })
             return
 
         last_done: dict | None = None
+        last_followups: list[str] = []
+        agent_failed = False
         try:
             async for ev in run_agent_stream(
                 req.message,
@@ -483,9 +539,22 @@ async def chat_stream(
                 document_id=req.document_id,
                 temp=req.temp,
             ):
-                if ev.get("event") == "done":
-                    ev = {**ev, "session_id": session_id}
+                ev_kind = ev.get("event")
+                if ev_kind == "done":
+                    ev = {
+                        **ev,
+                        "session_id": session_id,
+                        "meta": {**(ev.get("meta") or {}), "request_id": request_id},
+                    }
                     last_done = ev
+                    wall_ms_done = int(time.time() * 1000) - t0_ms
+                elif ev_kind == "followups_update":
+                    ev = {**ev, "request_id": request_id}
+                    fu = ev.get("followups")
+                    if isinstance(fu, list):
+                        last_followups = [s for s in fu if isinstance(s, str)]
+                elif ev_kind in ("verification_update", "thought"):
+                    ev = {**ev, "request_id": request_id}
                 yield sse_pack(ev)
         except asyncio.CancelledError:
             logger.info("chat_stream_client_disconnect", session_id=session_id)
@@ -498,6 +567,7 @@ async def chat_stream(
                 error_type=type(exc).__name__,
                 error_message=str(exc),
             )
+            agent_failed = True
             yield sse_pack({
                 "event": "done",
                 "session_id": session_id,
@@ -506,17 +576,37 @@ async def chat_stream(
                 "sources": [],
                 "attached_pages": [],
                 "tool_calls_made": 0,
-                "meta": {"path": "error", "error": "agent_failed"},
+                "meta": {
+                    "path": "error",
+                    "error": "agent_failed",
+                    "request_id": request_id,
+                },
             })
-            return
 
         # After the stream closes — index for the sidebar (non-temp only).
         if (
-            not req.temp
+            not agent_failed
+            and not req.temp
             and last_done is not None
             and last_done.get("status") in ("answered", "clarification_requested")
         ):
             try:
+                # Stash grounding visuals on `meta` so the GET messages
+                # endpoint can rehydrate them on hard refresh. ``meta``
+                # is jsonb (additionalProperties: true on the wire) so
+                # this needs no schema change. The FE already probes
+                # meta.attached_pages / meta.documents_used / meta.followups.
+                base_meta = last_done.get("meta") or {}
+                persisted_meta = {
+                    **base_meta,
+                    "attached_pages": last_done.get("attached_pages") or [],
+                    "documents_used": (
+                        last_done.get("documents_used")
+                        or base_meta.get("documents_used")
+                        or []
+                    ),
+                    "followups": last_followups,
+                }
                 await _persist_session_index(
                     session_id=session_id,
                     user_id=user.id,
@@ -525,13 +615,28 @@ async def chat_stream(
                     assistant_message=last_done.get("answer") or "",
                     settings=settings,
                     sources=last_done.get("sources") or [],
-                    meta=last_done.get("meta") or {},
+                    meta=persisted_meta,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "chat_stream_session_persist_failed",
                     session_id=session_id, error=str(exc),
                 )
+
+        # Terminal `complete` frame — tells the FE the stream is finished
+        # and it's safe to close the EventSource. Under the progressive-
+        # finalisation protocol, `done` no longer signals end-of-stream.
+        wall_ms_complete = int(time.time() * 1000) - t0_ms
+        yield sse_pack({
+            "event": "complete",
+            "request_id": request_id,
+            "session_id": session_id,
+            "meta": {
+                "wall_ms_done": wall_ms_done,
+                "wall_ms_complete": wall_ms_complete,
+                **({"path": "error"} if agent_failed else {}),
+            },
+        })
 
     return StreamingResponse(
         event_source(),

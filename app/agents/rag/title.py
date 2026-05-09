@@ -46,7 +46,10 @@ def _fallback_title(user_message: str) -> str:
 
 
 def _clean(title: str) -> str:
-    title = (title or "").strip().splitlines()[0].strip()
+    lines = (title or "").strip().splitlines()
+    if not lines:
+        return ""
+    title = lines[0].strip()
     title = _TITLE_BAD_RE.sub("", title)
     if len(title) > _TITLE_MAX_CHARS:
         title = title[:_TITLE_MAX_CHARS].rstrip() + "…"
@@ -78,7 +81,8 @@ async def generate_title(
             config=types.GenerateContentConfig(
                 system_instruction=_TITLE_SYSTEM,
                 temperature=0.2,
-                max_output_tokens=24,
+                max_output_tokens=64,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
             ),
         )
         raw = (getattr(resp, "text", "") or "").strip()
