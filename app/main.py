@@ -21,6 +21,8 @@ from app.routes.ingest import router as ingest_router
 from app.routes.memories import router as memories_router
 from app.routes.projects import router as projects_router
 from app.routes.search import router as search_router
+from app.routes.admin_support import router as admin_support_router
+from app.routes.support import router as support_router
 from app.utils.gemini_client import GeminiClient
 from app.utils.logging import get_logger, setup_logging
 from app.vectorstore.embedder import GeminiEmbedder
@@ -189,6 +191,8 @@ app.include_router(search_router)
 app.include_router(chat_router)
 app.include_router(chat_sessions_router)
 app.include_router(memories_router)
+app.include_router(support_router)
+app.include_router(admin_support_router)
 
 
 # ---------------------------------------------------------------------------

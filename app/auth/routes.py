@@ -87,6 +87,10 @@ def _serialize(user: AuthUser) -> dict:
         "role": user.role,
         "display_name": user.display_name,
         "organization": user.organization,
+        # Convenience flag for FE gating (admin/support screen, etc.) so it
+        # doesn't need to hard-code the role string. Kept derived — do not
+        # add a separate column.
+        "is_superadmin": user.role == "super_admin",
     }
 
 

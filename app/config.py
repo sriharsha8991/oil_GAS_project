@@ -80,6 +80,19 @@ class Settings(BaseSettings):
     # Leave blank to render the email without a button.
     sign_in_url: str = ""
 
+    # --- Support tickets (POST /support/tickets etc.) ---
+    support_inbox_email: str = "srih8991@gmail.com"
+    support_from_email: str = ""             # falls back to resend_from_email when blank
+    support_notify_user_on_update: bool = True
+    support_rate_limit_per_hour: int = 5
+    support_rate_limit_per_day: int = 20
+    support_max_attachments: int = 3
+    support_max_attachment_bytes: int = 5 * 1024 * 1024
+    support_attachment_ttl_seconds: int = 7 * 24 * 3600  # 7 days
+    # FE base URL used when composing links inside support emails (e.g.
+    # "{frontend_base_url}/help/tickets/{id}"). Optional.
+    frontend_base_url: str = ""
+
     # --- CORS ---
     cors_allow_origins: str = "http://localhost:3000"  # comma-separated
 

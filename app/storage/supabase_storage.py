@@ -319,3 +319,40 @@ class SupabaseStorage:
                         )
 
         await asyncio.to_thread(_wipe)
+
+    # ------------------------------------------------------------------
+    # Support tickets — attachments
+    # ------------------------------------------------------------------
+    # Path scheme: <ticket_user_id>/support/<ticket_id>/<filename>
+    # Reuses the `artifacts` bucket; bucket RLS already scopes to
+    # path[1] == auth.uid() for non-service-role reads. Backend writes via
+    # service-role and serves attachments via short-TTL signed URLs.
+
+    @staticmethod
+    def _support_key(user_id: str, ticket_id: str, filename: str) -> str:
+        return f"{user_id}/support/{ticket_id}/{filename}"
+
+    async def write_support_attachment(
+        self,
+        *,
+        user_id: str,
+        ticket_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str,
+    ) -> str:
+        key = self._support_key(user_id, ticket_id, filename)
+        await self._upload(ARTIFACTS_BUCKET, key, data, content_type)
+        return key
+
+    def signed_url_support_attachment(
+        self, storage_key: str, *, ttl_seconds: int | None = None,
+    ) -> str:
+        ttl = ttl_seconds if ttl_seconds is not None else self._signed_url_ttl
+        resp = self._client.storage.from_(ARTIFACTS_BUCKET).create_signed_url(
+            storage_key, ttl
+        )
+        url = resp.get("signedURL") or resp.get("signedUrl")
+        if not url:
+            raise RuntimeError(f"Could not sign URL for {storage_key}: {resp}")
+        return url
